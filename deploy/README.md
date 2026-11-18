@@ -3,6 +3,11 @@
 > [!IMPORTANT]
 > 本教程仅在 **Xiaomi 智能音箱 Pro（OH2P）** 上测试成功，**其他型号**没有测试，请自行承担刷机风险！🚨
 
+> [!NOTE]
+> **LX06（小爱音箱 Pro）** 不走本文流程，请改用 [`lx06/README.md`](./lx06/README.md)：
+> 它有独立的补丁集（`patches/core/`）、A/B 分区备份与刷写脚本，以及与上游 / CocoJiao fork
+> 同步的约定（[`lx06/UPSTREAM.md`](./lx06/UPSTREAM.md)）。
+
 ### 准备条件
 
 - 小爱音箱

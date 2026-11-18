@@ -1,0 +1,73 @@
+{
+  "file": "mico_all_911151b95_1.94.13.bin",
+  "length": 43478328,
+  "magic": "HDR1",
+  "signatureOffset": 43478056,
+  "crc32": "0xdc3f85c8",
+  "fileType": 0,
+  "modelId": 8,
+  "sha256": "a56a38619fd98e467adb8c998757f80109c4dac89db48d62dae985e3062476ed",
+  "md5": "b202de2bbe149ce884aa500911151b95",
+  "segments": [
+    {
+      "index": 0,
+      "name": "mico_version",
+      "headerOffset": "0x38",
+      "flashAddress": "0xffffffff",
+      "partition": 65535,
+      "length": 517,
+      "sha256": "3b1716795ad266fe1af0989d67cfe2e1441ce18841f93fbe2099e993abb044d3",
+      "md5": "cc69d5457b15bd49f703b8381a94294d"
+    },
+    {
+      "index": 1,
+      "name": "root.squashfs",
+      "headerOffset": "0x288",
+      "flashAddress": "0xffffffff",
+      "partition": 65535,
+      "length": 37500699,
+      "sha256": "317a54909f12b63f22128965bf9005c06435d15f61c4202bb88c4524bf1e2ef4",
+      "md5": "df8e9595ea804b51c2b0ce82434d8ea9"
+    },
+    {
+      "index": 2,
+      "name": "boot.img",
+      "headerOffset": "0x23c39e8",
+      "flashAddress": "0xffffffff",
+      "partition": 65535,
+      "length": 5288767,
+      "sha256": "97b772225fe1c287a47c3add92565faf16e93178ce8fc247853a1021468586c7",
+      "md5": "747c92b816c127db60d97c7f1f06266d"
+    },
+    {
+      "index": 3,
+      "name": "u-boot.bin.usb.bl2",
+      "headerOffset": "0x28ced68",
+      "flashAddress": "0xffffffff",
+      "partition": 65535,
+      "length": 49152,
+      "sha256": "e79cc10e4a4742d44520117cf8676ed4f2827216f2f476e962c0020c82b89631",
+      "md5": "3cd49de323abe60c3f124831576cc111"
+    },
+    {
+      "index": 4,
+      "name": "u-boot.bin.usb.tpl",
+      "headerOffset": "0x28dada8",
+      "flashAddress": "0xffffffff",
+      "partition": 65535,
+      "length": 531968,
+      "sha256": "dcaa4992239e971c41256bbc9c8f8bc846b2954145854d613d2415e9f39a83c0",
+      "md5": "b3e550abf859e503863c25fb10ee091a"
+    },
+    {
+      "index": 5,
+      "name": "dtb.img",
+      "headerOffset": "0x295cbe8",
+      "flashAddress": "0xffffffff",
+      "partition": 65535,
+      "length": 106496,
+      "sha256": "ef6e5b9de4a1ad01d03c1ea43c93fec66da9d12fc264ded496154a995864c0a0",
+      "md5": "1755520f7815dd35ed925b4fe2b0f11c"
+    }
+  ]
+}

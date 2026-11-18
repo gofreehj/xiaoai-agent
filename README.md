@@ -33,12 +33,17 @@ https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 ├── xiaoai-agent/              # Rust 编写的音箱端 Agent
 ├── deploy/client-patch/       # 用于制作带 SSH 和启动钩子的补丁固件
 ├── deploy/flash-tool/         # macOS 刷机辅助工具
+├── deploy/lx06/               # LX06（小爱音箱 Pro）独立实施规格与构建链
 ├── deploy/OH2P_1.62.2_BUILD_NOTES.md # OH2P 构建踩坑记录
 ├── upstream-open-xiaoai/      # 上游 Open-XiaoAI 快照说明和许可证
 └── AGENTS.md                  # README 的工程补充说明
 ```
 
 `deploy/client-patch/`、`deploy/flash-tool/` 和 `upstream-open-xiaoai/` 主要来自其它开源项目。
+
+LX06 机型走独立目录 [`deploy/lx06/`](./deploy/lx06/README.md)：规格、补丁、构建脚本和运行时模板
+各自自包含，不改动本仓库其它机型的默认配置。同步上游与 CocoJiao fork 的约定见
+[`deploy/lx06/UPSTREAM.md`](./deploy/lx06/UPSTREAM.md)。
 
 ## 使用流程
 

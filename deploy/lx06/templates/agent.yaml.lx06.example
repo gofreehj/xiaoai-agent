@@ -1,0 +1,38 @@
+# LX06 runtime template. Copy this file to agent.yaml on the speaker and set
+# its permission to 0600. Values below are literals: the Agent does not expand
+# ${ENV}; edit the API-key fields on the device instead of committing secrets.
+runtime:
+  speech_socket: /tmp/mico_aivs_lab/usock/speech.usock
+  session_idle_timeout_s: 20
+
+device:
+  # LX06 tts_play.sh has no shebang, only consumes $1, and returns 1 when no music was playing prior to TTS.
+  tts_command: "sh /usr/sbin/tts_play.sh {text}; true"
+  play_url_command: "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &"
+  stop_audio_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
+  abort_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause 2>/dev/null || true; ubus call mediaplayer media_control '{\"player\":\"mediaplayer\",\"action\":\"pause\",\"volume\":0}' 2>/dev/null || true; ubus call mediaplayer player_play_operation '{\"media\":\"app_ios\",\"action\":\"stop\"}' 2>/dev/null || true"
+  led_enabled: true
+  led_listening: 3
+  led_user_speaking: 4
+  led_thinking: 2
+  led_speaking: 5
+
+capture:
+  sample_rate: 16000
+
+asr:
+  provider: open_ai
+  open_ai:
+    base_url: https://api.openai.com/v1
+    api_key: EMPTY
+    model: whisper-1
+    language: zh
+
+llm:
+  protocol: open_ai_chat
+  base_url: https://api.openai.com/v1
+  api_key: EMPTY
+  model: gpt-5.4-mini
+
+agent:
+  timezone: Asia/Shanghai

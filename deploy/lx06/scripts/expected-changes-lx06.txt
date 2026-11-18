@@ -1,0 +1,11 @@
+# LX06 官方 1.94.13 + core-4 的预期改动集合。
+# 当前标准 speech.usock 接管镜像固定只使用 patches/core 的四个补丁。换固件版本后
+# 必须重新实测并人工确认，不要直接沿用本清单。
+bin/flash.sh
+bin/ota
+etc/init.d/dropbear
+etc/init.d/wireless
+etc/inittab
+etc/pam.d/common-auth
+etc/rc.local
+etc/shadow
