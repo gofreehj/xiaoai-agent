@@ -207,10 +207,13 @@ pub struct WebSearch {
 
 impl WebSearch {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .pool_idle_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { config, client }
     }
 }
 

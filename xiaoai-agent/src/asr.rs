@@ -63,10 +63,13 @@ pub struct OpenAiAsr {
 
 impl OpenAiAsr {
     pub fn new(config: OpenAiAsrConfig) -> Self {
-        Self {
-            config,
-            client: Client::new(),
-        }
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .pool_idle_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { config, client }
     }
 
     pub async fn transcribe_pcm(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {

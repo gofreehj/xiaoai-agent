@@ -15,10 +15,13 @@ pub struct WeatherService {
 
 impl WeatherService {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        Self {
-            config,
-            client: Client::new(),
-        }
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .pool_idle_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+        Self { config, client }
     }
 
     pub async fn get_weather(&self, location: &str) -> Value {
@@ -35,25 +38,26 @@ impl WeatherService {
             "agent.weather.qweather_url is empty"
         );
 
-        let (location, label) = if requested_location.is_empty() {
+        let effective_location = effective_requested_location(requested_location, &settings.default_location);
+        let (location, label) = if effective_location.is_empty() {
             self.auto_ip_location(settings).await.unwrap_or_else(|err| {
                 (
                     settings.default_location.clone(),
                     format!("default location {} ({err})", settings.default_location),
                 )
             })
-        } else if looks_like_qweather_location(requested_location) {
+        } else if looks_like_qweather_location(effective_location) {
             (
-                requested_location.to_string(),
-                requested_location.to_string(),
+                effective_location.to_string(),
+                effective_location.to_string(),
             )
         } else {
-            self.lookup_city(settings, requested_location)
+            self.lookup_city(settings, effective_location)
                 .await
                 .unwrap_or_else(|err| {
                     (
-                        requested_location.to_string(),
-                        format!("{requested_location} ({err})"),
+                        effective_location.to_string(),
+                        format!("{effective_location} ({err})"),
                     )
                 })
         };
@@ -149,6 +153,15 @@ impl WeatherService {
         );
         serde_json::from_str(&text)
             .with_context(|| format!("QWeather returned non-JSON body: {}", preview(&text)))
+    }
+}
+
+fn effective_requested_location<'a>(requested_location: &'a str, default_location: &'a str) -> &'a str {
+    let requested = requested_location.trim();
+    if !requested.is_empty() {
+        requested
+    } else {
+        default_location.trim()
     }
 }
 
@@ -298,5 +311,18 @@ mod tests {
         assert_eq!(summary["location"], "郑州");
         assert_eq!(summary["raw"]["error"], "no daily field");
         assert!(summary.get("forecast").is_none());
+    }
+
+    #[test]
+    fn effective_requested_location_prefers_explicit_then_default() {
+        assert_eq!(
+            effective_requested_location("北京", "117.199,39.0851"),
+            "北京"
+        );
+        assert_eq!(
+            effective_requested_location("  ", "117.199,39.0851"),
+            "117.199,39.0851"
+        );
+        assert_eq!(effective_requested_location("", ""), "");
     }
 }

@@ -92,6 +92,17 @@ pub struct AgentControl {
 struct AgentView {
     config: Arc<AppConfig>,
     tool_server: ToolServerHandle,
+    http_client: reqwest::Client,
+}
+
+fn build_llm_http_client(timeout_s: f64) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .pool_idle_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(15))
+        .timeout(timeout_duration(timeout_s))
+        .build()
+        .context("failed to create LLM HTTP client")
 }
 
 pub struct AgentRuntime {
@@ -123,20 +134,23 @@ fn build_tool_server(
             .tool(GetCurrentTime::new(config.clone()))
             .tool(GetWeather::new(config.clone()))
             .tool(WebSearch::new(config.clone()))
-            .tool(EndConversation::new(control))
-            .tool(SearchMusic::new(music.clone()))
-            .tool(RequestMusicLoginCode::new(music.clone()))
-            .tool(SubmitMusicLoginCode::new(music.clone()))
-            .tool(PlayMusicQuery::new(music.clone()))
-            .tool(AddMusicToQueue::new(music.clone()))
-            .tool(AddRandomMusicToQueue::new(music.clone()))
-            .tool(PlayRandomMusic::new(music.clone()))
-            .tool(StopMusicPlayback::new(music.clone()))
-            .tool(PauseMusicPlayback::new(music.clone()))
-            .tool(ResumeMusicPlayback::new(music.clone()))
-            .tool(PlayNextMusic::new(music.clone()))
-            .tool(PlayPreviousMusic::new(music.clone()))
-            .tool(GetMusicStatus::new(music));
+            .tool(EndConversation::new(control));
+        if config.music.enabled {
+            tool_server = tool_server
+                .tool(SearchMusic::new(music.clone()))
+                .tool(RequestMusicLoginCode::new(music.clone()))
+                .tool(SubmitMusicLoginCode::new(music.clone()))
+                .tool(PlayMusicQuery::new(music.clone()))
+                .tool(AddMusicToQueue::new(music.clone()))
+                .tool(AddRandomMusicToQueue::new(music.clone()))
+                .tool(PlayRandomMusic::new(music.clone()))
+                .tool(StopMusicPlayback::new(music.clone()))
+                .tool(PauseMusicPlayback::new(music.clone()))
+                .tool(ResumeMusicPlayback::new(music.clone()))
+                .tool(PlayNextMusic::new(music.clone()))
+                .tool(PlayPreviousMusic::new(music.clone()))
+                .tool(GetMusicStatus::new(music));
+        }
     }
     tool_server.run()
 }
@@ -197,9 +211,11 @@ impl AgentRuntime {
         let control = Arc::new(Mutex::new(AgentControl::default()));
         let snapshot = config.get().await;
         let tool_server = build_tool_server(snapshot.clone(), music.clone(), control.clone());
+        let http_client = build_llm_http_client(snapshot.llm.timeout_s)?;
         let view = AgentView {
             config: snapshot.clone(),
             tool_server,
+            http_client,
         };
 
         let mcp = if snapshot.agent.tools_enabled {
@@ -239,9 +255,12 @@ impl AgentRuntime {
         let snapshot = self.config.get().await;
         let tool_server =
             build_tool_server(snapshot.clone(), self.music.clone(), self.control.clone());
+        let http_client = build_llm_http_client(snapshot.llm.timeout_s)
+            .unwrap_or_else(|_| reqwest::Client::new());
         let next_view = AgentView {
             config: snapshot.clone(),
             tool_server,
+            http_client,
         };
         // 慢的那几步（MCP 重连）全在换之前做完，换的时候只剩一次写锁。
         let mcp = if snapshot.agent.tools_enabled {
@@ -337,10 +356,7 @@ impl AgentRuntime {
         history: Vec<Message>,
     ) -> anyhow::Result<String> {
         let config = view.config.clone();
-        let http_client = reqwest::Client::builder()
-            .timeout(timeout_duration(config.llm.timeout_s))
-            .build()
-            .context("failed to create LLM HTTP client")?;
+        let http_client = view.http_client.clone();
 
         match config.llm.protocol {
             LlmProtocol::OpenAiChat => {
@@ -619,5 +635,43 @@ mod tests {
             openai_thinking_params(&LlmThinkingMode::Enabled),
             json!({"enable_thinking": true})
         );
+    }
+
+    #[tokio::test]
+    async fn build_tool_server_omits_music_tools_when_music_disabled() {
+        use super::{build_tool_server, AgentControl};
+        use crate::config::{AppConfig, ConfigHandle};
+        use crate::device::Device;
+        use crate::music::MusicService;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let mut cfg = AppConfig::default();
+        cfg.agent.tools_enabled = true;
+        cfg.music.enabled = false;
+        let arc_cfg = Arc::new(cfg.clone());
+        let music = Arc::new(
+            MusicService::new(
+                ConfigHandle::new(arc_cfg.clone()),
+                Device::new(arc_cfg.device.clone()),
+            )
+            .unwrap(),
+        );
+        let server_no_music = build_tool_server(
+            arc_cfg,
+            music.clone(),
+            Arc::new(Mutex::new(AgentControl::default())),
+        );
+        let defs_no_music = server_no_music.get_tool_defs(None).await.unwrap();
+        assert_eq!(defs_no_music.len(), 4);
+
+        cfg.music.enabled = true;
+        let server_with_music = build_tool_server(
+            Arc::new(cfg),
+            music,
+            Arc::new(Mutex::new(AgentControl::default())),
+        );
+        let defs_with_music = server_with_music.get_tool_defs(None).await.unwrap();
+        assert_eq!(defs_with_music.len(), 17);
     }
 }
