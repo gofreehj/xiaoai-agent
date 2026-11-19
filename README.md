@@ -9,7 +9,11 @@
 
 运行在小爱音箱端侧的独立语音 Agent。仅需配置外部 ASR 与大模型服务 API，即可在音箱端侧完成唤醒、ASR、LLM 对话、工具调用和 TTS 回复。
 与 Open-XiaoAI 和 [MiGPT](https://github.com/idootop/mi-gpt) 项目不同，XiaoAI Agent 无需部署专门的服务端运行 Agent，也不会与原生小爱同学抢麦、抢答或触发小米云端控制。
-目前仅在 Xiaomi 智能音箱 Pro（OH2P）固件 `1.62.2` 上测试成功，其他型号和固件版本需要自行适配并承担风险。
+目前已在以下机型和固件版本上完整测试通过：
+- **小爱音箱 Pro（LX06）** 官方固件 `1.94.13` —— 提供 **[小白保姆级刷机与部署指南](./deploy/lx06/FLASH_GUIDE.md)**（开箱即用，免编译免虚拟机）
+- **Xiaomi 智能音箱 Pro（OH2P）** 官方固件 `1.62.2` —— 详细记录见 [OH2P 构建记录](./deploy/OH2P_1.62.2_BUILD_NOTES.md)
+
+其他型号和固件版本需要自行适配并承担风险。
 
 https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 
