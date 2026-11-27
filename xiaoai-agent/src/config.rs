@@ -29,14 +29,16 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = fs::read_to_string(path)?;
-        let mut config: Self = serde_yaml::from_str(&text)?;
+        Self::from_yaml_str(&text, path.parent())
+    }
+
+    pub fn from_yaml_str(text: &str, base_dir: Option<&Path>) -> anyhow::Result<Self> {
+        let mut config: Self = serde_yaml::from_str(text)?;
         if config.root.is_none() {
-            config.root = Some(
-                path.parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(".")),
-            );
+            let base = base_dir
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            config.root = Some(base.canonicalize().unwrap_or_else(|_| base.to_path_buf()));
         }
         config.resolve_paths();
         config.llm.base_url = openai_base_url(&config.llm.base_url);
@@ -495,7 +497,7 @@ impl Default for LlmConfig {
 #[derive(Debug, Clone, Deserialize, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProtocol {
-    #[serde(alias = "openai", alias = "chat_completions")]
+    #[serde(alias = "openai", alias = "openai_chat", alias = "chat_completions")]
     #[default]
     OpenAiChat,
     Anthropic,

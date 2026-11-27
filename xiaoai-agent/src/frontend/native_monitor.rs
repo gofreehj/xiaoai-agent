@@ -27,6 +27,26 @@ const MIN_EXTERNAL_COOLDOWN: Duration = Duration::from_secs(3);
 const MAX_READ_BYTES_PER_POLL: usize = 256 * 1024;
 const MAX_PENDING_LINE_BYTES: usize = 64 * 1024;
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct NativeInterlockStatus {
+    pub enabled: bool,
+    pub state: &'static str,
+    pub active_remaining_s: u64,
+    pub cooldown_remaining_s: u64,
+    pub has_event_command: bool,
+    pub wake_count: u64,
+}
+
+fn remaining_ceil_secs(until: Option<Instant>, now: Instant) -> u64 {
+    match until {
+        Some(t) if t > now => {
+            let d = t.saturating_duration_since(now);
+            d.as_secs() + u64::from(d.subsec_nanos() > 0)
+        }
+        _ => 0,
+    }
+}
+
 #[derive(Debug)]
 pub struct NativeInterlockState {
     wake_patterns: Vec<String>,
@@ -37,6 +57,7 @@ pub struct NativeInterlockState {
     active_until: Option<Instant>,
     hold_until: Option<Instant>,
     last_emit: Option<Instant>,
+    wake_count: u64,
 }
 
 impl NativeInterlockState {
@@ -65,11 +86,32 @@ impl NativeInterlockState {
             active_until: None,
             hold_until: None,
             last_emit: None,
+            wake_count: 0,
         }
     }
 
     pub fn is_blocked(&self, now: Instant) -> bool {
         self.active_until.is_some_and(|t| now < t) || self.hold_until.is_some_and(|t| now < t)
+    }
+
+    pub fn status(&self, now: Instant, has_event_command: bool) -> NativeInterlockStatus {
+        let active_remaining_s = remaining_ceil_secs(self.active_until, now);
+        let cooldown_remaining_s = remaining_ceil_secs(self.hold_until, now);
+        let state = if active_remaining_s > 0 {
+            "active"
+        } else if cooldown_remaining_s > 0 {
+            "cooldown"
+        } else {
+            "idle"
+        };
+        NativeInterlockStatus {
+            enabled: true,
+            state,
+            active_remaining_s,
+            cooldown_remaining_s,
+            has_event_command,
+            wake_count: self.wake_count,
+        }
     }
 
     fn debounce_allows(&self, now: Instant) -> bool {
@@ -92,6 +134,7 @@ impl NativeInterlockState {
             self.active_until = Some(now + self.max_active);
             if !was_active && self.debounce_allows(now) {
                 self.last_emit = Some(now);
+                self.wake_count += 1;
                 return true;
             }
             return false;
@@ -118,6 +161,7 @@ impl NativeInterlockState {
         let currently_active = self.active_until.is_some_and(|t| now < t);
         if !currently_active && self.debounce_allows(now) {
             self.last_emit = Some(now);
+            self.wake_count += 1;
             return true;
         }
         false
@@ -128,6 +172,7 @@ impl NativeInterlockState {
         let hold = self.cooldown.max(MIN_EXTERNAL_COOLDOWN);
         self.extend_hold(now + hold);
         self.last_emit = Some(now);
+        self.wake_count += 1;
         true
     }
 }
@@ -286,6 +331,7 @@ impl Drop for AbortTasksOnDrop {
 #[derive(Clone)]
 pub struct NativeWakeMonitor {
     enabled: bool,
+    has_event_command: bool,
     state: Arc<Mutex<NativeInterlockState>>,
     tx: broadcast::Sender<()>,
     _tasks: Arc<AbortTasksOnDrop>,
@@ -296,6 +342,7 @@ impl NativeWakeMonitor {
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         Self {
             enabled: false,
+            has_event_command: false,
             state: Arc::new(Mutex::new(NativeInterlockState::from_config(
                 &NativeInterlockConfig::default(),
             ))),
@@ -334,7 +381,8 @@ impl NativeWakeMonitor {
         }
 
         let event_cmd = cfg.event_command.trim().to_string();
-        if !event_cmd.is_empty() {
+        let has_event_command = !event_cmd.is_empty();
+        if has_event_command {
             let state_clone = state.clone();
             let tx_clone = tx.clone();
             handles.push(tokio::spawn(run_event_command_loop(
@@ -346,6 +394,7 @@ impl NativeWakeMonitor {
 
         Self {
             enabled: true,
+            has_event_command,
             state,
             tx,
             _tasks: Arc::new(AbortTasksOnDrop(handles)),
@@ -361,6 +410,24 @@ impl NativeWakeMonitor {
             .lock()
             .expect("native interlock mutex poisoned")
             .is_blocked(now)
+    }
+
+    pub fn status(&self) -> NativeInterlockStatus {
+        if !self.enabled {
+            return NativeInterlockStatus {
+                enabled: false,
+                state: "disabled",
+                active_remaining_s: 0,
+                cooldown_remaining_s: 0,
+                has_event_command: false,
+                wake_count: 0,
+            };
+        }
+        let now = Instant::now();
+        self.state
+            .lock()
+            .expect("native interlock mutex poisoned")
+            .status(now, self.has_event_command)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<()> {

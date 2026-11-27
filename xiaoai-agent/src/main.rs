@@ -149,14 +149,17 @@ async fn main() -> anyhow::Result<()> {
         let ep = initial.dual.kws.endpoint.trim();
         let control_state = Arc::new(server::ControlState {
             token: initial.server.token.clone(),
+            mode: "dual".to_string(),
             socket: SocketOwnership::unattributed(PathBuf::from(if ep.is_empty() {
                 "external-kws".to_string()
             } else {
                 format!("udp://{ep}")
             })),
             liveness: SpeechLiveness::default(),
+            native_monitor: Some(native_monitor.clone()),
             started_at: std::time::Instant::now(),
             config_path: Some(cli.config.clone()),
+            log_path: None,
             telemetry: telemetry.clone(),
         });
         let _control_task = start_control_plane(&initial.server, control_state, hooks).await;
@@ -204,10 +207,13 @@ async fn main() -> anyhow::Result<()> {
 
     let control_state = Arc::new(server::ControlState {
         token: initial.server.token.clone(),
+        mode: initial.runtime.mode.clone(),
         socket: ownership.clone(),
         liveness: speech.liveness(),
+        native_monitor: None,
         started_at: std::time::Instant::now(),
         config_path: Some(cli.config.clone()),
+        log_path: None,
         telemetry: telemetry.clone(),
     });
     let _control_task = start_control_plane(&initial.server, control_state, hooks).await;
@@ -667,60 +673,24 @@ async fn run_status_command(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Probe one upstream with HEAD (any HTTP answer counts as reachable) and print RTT.
-async fn probe_upstream(client: &reqwest::Client, label: &str, url: &str) -> bool {
-    let started = std::time::Instant::now();
-    match client.head(url).send().await {
-        Ok(resp) => {
-            println!(
-                "  {label}: reachable ({} ms, HTTP {}) {url}",
-                started.elapsed().as_millis(),
-                resp.status().as_u16()
-            );
-            true
-        }
-        Err(err) => {
-            println!("  {label}: UNREACHABLE ({err}) {url}");
-            false
-        }
-    }
-}
-
-/// Free space of `path` in KiB via `df -k`; best-effort (None when df is missing/unparseable).
-fn tmp_free_kib(path: &str) -> Option<u64> {
-    let out = std::process::Command::new("df")
-        .args(["-k", path])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().nth(1)?;
-    line.split_whitespace().nth(3)?.parse().ok()
-}
-
 async fn run_doctor_command(config_path: &Path) -> anyhow::Result<()> {
     let config = AppConfig::load(config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    println!("config: {} (parsed ok)", config_path.display());
-    println!("mode: {}", config.runtime.mode);
+    let report = crate::runtime::doctor::collect_doctor_report(&config, Some(config_path), None).await;
 
-    let warnings = crate::config::collect_startup_warnings(&config);
-    if warnings.is_empty() {
+    println!("config: {} (parsed ok)", config_path.display());
+    println!("mode: {}", report.mode);
+
+    if report.warnings.is_empty() {
         println!("warnings: none");
     } else {
-        println!("warnings: {}", warnings.len());
-        for warning in &warnings {
+        println!("warnings: {}", report.warnings.len());
+        for warning in &report.warnings {
             println!("  WARN {warning}");
         }
     }
 
-    let pid_text = std::fs::read_to_string("/tmp/xiaoai-agent/xiaoai-agent.pid")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    println!("pid_file: {}", pid_text.as_deref().unwrap_or("none"));
+    println!("pid_file: {}", report.pid_file.as_deref().unwrap_or("none"));
     if config.runtime.mode == "dual" {
         let ep = config.dual.kws.endpoint.trim();
         println!(
@@ -759,7 +729,7 @@ async fn run_doctor_command(config_path: &Path) -> anyhow::Result<()> {
         println!("socket: {socket} (exists={})", Path::new(socket).exists());
     }
 
-    match tmp_free_kib("/tmp") {
+    match report.tmp_free_kib {
         Some(kib) => {
             let note = if kib < 4096 { " LOW" } else { "" };
             println!("tmp_free: {} KiB{note}", kib);
@@ -767,43 +737,33 @@ async fn run_doctor_command(config_path: &Path) -> anyhow::Result<()> {
         None => println!("tmp_free: unknown"),
     }
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(3))
-        .build()?;
     println!("upstream:");
-    let asr_url = match config.asr.provider {
-        crate::config::AsrProvider::OpenAi => config.asr.open_ai.base_url.clone(),
-        crate::config::AsrProvider::OpenAiRealtime => config
-            .asr
-            .openai_realtime
-            .base_url
-            .replace("wss://", "https://")
-            .replace("ws://", "http://"),
-    };
-    probe_upstream(&client, "asr", asr_url.trim_end_matches('/')).await;
-    probe_upstream(&client, "llm", config.llm.base_url.trim_end_matches('/')).await;
-    if !config.agent.weather.qweather_url.trim().is_empty() {
-        probe_upstream(&client, "weather", config.agent.weather.qweather_url.trim()).await;
-    }
-    for server in config
-        .mcp
-        .servers
-        .iter()
-        .filter(|s| s.enabled && !s.url.trim().is_empty())
-    {
-        probe_upstream(&client, &format!("mcp:{}", server.name), server.url.trim()).await;
-    }
-    let ha = &config.mcp.home_assistant;
-    if ha.enabled && !ha.url.trim().is_empty() {
-        probe_upstream(&client, "mcp:home_assistant", ha.url.trim()).await;
-    }
-    if config.runtime.mode == "dual" && !config.dual.kws.endpoint.trim().is_empty() {
-        let ep = config.dual.kws.endpoint.trim();
-        match crate::frontend::external_kws::probe_external_kws(ep, Duration::from_secs(2)).await
-        {
-            Ok(rtt) => println!("  external_kws: reachable ({} ms) {ep}", rtt.as_millis()),
-            Err(err) => println!("  external_kws: UNREACHABLE ({err}) {ep}"),
+    for u in &report.upstreams {
+        if u.label == "external_kws" {
+            if u.reachable {
+                println!("  external_kws: reachable ({} ms) {}", u.rtt_ms, u.url);
+            } else {
+                println!(
+                    "  external_kws: UNREACHABLE ({}) {}",
+                    u.error.as_deref().unwrap_or("unknown"),
+                    u.url
+                );
+            }
+        } else if u.reachable {
+            println!(
+                "  {}: reachable ({} ms, HTTP {}) {}",
+                u.label,
+                u.rtt_ms,
+                u.status_code.unwrap_or(0),
+                u.url
+            );
+        } else {
+            println!(
+                "  {}: UNREACHABLE ({}) {}",
+                u.label,
+                u.error.as_deref().unwrap_or("unknown"),
+                u.url
+            );
         }
     }
     Ok(())
@@ -1259,10 +1219,13 @@ mod tests {
         };
         let state = Arc::new(crate::server::ControlState {
             token: String::new(),
+            mode: "exclusive".to_string(),
             socket: SocketOwnership::unattributed(std::env::temp_dir().join("xiaoai-not-there")),
             liveness: SpeechLiveness::default(),
+            native_monitor: None,
             started_at: std::time::Instant::now(),
             config_path: None,
+            log_path: None,
             telemetry: RuntimeTelemetry::default(),
         });
 

@@ -1,9 +1,12 @@
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -15,8 +18,11 @@ use tracing::info;
 
 use crate::agent::AgentRuntime;
 use crate::audio::{AudioCoordinator, FinishMode, VolumeAction};
-use crate::config::{ConfigHandle, ServerConfig};
+use crate::config::{AppConfig, ConfigHandle, ServerConfig};
+use crate::frontend::native_monitor::NativeWakeMonitor;
 use crate::music::MusicService;
+use crate::runtime::config_admin;
+use crate::runtime::doctor;
 use crate::session::ControlCommand;
 use crate::speech::{SocketOwnership, SpeechLiveness};
 
@@ -99,10 +105,13 @@ impl RuntimeTelemetry {
 /// 「进程还在吗」细一级。
 pub struct ControlState {
     pub token: String,
+    pub mode: String,
     pub socket: SocketOwnership,
     pub liveness: SpeechLiveness,
+    pub native_monitor: Option<NativeWakeMonitor>,
     pub started_at: Instant,
     pub config_path: Option<PathBuf>,
+    pub log_path: Option<PathBuf>,
     pub telemetry: RuntimeTelemetry,
 }
 
@@ -206,6 +215,10 @@ fn build_router_with_hooks(state: Arc<ControlState>, hooks: ControlHooks) -> Rou
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/music/status", get(music_status))
+        .route("/history", get(get_history))
+        .route("/config", get(get_config))
+        .route("/doctor", get(get_doctor))
+        .route("/logs", get(get_logs))
         .route("/stop", post(stop_output))
         .route("/speak", post(speak))
         .route("/chat", post(chat))
@@ -217,6 +230,10 @@ fn build_router_with_hooks(state: Arc<ControlState>, hooks: ControlHooks) -> Rou
         .route("/music/previous", post(music_previous))
         .route("/music/stop", post(music_stop))
         .route("/history/clear", post(clear_history))
+        .route("/history/delete", post(delete_history))
+        .route("/config/form", post(save_config_form))
+        .route("/config/yaml", post(save_config_yaml))
+        .route("/config/rollback", post(rollback_config))
         .route_layer(axum::middleware::from_fn_with_state(
             router_state.clone(),
             require_token,
@@ -563,10 +580,86 @@ async fn music_stop(State(state): State<RouterState>) -> Response {
     (StatusCode::OK, no_store(), Json(music.stop().await)).into_response()
 }
 
-async fn clear_history(State(state): State<RouterState>) -> Response {
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct HistoryQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ClearHistoryPayload {
+    clear_log: bool,
+}
+
+#[derive(Deserialize)]
+struct DeleteHistoryPayload {
+    id: u64,
+}
+
+#[derive(Deserialize)]
+struct YamlConfigPayload {
+    yaml: String,
+    #[serde(default)]
+    validate_only: bool,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LogsQuery {
+    lines: Option<usize>,
+    level: Option<String>,
+    q: Option<String>,
+}
+
+async fn get_history(State(state): State<RouterState>, Query(query): Query<HistoryQuery>) -> Response {
+    let Some(agent) = &state.hooks.agent else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "history_unavailable" })),
+        )
+            .into_response();
+    };
+    let (entries, total, context_turns) = agent.conversation_snapshot(query.limit.unwrap_or(50)).await;
+    let (max_turns, ttl_s) = AgentRuntime::history_limits();
+    (
+        StatusCode::OK,
+        no_store(),
+        Json(json!({
+            "entries": entries,
+            "total": total,
+            "context_turns": context_turns,
+            "context_max_turns": max_turns,
+            "context_ttl_s": ttl_s,
+        })),
+    )
+        .into_response()
+}
+
+async fn clear_history(State(state): State<RouterState>, body: Bytes) -> Response {
+    let clear_log = if body.iter().all(u8::is_ascii_whitespace) {
+        false
+    } else {
+        match serde_json::from_slice::<ClearHistoryPayload>(&body) {
+            Ok(p) => p.clear_log,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    no_store(),
+                    Json(json!({ "error": format!("invalid_payload: {err}") })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
     let mut handled = false;
     if let Some(agent) = &state.hooks.agent {
         agent.reset_session("clear history").await;
+        if clear_log {
+            agent.clear_conversation_log().await;
+        }
         handled = true;
     }
     if let Some(tx) = &state.hooks.command_tx {
@@ -575,7 +668,12 @@ async fn clear_history(State(state): State<RouterState>) -> Response {
         }
     }
     if handled {
-        (StatusCode::OK, no_store(), Json(json!({ "ok": true }))).into_response()
+        (
+            StatusCode::OK,
+            no_store(),
+            Json(json!({ "ok": true, "cleared_log": clear_log })),
+        )
+            .into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -584,6 +682,338 @@ async fn clear_history(State(state): State<RouterState>) -> Response {
         )
             .into_response()
     }
+}
+
+async fn delete_history(
+    State(state): State<RouterState>,
+    Json(payload): Json<DeleteHistoryPayload>,
+) -> Response {
+    let Some(agent) = &state.hooks.agent else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "history_unavailable" })),
+        )
+            .into_response();
+    };
+    let deleted = agent.delete_conversation_entry(payload.id).await;
+    (
+        StatusCode::OK,
+        no_store(),
+        Json(json!({ "ok": true, "deleted": deleted })),
+    )
+        .into_response()
+}
+
+async fn trigger_reload_after_save(state: &RouterState, path: &Path) -> bool {
+    if let Some(tx) = &state.hooks.reload_tx {
+        if tx.send(()).await.is_ok() {
+            return true;
+        }
+    }
+    if let (Some(cfg), Some(agent)) = (&state.hooks.config, &state.hooks.agent) {
+        crate::runtime::reload::apply_config_reload(cfg, path, agent).await;
+        return true;
+    }
+    false
+}
+
+async fn get_config(State(state): State<RouterState>) -> Response {
+    let (Some(path), Some(cfg_handle)) = (&state.control.config_path, &state.hooks.config) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "config_unavailable" })),
+        )
+            .into_response();
+    };
+    let effective = cfg_handle.get().await;
+    match config_admin::read_config_view(path, &effective) {
+        Ok(view) => (StatusCode::OK, no_store(), Json(view)).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            no_store(),
+            Json(json!({ "error": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn save_config_form(State(state): State<RouterState>, Json(patch): Json<Value>) -> Response {
+    let (Some(path), Some(cfg_handle)) = (&state.control.config_path, &state.hooks.config) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "config_unavailable" })),
+        )
+            .into_response();
+    };
+    let effective = cfg_handle.get().await;
+    match config_admin::validate_and_save_form(path, &patch, &effective) {
+        Ok(outcome) => {
+            let reloaded = if outcome.should_reload {
+                trigger_reload_after_save(&state, path).await
+            } else {
+                false
+            };
+            (
+                StatusCode::OK,
+                no_store(),
+                Json(json!({
+                    "ok": true,
+                    "reloaded": reloaded,
+                    "outcome": outcome,
+                })),
+            )
+                .into_response()
+        }
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            no_store(),
+            Json(json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn save_config_yaml(
+    State(state): State<RouterState>,
+    Json(payload): Json<YamlConfigPayload>,
+) -> Response {
+    let (Some(path), Some(cfg_handle)) = (&state.control.config_path, &state.hooks.config) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "config_unavailable" })),
+        )
+            .into_response();
+    };
+    let effective = cfg_handle.get().await;
+    match config_admin::validate_and_save_yaml(path, &payload.yaml, &effective, payload.validate_only) {
+        Ok(outcome) => {
+            let reloaded = if outcome.should_reload {
+                trigger_reload_after_save(&state, path).await
+            } else {
+                false
+            };
+            (
+                StatusCode::OK,
+                no_store(),
+                Json(json!({
+                    "ok": true,
+                    "validate_only": payload.validate_only,
+                    "reloaded": reloaded,
+                    "outcome": outcome,
+                })),
+            )
+                .into_response()
+        }
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            no_store(),
+            Json(json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn rollback_config(State(state): State<RouterState>) -> Response {
+    let (Some(path), Some(cfg_handle)) = (&state.control.config_path, &state.hooks.config) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "config_unavailable" })),
+        )
+            .into_response();
+    };
+    let effective = cfg_handle.get().await;
+    match config_admin::rollback_from_backup(path, &effective) {
+        Ok(outcome) => {
+            let reloaded = if outcome.should_reload {
+                trigger_reload_after_save(&state, path).await
+            } else {
+                false
+            };
+            (
+                StatusCode::OK,
+                no_store(),
+                Json(json!({
+                    "ok": true,
+                    "reloaded": reloaded,
+                    "outcome": outcome,
+                })),
+            )
+                .into_response()
+        }
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            no_store(),
+            Json(json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_doctor(State(state): State<RouterState>) -> Response {
+    let cfg = if let Some(handle) = &state.hooks.config {
+        (*handle.get().await).clone()
+    } else if let Some(path) = &state.control.config_path {
+        AppConfig::load(path).unwrap_or_default()
+    } else {
+        AppConfig::default()
+    };
+    let report = doctor::collect_doctor_report(
+        &cfg,
+        state.control.config_path.as_deref(),
+        state.control.native_monitor.as_ref(),
+    )
+    .await;
+    (StatusCode::OK, no_store(), Json(report)).into_response()
+}
+
+fn resolve_log_path(state: &ControlState) -> PathBuf {
+    if let Some(path) = &state.log_path {
+        return path.clone();
+    }
+    if let Ok(env_path) = std::env::var("XIAOAI_AGENT_LOG") {
+        let trimmed = env_path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    let primary = PathBuf::from("/tmp/xiaoai-agent.log");
+    if primary.exists() {
+        return primary;
+    }
+    let secondary = PathBuf::from("/tmp/xiaoai-agent/agent.log");
+    if secondary.exists() {
+        return secondary;
+    }
+    primary
+}
+
+fn strip_ansi_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+async fn get_logs(State(state): State<RouterState>, Query(query): Query<LogsQuery>) -> Response {
+    const MAX_TAIL_BYTES: u64 = 64 * 1024;
+    let path = resolve_log_path(&state.control);
+    let max_lines = query.lines.unwrap_or(150).clamp(1, 500);
+    let level_filter = query
+        .level
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_uppercase);
+    let keyword = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase);
+
+    if !path.exists() {
+        return (
+            StatusCode::OK,
+            no_store(),
+            Json(json!({
+                "path": path.display().to_string(),
+                "exists": false,
+                "file_size_bytes": 0,
+                "truncated": false,
+                "lines": Vec::<String>::new(),
+            })),
+        )
+            .into_response();
+    }
+
+    let Ok(mut file) = OpenOptions::new().read(true).open(&path) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            no_store(),
+            Json(json!({ "error": "cannot_open_log" })),
+        )
+            .into_response();
+    };
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let truncated = file_size > MAX_TAIL_BYTES;
+    let start = file_size.saturating_sub(MAX_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            no_store(),
+            Json(json!({ "error": "cannot_seek_log" })),
+        )
+            .into_response();
+    }
+
+    let mut buf = Vec::with_capacity((file_size - start) as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            no_store(),
+            Json(json!({ "error": "cannot_read_log" })),
+        )
+            .into_response();
+    }
+
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        if let Some(pos) = text.find('\n') {
+            text = text[pos + 1..].to_string();
+        }
+    }
+
+    let mut matched: Vec<String> = text
+        .lines()
+        .map(strip_ansi_escapes)
+        .filter(|line| {
+            if let Some(ref lvl) = level_filter {
+                if !line.to_ascii_uppercase().contains(lvl) {
+                    return false;
+                }
+            }
+            if let Some(ref kw) = keyword {
+                if !line.to_ascii_lowercase().contains(kw) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    if matched.len() > max_lines {
+        let drop_n = matched.len() - max_lines;
+        matched.drain(..drop_n);
+    }
+
+    (
+        StatusCode::OK,
+        no_store(),
+        Json(json!({
+            "path": path.display().to_string(),
+            "exists": true,
+            "file_size_bytes": file_size,
+            "truncated": truncated,
+            "lines": matched,
+        })),
+    )
+        .into_response()
 }
 
 /// 监控端点被缓存没有任何好处（`fetch` 默认会走 HTTP 缓存），显式禁掉。
@@ -600,9 +1030,25 @@ fn no_store() -> [(axum::http::header::HeaderName, &'static str); 2] {
 /// 而进程本身还活得好好的。所以「进程在」不能当健康，inode 归属才能当健康。
 /// 收包年龄只作为诊断字段返回，不参与判定：没人说话时长期没有音频包是正常的。
 fn health_response(state: &ControlState) -> (StatusCode, Value) {
+    if state.mode == "dual" {
+        let body = json!({
+            "status": "ok",
+            "mode": "dual",
+            "uptime_s": state.started_at.elapsed().as_secs(),
+            "socket": {
+                "path": state.socket.path().display().to_string(),
+                "owned": false,
+            },
+            "speech": speech_json(state),
+            "native_interlock": state.native_monitor.as_ref().map(NativeWakeMonitor::status),
+        });
+        return (StatusCode::OK, body);
+    }
+
     let owned = state.socket.still_owned();
     let body = json!({
         "status": if owned { "ok" } else { "socket_not_owned" },
+        "mode": state.mode,
         "uptime_s": state.started_at.elapsed().as_secs(),
         "socket": {
             "path": state.socket.path().display().to_string(),
@@ -621,6 +1067,7 @@ fn health_response(state: &ControlState) -> (StatusCode, Value) {
 fn status_body(state: &ControlState) -> Value {
     json!({
         "pid": std::process::id(),
+        "mode": state.mode,
         "uptime_s": state.started_at.elapsed().as_secs(),
         "config": state.config_path.as_ref().map(|p| p.display().to_string()),
         "phase": state.telemetry.phase().as_str(),
@@ -630,6 +1077,7 @@ fn status_body(state: &ControlState) -> Value {
             "owned": state.socket.still_owned(),
         },
         "speech": speech_json(state),
+        "native_interlock": state.native_monitor.as_ref().map(NativeWakeMonitor::status),
     })
 }
 
@@ -698,10 +1146,13 @@ mod tests {
         };
         Arc::new(ControlState {
             token: token.to_string(),
+            mode: "exclusive".to_string(),
             socket,
             liveness,
+            native_monitor: None,
             started_at: Instant::now(),
             config_path: None,
+            log_path: None,
             telemetry: RuntimeTelemetry::default(),
         })
     }
@@ -820,7 +1271,15 @@ mod tests {
         // 除了面板，**每一条**路由都必须要求鉴权。这是路由级断言：
         // 新增端点忘了挂 layer 会直接红。
         let client = reqwest::Client::new();
-        for path in ["/health", "/status", "/music/status"] {
+        for path in [
+            "/health",
+            "/status",
+            "/music/status",
+            "/history",
+            "/config",
+            "/doctor",
+            "/logs",
+        ] {
             let unauth = client
                 .get(format!("http://127.0.0.1:{port}{path}"))
                 .send()
@@ -840,6 +1299,10 @@ mod tests {
             "/music/next",
             "/music/previous",
             "/history/clear",
+            "/history/delete",
+            "/config/form",
+            "/config/yaml",
+            "/config/rollback",
         ] {
             let unauth = client
                 .post(format!("http://127.0.0.1:{port}{path}"))
@@ -851,7 +1314,17 @@ mod tests {
         }
 
         // 状态变更端点绝不允许 GET（防 CSRF），哪怕带了合法令牌也必须 405 Method Not Allowed。
-        for path in ["/stop", "/speak", "/volume", "/reload", "/history/clear"] {
+        for path in [
+            "/stop",
+            "/speak",
+            "/volume",
+            "/reload",
+            "/history/clear",
+            "/history/delete",
+            "/config/form",
+            "/config/yaml",
+            "/config/rollback",
+        ] {
             let get_mut = client
                 .get(format!("http://127.0.0.1:{port}{path}"))
                 .bearer_auth("s3cret")
@@ -1257,5 +1730,280 @@ mod tests {
 
         handle.abort();
         cleanup(&state);
+    }
+
+    #[test]
+    fn dual_mode_health_returns_200_and_reports_native_interlock_state() {
+        let mut ni_cfg = crate::config::NativeInterlockConfig::default();
+        ni_cfg.syslog_path = None;
+        ni_cfg.instruction_log_path = None;
+        let monitor = NativeWakeMonitor::spawn(&ni_cfg);
+        let state = Arc::new(ControlState {
+            token: String::new(),
+            mode: "dual".to_string(),
+            socket: SocketOwnership::unattributed(PathBuf::from("udp://127.0.0.1:5005")),
+            liveness: SpeechLiveness::default(),
+            native_monitor: Some(monitor.clone()),
+            started_at: Instant::now(),
+            config_path: None,
+            log_path: None,
+            telemetry: RuntimeTelemetry::default(),
+        });
+
+        let (code, body) = health_response(&state);
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["mode"], "dual");
+        assert_eq!(body["native_interlock"]["state"], "idle");
+
+        monitor.notify_native_utterance();
+        let (code2, body2) = health_response(&state);
+        assert_eq!(code2, StatusCode::OK);
+        assert_eq!(body2["native_interlock"]["state"], "cooldown");
+        assert_eq!(body2["native_interlock"]["wake_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn history_endpoints_list_delete_and_optionally_clear_log() {
+        let shell = Arc::new(crate::shell::RecordingShell::always_ok());
+        let (audio, cfg, music) = test_audio_and_config(shell.clone()).await;
+        let device = crate::device::Device::with_runner(cfg.get().await.device.clone(), shell);
+        let agent = Arc::new(AgentRuntime::new(cfg.clone(), device, music.clone()).await.unwrap());
+        agent.record_partial_turn("你好", "在呢").await;
+        agent.record_partial_turn("北京天气", "晴天").await;
+
+        let hooks = ControlHooks {
+            audio: Some(audio),
+            music: Some(music),
+            agent: Some(agent.clone()),
+            config: Some(cfg),
+            ..ControlHooks::default()
+        };
+        let (port, state, handle) = spawn_test_server_with_hooks("tok", hooks).await;
+        let client = reqwest::Client::new();
+
+        let list = client
+            .get(format!("http://127.0.0.1:{port}/history?limit=10"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list.status(), 200);
+        let body: Value = list.json().await.unwrap();
+        assert_eq!(body["total"], 2);
+        let first_id = body["entries"][0]["id"].as_u64().unwrap();
+
+        // /history/clear with empty JSON clears LLM context only
+        let clear_ctx = client
+            .post(format!("http://127.0.0.1:{port}/history/clear"))
+            .bearer_auth("tok")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clear_ctx.status(), 200);
+        assert_eq!(clear_ctx.json::<Value>().await.unwrap()["cleared_log"], false);
+        assert_eq!(agent.history_len_for_test().await, 0);
+
+        // /history/delete deletes one entry
+        let del = client
+            .post(format!("http://127.0.0.1:{port}/history/delete"))
+            .bearer_auth("tok")
+            .json(&json!({ "id": first_id }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(del.status(), 200);
+        assert_eq!(del.json::<Value>().await.unwrap()["deleted"], true);
+
+        // /history/clear with clear_log=true empties admin log too
+        let clear_all = client
+            .post(format!("http://127.0.0.1:{port}/history/clear"))
+            .bearer_auth("tok")
+            .json(&json!({ "clear_log": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(clear_all.status(), 200);
+        assert_eq!(clear_all.json::<Value>().await.unwrap()["cleared_log"], true);
+        let after = client
+            .get(format!("http://127.0.0.1:{port}/history"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(after["total"], 0);
+
+        handle.abort();
+        cleanup(&state);
+    }
+
+    #[tokio::test]
+    async fn config_endpoints_redact_validate_save_reload_and_rollback() {
+        let dir = std::env::temp_dir().join(format!("xiaoai-srv-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("agent.yaml");
+        std::fs::write(
+            &cfg_path,
+            "runtime:\n  mode: dual\nllm:\n  model: m1\n  api_key: secret-abc\nagent:\n  tools_enabled: false\nairplay:\n  enabled: false\ntts:\n  provider: native\n",
+        )
+        .unwrap();
+
+        let initial = AppConfig::load(&cfg_path).unwrap();
+        let cfg_handle = ConfigHandle::new(Arc::new(initial.clone()));
+        let shell = Arc::new(crate::shell::RecordingShell::always_ok());
+        let device = crate::device::Device::with_runner(initial.device.clone(), shell.clone());
+        let music = Arc::new(MusicService::new(cfg_handle.clone(), device.clone()).unwrap());
+        let agent = Arc::new(AgentRuntime::new(cfg_handle.clone(), device, music.clone()).await.unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(ControlState {
+            token: "tok".to_string(),
+            mode: "dual".to_string(),
+            socket: SocketOwnership::unattributed(PathBuf::from("udp://127.0.0.1:5005")),
+            liveness: SpeechLiveness::default(),
+            native_monitor: None,
+            started_at: Instant::now(),
+            config_path: Some(cfg_path.clone()),
+            log_path: None,
+            telemetry: RuntimeTelemetry::default(),
+        });
+        let hooks = ControlHooks {
+            agent: Some(agent),
+            config: Some(cfg_handle.clone()),
+            music: Some(music),
+            ..ControlHooks::default()
+        };
+        let app = build_router_with_hooks(state.clone(), hooks);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let get_cfg: Value = client
+            .get(format!("http://127.0.0.1:{port}/config"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!get_cfg["yaml"].as_str().unwrap().contains("secret-abc"));
+        assert_eq!(get_cfg["form"]["llm"]["api_key_set"], true);
+
+        // Invalid YAML syntax or invalid config schema -> 400 and does NOT modify disk
+        for bad_yaml in ["llm: [\nbroken", "tts:\n  provider: bogus_provider\n"] {
+            let bad = client
+                .post(format!("http://127.0.0.1:{port}/config/yaml"))
+                .bearer_auth("tok")
+                .json(&json!({ "yaml": bad_yaml, "validate_only": false }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bad.status(), 400);
+            assert_eq!(AppConfig::load(&cfg_path).unwrap().llm.model, "m1");
+        }
+
+        // Save form -> updates disk & reloads effective ConfigHandle while keeping secret
+        let save_form = client
+            .post(format!("http://127.0.0.1:{port}/config/form"))
+            .bearer_auth("tok")
+            .json(&json!({ "llm": { "model": "m2", "api_key": "" } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(save_form.status(), 200);
+        let save_body: Value = save_form.json().await.unwrap();
+        assert_eq!(save_body["reloaded"], true);
+        assert_eq!(cfg_handle.get().await.llm.model, "m2");
+        assert_eq!(cfg_handle.get().await.llm.api_key, "secret-abc");
+
+        // Rollback -> restores m1
+        let rb = client
+            .post(format!("http://127.0.0.1:{port}/config/rollback"))
+            .bearer_auth("tok")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rb.status(), 200);
+        assert_eq!(cfg_handle.get().await.llm.model, "m1");
+
+        handle.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn logs_and_doctor_endpoints_return_bounded_tail_and_diagnostics() {
+        let dir = std::env::temp_dir().join(format!("xiaoai-srv-diag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("agent.log");
+        let mut log_content = String::new();
+        for i in 0..300 {
+            let lvl = if i % 10 == 0 { "\x1b[33mWARN\x1b[0m" } else { "\x1b[32mINFO\x1b[0m" };
+            log_content.push_str(&format!("2026-11-27T15:00:00Z {lvl} line={i} needle_{}\n", i % 3));
+        }
+        std::fs::write(&log_path, &log_content).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(ControlState {
+            token: "tok".to_string(),
+            mode: "exclusive".to_string(),
+            socket: still_owned_socket("diag"),
+            liveness: SpeechLiveness::default(),
+            native_monitor: None,
+            started_at: Instant::now(),
+            config_path: None,
+            log_path: Some(log_path.clone()),
+            telemetry: RuntimeTelemetry::default(),
+        });
+        let app = build_router_with_hooks(state.clone(), ControlHooks::default());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let logs: Value = client
+            .get(format!("http://127.0.0.1:{port}/logs?lines=5&level=WARN&q=needle_0"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(logs["exists"], true);
+        let lines = logs["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 5);
+        for l in lines {
+            let s = l.as_str().unwrap();
+            assert!(
+                s.contains("WARN") && s.contains("needle_0") && !s.contains('\x1b'),
+                "unexpected line: {s}"
+            );
+        }
+
+        let doc: Value = client
+            .get(format!("http://127.0.0.1:{port}/doctor"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(doc["mode"], "exclusive");
+        assert!(doc["warnings"].is_array());
+        assert!(doc["upstreams"].is_array());
+
+        handle.abort();
+        cleanup(&state);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

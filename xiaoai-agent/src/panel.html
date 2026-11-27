@@ -8,223 +8,369 @@
 <style>
   :root {
     color-scheme: light dark;
-    --bg: #f5f6f5;
+    --bg: #f4f6f4;
     --card: #ffffff;
-    --line: rgba(0, 0, 0, .10);
-    --line-strong: rgba(0, 0, 0, .20);
-    --fg: #1a1f1c;
-    --fg-2: #5c6762;
-    --fg-3: #8b9590;
+    --subtle: #f8faf8;
+    --line: rgba(0, 0, 0, .09);
+    --line-strong: rgba(0, 0, 0, .18);
+    --fg: #181d1a;
+    --fg-2: #525d57;
+    --fg-3: #838e88;
     --ok: #0f7a52;
     --warn: #9a5b0b;
-    --bad: #a52a2a;
+    --bad: #b42318;
     --idle: #6d7671;
     --ok-bg: #eaf6f0;
     --warn-bg: #fdf3e3;
-    --bad-bg: #fbeceb;
-    --idle-bg: #eef0ef;
+    --bad-bg: #fef3f2;
+    --idle-bg: #eef1ef;
+    --user-bg: #0f7a52;
+    --user-fg: #ffffff;
+    --shadow: 0 8px 24px rgba(0, 0, 0, .10);
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #121614;
-      --card: #1b201e;
-      --line: rgba(255, 255, 255, .10);
-      --line-strong: rgba(255, 255, 255, .22);
+    :root:not([data-theme="light"]) {
+      --bg: #111513;
+      --card: #191f1c;
+      --subtle: #141917;
+      --line: rgba(255, 255, 255, .09);
+      --line-strong: rgba(255, 255, 255, .20);
       --fg: #e9eeeb;
-      --fg-2: #9fa9a4;
-      --fg-3: #6f7975;
+      --fg-2: #a0aba5;
+      --fg-3: #6c7772;
       --ok: #5dcaa5;
       --warn: #efb05e;
-      --bad: #f09595;
+      --bad: #f97066;
       --idle: #98a29d;
-      --ok-bg: #152b23;
-      --warn-bg: #2b2416;
-      --bad-bg: #2b1717;
-      --idle-bg: #1f2523;
+      --ok-bg: #142b23;
+      --warn-bg: #2a2214;
+      --bad-bg: #2d1818;
+      --idle-bg: #202624;
+      --user-bg: #166a4a;
+      --user-fg: #f3faf6;
+      --shadow: 0 10px 28px rgba(0, 0, 0, .42);
     }
+  }
+  :root[data-theme="dark"] {
+    --bg: #111513;
+    --card: #191f1c;
+    --subtle: #141917;
+    --line: rgba(255, 255, 255, .09);
+    --line-strong: rgba(255, 255, 255, .20);
+    --fg: #e9eeeb;
+    --fg-2: #a0aba5;
+    --fg-3: #6c7772;
+    --ok: #5dcaa5;
+    --warn: #efb05e;
+    --bad: #f97066;
+    --idle: #98a29d;
+    --ok-bg: #142b23;
+    --warn-bg: #2a2214;
+    --bad-bg: #2d1818;
+    --idle-bg: #202624;
+    --user-bg: #166a4a;
+    --user-fg: #f3faf6;
+    --shadow: 0 10px 28px rgba(0, 0, 0, .42);
   }
 
   * { box-sizing: border-box; }
   body {
-    margin: 0;
-    padding: 26px 20px 32px;
-    background: var(--bg);
-    color: var(--fg);
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 720px; margin: 0 auto; }
 
-  .top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-  h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
-  .host { font-family: var(--mono); font-size: 12px; color: var(--fg-3); }
+  /* Responsive shell */
+  .shell { display: flex; min-height: 100vh; }
+  .sidebar {
+    width: 216px; flex: none; position: sticky; top: 0; height: 100vh;
+    display: flex; flex-direction: column; padding: 18px 12px 14px;
+    background: var(--card); border-right: 1px solid var(--line); z-index: 25;
+  }
+  .brand { padding: 2px 10px 14px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+  .brand h1 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
+  .brand .host { display: block; margin-top: 2px; font-family: var(--mono); font-size: 11px; color: var(--fg-3); word-break: break-all; }
 
+  .nav-list { display: flex; flex-direction: column; gap: 4px; }
+  .nav-btn {
+    display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+    font: inherit; font-size: 13.5px; font-weight: 500;
+    padding: 9px 12px; border: 0; border-radius: 9px;
+    background: transparent; color: var(--fg-2); cursor: pointer;
+  }
+  .nav-btn:hover { background: var(--idle-bg); color: var(--fg); }
+  .nav-btn[aria-selected="true"] { background: var(--ok-bg); color: var(--ok); font-weight: 600; }
+
+  .side-foot { margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+  .side-meta { font-size: 11px; color: var(--fg-3); padding: 0 6px; }
+
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    padding: 10px 22px; background: var(--card); border-bottom: 1px solid var(--line);
+  }
+  .top-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+  .top-right { display: flex; align-items: center; gap: 7px; margin-left: auto; }
+  .status-chip { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; }
+  .sdot { width: 9px; height: 9px; border-radius: 50%; background: var(--idle); }
+  .sdot[data-tone="ok"] { background: var(--ok); }
+  .sdot[data-tone="warn"] { background: var(--warn); }
+  .sdot[data-tone="bad"] { background: var(--bad); }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 500;
+    background: var(--idle-bg); color: var(--fg-2); border: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  .pill[data-tone="ok"] { background: var(--ok-bg); color: var(--ok); border-color: transparent; }
+  .pill[data-tone="warn"] { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
+  .pill[data-tone="bad"] { background: var(--bad-bg); color: var(--bad); border-color: transparent; }
+
+  .content { flex: 1; width: 100%; max-width: 1060px; margin: 0 auto; padding: 18px 22px 92px; }
+  .pane { display: none; }
+  .pane.active { display: block; }
+  .hidden { display: none !important; }
+
+  /* Buttons & Inputs */
+  .btn {
+    font: inherit; font-size: 12.5px; padding: 6px 12px;
+    border: 1px solid var(--line-strong); border-radius: 8px;
+    background: transparent; color: var(--fg-2); cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn:hover { background: var(--idle-bg); color: var(--fg); }
+  .btn:focus-visible { outline: 2px solid var(--ok); outline-offset: 2px; }
+  .btn:disabled, .btn:disabled:hover { opacity: .42; cursor: default; background: transparent; color: var(--fg-3); }
+  .btn-sm { padding: 4px 10px; font-size: 12px; }
+  .btn-danger { border-color: var(--bad); color: var(--bad); }
+  .btn-danger:hover { background: var(--bad-bg); color: var(--bad); }
+  .btn-danger-fill { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; }
+  .btn-danger-fill:hover { opacity: .92; background: var(--bad); color: #fff; }
+  .btn-accent { border-color: var(--ok); color: var(--ok); font-weight: 500; }
+  .btn-accent:hover { background: var(--ok-bg); color: var(--ok); }
+  .btn-primary { background: var(--ok); border-color: var(--ok); color: #fff; font-weight: 600; }
+  .btn-primary:hover { opacity: .92; background: var(--ok); color: #fff; }
+
+  input[type="text"], input[type="password"], input[type="number"], select, textarea {
+    font: inherit; font-size: 13px; padding: 7px 10px;
+    border: 1px solid var(--line-strong); border-radius: 8px;
+    background: var(--subtle); color: var(--fg); min-width: 0;
+  }
+  input[readonly] { opacity: .72; cursor: default; }
+  input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--ok); outline-offset: 1px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .grow { flex: 1 1 190px; }
+
+  /* Overview */
   .verdict {
-    display: flex;
-    align-items: flex-start;
-    gap: 14px;
-    flex-wrap: wrap;
-    padding: 18px 20px;
-    border: 1px solid var(--line);
-    border-radius: 16px;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 15px 18px; border: 1px solid var(--line); border-radius: 14px;
     background: var(--tone-bg, var(--idle-bg));
-    transition: background .2s ease;
   }
   .verdict[data-tone="idle"]     { --tone: var(--idle); --tone-bg: var(--idle-bg); }
   .verdict[data-tone="warn"]     { --tone: var(--warn); --tone-bg: var(--warn-bg); }
   .verdict[data-tone="bad"]      { --tone: var(--bad);  --tone-bg: var(--bad-bg); }
   .verdict[data-tone="ok"]       { --tone: var(--ok);   --tone-bg: var(--ok-bg); }
   .verdict[data-tone="ok-quiet"] { --tone: var(--ok);   --tone-bg: var(--ok-bg); }
-
   .dot {
-    width: 12px; height: 12px; flex: none;
-    margin-top: 7px;
-    border-radius: 50%;
-    border: 2px solid var(--tone, var(--idle));
-    background: var(--tone, var(--idle));
-    transition: background .2s ease, border-color .2s ease;
+    width: 11px; height: 11px; flex: none; border-radius: 50%;
+    border: 2px solid var(--tone, var(--idle)); background: var(--tone, var(--idle));
   }
   .verdict[data-tone="ok-quiet"] .dot { background: transparent; }
-
   .vtext { flex: 1 1 240px; min-width: 0; }
-  .vtitle { margin: 0; font-size: 21px; font-weight: 600; line-height: 1.32; letter-spacing: -.01em; }
-  .vdetail { margin: 6px 0 0; font-size: 13px; line-height: 1.55; color: var(--fg-2); }
+  .vtitle { margin: 0; font-size: 18px; font-weight: 650; line-height: 1.3; }
+  .vdetail { margin: 3px 0 0; font-size: 13px; color: var(--fg-2); }
   .vacts { display: flex; gap: 6px; margin-left: auto; }
 
-  .btn {
-    font: inherit; font-size: 12.5px;
-    padding: 6px 12px;
-    border: 1px solid var(--line-strong);
-    border-radius: 9px;
-    background: transparent;
-    color: var(--fg-2);
-    cursor: pointer;
-  }
-  .btn:hover { background: rgba(0, 0, 0, .05); color: var(--fg); }
-  .btn:focus-visible { outline: 2px solid var(--ok); outline-offset: 2px; }
-  .btn:disabled, .btn:disabled:hover { opacity: .4; cursor: default; background: transparent; color: var(--fg-3); }
-
-  .facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+  .facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
   .fact { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
-  .fact dt { font-size: 11.5px; color: var(--fg-3); margin-bottom: 5px; }
-  .fact dd { margin: 0; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
-  /* 绝对时刻：排障时要拿它去和 agent.log 对时间，相对时长对不上。 */
-  .fact dd .sub { display: block; margin-top: 3px; font-size: 11px; font-weight: 400; letter-spacing: 0; color: var(--fg-3); }
+  .fact dt { font-size: 11.5px; color: var(--fg-3); margin-bottom: 4px; }
+  .fact dd { margin: 0; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; word-break: break-word; }
+  .fact dd .sub { display: block; margin-top: 2px; font-size: 11px; font-weight: 400; color: var(--fg-3); }
 
-  details.fold {
-    margin-top: 12px;
-    background: var(--card);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    overflow: hidden;
+  .ctl-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }
+  .card {
+    margin-top: 12px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 15px 17px;
   }
+  .ctl-grid .card { margin-top: 0; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .card-head h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--fg); }
+
+  .vol-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .vol-slider { display: flex; align-items: center; gap: 10px; flex: 1 1 180px; }
+  .vol-slider input[type="range"] { flex: 1; accent-color: var(--ok); cursor: pointer; }
+  .vol-num { font-family: var(--mono); font-size: 13px; font-weight: 600; min-width: 34px; text-align: right; color: var(--fg); }
+
+  .music-now { font-size: 13px; color: var(--fg-2); margin-bottom: 10px; }
+  .music-q { margin: 10px 0 0; padding-left: 18px; font-size: 12px; color: var(--fg-3); max-height: 120px; overflow: auto; }
+  .hint { margin: 6px 0 0; font-size: 12px; line-height: 1.5; color: var(--fg-3); }
+
+  /* Chat view */
+  .chat-card { display: flex; flex-direction: column; height: calc(100vh - 150px); min-height: 460px; max-height: 760px; padding: 0; overflow: hidden; }
+  .chat-bar {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+    padding: 11px 16px; border-bottom: 1px solid var(--line); background: var(--card);
+  }
+  .chat-viewport {
+    flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px;
+    background: var(--subtle);
+  }
+  .turn-group { display: flex; flex-direction: column; gap: 6px; }
+  .msg-row { display: flex; flex-direction: column; max-width: 82%; }
+  .msg-row.user { align-self: flex-end; align-items: flex-end; }
+  .msg-row.bot { align-self: flex-start; align-items: flex-start; }
+  .bubble {
+    padding: 9px 13px; border-radius: 13px; font-size: 13.5px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word; border: 1px solid var(--line);
+  }
+  .msg-row.user .bubble { background: var(--user-bg); color: var(--user-fg); border-color: transparent; border-bottom-right-radius: 4px; }
+  .msg-row.bot .bubble { background: var(--card); color: var(--fg); border-bottom-left-radius: 4px; }
+  .msg-row.pending .bubble { color: var(--fg-3); font-style: italic; }
+  .msg-meta { display: flex; align-items: center; gap: 6px; margin-top: 3px; font-size: 11px; color: var(--fg-3); }
+  .msg-del { border: 0; background: transparent; color: var(--fg-3); cursor: pointer; font-size: 11px; padding: 1px 4px; border-radius: 4px; }
+  .msg-del:hover { color: var(--bad); background: var(--bad-bg); }
+  .chat-compose { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); background: var(--card); }
+
+  /* Config view */
+  .banner {
+    padding: 10px 13px; border-radius: 10px; font-size: 12.5px; margin-bottom: 10px;
+    border: 1px solid var(--line); background: var(--warn-bg); color: var(--warn);
+  }
+  .subtabs { display: flex; gap: 6px; flex-wrap: wrap; padding-bottom: 10px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+  .subtab {
+    font: inherit; font-size: 12px; font-weight: 500; padding: 6px 11px;
+    border: 1px solid transparent; border-radius: 8px; background: var(--idle-bg); color: var(--fg-2); cursor: pointer;
+  }
+  .subtab[aria-selected="true"] { background: var(--ok-bg); color: var(--ok); font-weight: 600; border-color: rgba(15, 122, 82, .2); }
+
+  .sec-title {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    margin: 14px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line);
+    font-size: 13px; font-weight: 600; color: var(--fg);
+  }
+  .sec-title:first-child { margin-top: 0; }
+  .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px 14px; align-items: end; }
+  .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .field.full { grid-column: 1 / -1; }
+  .field label { font-size: 12px; color: var(--fg-2); }
+
+  /* Left-aligned boolean toggle row (never centered) */
+  .field.check, .check {
+    display: flex; flex-direction: row; align-items: center; justify-content: flex-start; gap: 8px;
+  }
+  .field.check {
+    padding: 8px 11px; border-radius: 8px; background: var(--subtle); border: 1px solid var(--line);
+  }
+  .field.check label, .check label {
+    display: inline-flex; align-items: center; justify-content: flex-start; gap: 8px;
+    width: 100%; margin: 0; font-size: 13px; color: var(--fg); cursor: pointer;
+  }
+  .check input[type="checkbox"] { width: 15px; height: 15px; margin: 0; flex: none; accent-color: var(--ok); }
+
+  .mcp-card {
+    padding: 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--subtle);
+    margin-bottom: 10px;
+  }
+  .mcp-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .group-card {
+    margin-top: 12px; padding: 13px 14px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--subtle);
+  }
+  .group-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .group-head .check { flex: 1 1 200px; }
+  .group-body { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--line); }
+  .muted-note {
+    margin: 8px 0 0; padding: 9px 12px; border-radius: 8px;
+    background: var(--idle-bg); color: var(--fg-2); font-size: 12.5px; line-height: 1.5;
+  }
+  .yaml-ed { width: 100%; min-height: 400px; font-family: var(--mono); font-size: 12px; line-height: 1.5; resize: vertical; }
+
+  details.adv, details.fold {
+    margin-top: 12px; background: var(--subtle); border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  }
+  details.fold { background: var(--card); }
   summary {
-    display: flex; align-items: center; gap: 8px;
-    padding: 12px 16px;
-    font-size: 13.5px; color: var(--fg-2);
-    cursor: pointer;
-    list-style: none;
+    display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+    font-size: 13px; font-weight: 500; color: var(--fg-2); cursor: pointer; list-style: none;
   }
   summary::-webkit-details-marker { display: none; }
   summary::before {
-    content: ""; flex: none;
-    width: 0; height: 0;
-    border-left: 5px solid var(--fg-3);
-    border-top: 4px solid transparent;
-    border-bottom: 4px solid transparent;
+    content: ""; flex: none; width: 0; height: 0;
+    border-left: 5px solid var(--fg-3); border-top: 4px solid transparent; border-bottom: 4px solid transparent;
     transition: transform .15s ease;
   }
   details[open] summary::before { transform: rotate(90deg); }
-  summary:focus-visible { outline: 2px solid var(--ok); outline-offset: -2px; }
   .count { margin-left: auto; font-size: 11.5px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
-  .foldbody { padding: 0 16px 14px; }
+  .foldbody { padding: 6px 14px 14px; }
 
-  .diag { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 14px; margin: 0 0 12px; font-size: 12.5px; }
-  .diag dt { color: var(--fg-3); }
-  .diag dd { margin: 0; font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  /* Sticky Dirty Save Bar */
+  .save-bar {
+    position: fixed; left: 238px; right: 22px; bottom: 16px; z-index: 28;
+    max-width: 1016px; margin: 0 auto;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    padding: 10px 16px; border-radius: 12px;
+    background: var(--card); border: 1px solid var(--ok); box-shadow: var(--shadow);
+  }
+  .save-bar .sb-msg { font-size: 13px; font-weight: 600; color: var(--ok); }
 
+  /* Doctor & Logs */
+  .diag { display: grid; grid-template-columns: minmax(90px, 180px) minmax(0, 1fr); gap: 6px 14px; margin: 0 0 10px; font-size: 12.5px; }
+  .diag > div { display: contents; }
+  .diag dt { color: var(--fg-3); overflow-wrap: anywhere; }
+  .diag dd { margin: 0; font-family: var(--mono); font-size: 12px; word-break: break-word; }
+  .tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 8px; }
+  .tbl th, .tbl td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  .tbl th { color: var(--fg-3); font-weight: 500; font-size: 11.5px; }
+  .tbl td.mono { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
   pre.raw {
-    margin: 0;
-    padding: 12px;
-    background: var(--idle-bg);
-    border-radius: 10px;
-    font-family: var(--mono);
-    font-size: 11.5px;
-    line-height: 1.5;
-    color: var(--fg-2);
-    overflow: auto;
-    max-height: 240px;
+    margin: 0; padding: 11px; background: var(--idle-bg); border-radius: 10px;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.48;
+    color: var(--fg-2); overflow: auto; max-height: 300px; white-space: pre-wrap; word-break: break-word;
   }
+  pre.logbox { max-height: 380px; white-space: pre; word-break: normal; }
 
-  .tokrow { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; }
-  .tokrow input {
-    flex: 1 1 220px; min-width: 0;
-    font: inherit; font-size: 13px;
-    padding: 9px 11px;
-    border: 1px solid var(--line-strong);
-    border-radius: 10px;
-    background: var(--bg);
-    color: var(--fg);
+  /* Auth Gate Modal */
+  .auth-gate {
+    position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+    padding: 20px; background: rgba(0, 0, 0, .48); backdrop-filter: blur(4px);
   }
-  .tokrow input:focus-visible { outline: 2px solid var(--ok); outline-offset: 1px; }
-  .hint { margin: 0; font-size: 12px; line-height: 1.55; color: var(--fg-3); }
+  .auth-card {
+    width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--line-strong);
+    border-radius: 16px; padding: 22px; box-shadow: var(--shadow);
+  }
+  .auth-card h2 { margin: 0 0 6px; font-size: 18px; }
+  .auth-card p { margin: 0 0 14px; font-size: 13px; color: var(--fg-2); }
 
-  .ctl {
-    margin-top: 12px;
-    background: var(--card);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 14px 16px;
+  /* Global Floating Toast */
+  .gtoast {
+    position: fixed; right: 20px; bottom: 20px; z-index: 60; max-width: 380px;
+    padding: 10px 15px; border-radius: 10px; font-size: 13px; font-weight: 500;
+    background: var(--card); color: var(--fg); border: 1px solid var(--line-strong); box-shadow: var(--shadow);
   }
-  .ctl-head {
-    display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
-    margin-bottom: 10px;
-  }
-  .ctl-head h2 { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--fg-2); }
-  .toast {
-    font-size: 12px; color: var(--fg-3);
-    min-height: 1.2em; text-align: right;
-  }
-  .toast[data-tone="ok"]  { color: var(--ok); }
-  .toast[data-tone="bad"] { color: var(--bad); }
+  .gtoast[data-tone="ok"] { background: var(--ok-bg); color: var(--ok); border-color: var(--ok); }
+  .gtoast[data-tone="warn"] { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
+  .gtoast[data-tone="bad"] { background: var(--bad-bg); color: var(--bad); border-color: var(--bad); }
 
-  .ctl-group { margin-top: 10px; }
-  .ctl-group:first-of-type { margin-top: 0; }
-  .ctl-label { font-size: 11.5px; color: var(--fg-3); margin-bottom: 6px; }
-  .btnrow { display: flex; gap: 7px; flex-wrap: wrap; }
-  .btn-danger { border-color: var(--bad); color: var(--bad); }
-  .btn-danger:hover { background: var(--bad-bg); color: var(--bad); }
-  .btn-accent { border-color: var(--ok); color: var(--ok); }
-  .btn-accent:hover { background: var(--ok-bg); color: var(--ok); }
-
-  .sayrow { display: flex; gap: 8px; flex-wrap: wrap; }
-  .sayrow input {
-    flex: 1 1 200px; min-width: 0;
-    font: inherit; font-size: 13px;
-    padding: 8px 11px;
-    border: 1px solid var(--line-strong);
-    border-radius: 9px;
-    background: var(--bg);
-    color: var(--fg);
-  }
-  .sayrow input:focus-visible { outline: 2px solid var(--ok); outline-offset: 1px; }
-
-  footer.foot {
-    display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap;
-    margin-top: 14px;
-    font-size: 11.5px;
-    color: var(--fg-3);
-  }
-
-  @media (max-width: 520px) {
-    body { padding: 18px 14px 26px; }
-    .vtitle { font-size: 18px; }
-    .vacts { width: 100%; margin-left: 0; }
-    .facts { grid-template-columns: 1fr; gap: 8px; }
-    .fact { display: flex; justify-content: space-between; align-items: baseline; padding: 11px 13px; }
-    .fact dt { margin-bottom: 0; font-size: 12.5px; }
-    .fact dd { font-size: 16px; }
+  @media (max-width: 768px) {
+    .shell { flex-direction: column; }
+    .sidebar {
+      position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: auto;
+      flex-direction: row; padding: 6px; border-right: 0; border-top: 1px solid var(--line);
+    }
+    .brand, .side-foot { display: none; }
+    .nav-list { flex-direction: row; width: 100%; gap: 4px; }
+    .nav-btn { flex: 1; justify-content: center; padding: 8px 4px; font-size: 12.5px; }
+    .topbar { padding: 9px 14px; }
+    .content { padding: 14px 14px 128px; }
+    .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .ctl-grid, .form-grid { grid-template-columns: 1fr; }
+    .save-bar { left: 10px; right: 10px; bottom: 62px; }
+    .gtoast { right: 12px; left: 12px; bottom: 64px; max-width: none; }
+    .chat-card { height: calc(100vh - 178px); }
   }
   @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
@@ -232,143 +378,747 @@
 </style>
 </head>
 <body>
-<main class="wrap">
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <h1>XiaoAI 控制台</h1>
+      <span class="host" id="host"></span>
+    </div>
+    <nav class="nav-list" role="tablist" aria-label="后台导航">
+      <button type="button" class="nav-btn" data-tab="overview" aria-selected="true">控制台</button>
+      <button type="button" class="nav-btn" data-tab="history" aria-selected="false">对话</button>
+      <button type="button" class="nav-btn" data-tab="config" aria-selected="false">配置</button>
+      <button type="button" class="nav-btn" data-tab="diag" aria-selected="false">运维诊断</button>
+    </nav>
+    <div class="side-foot">
+      <button type="button" class="btn btn-sm" id="themeBtn">主题：跟随系统</button>
+      <div class="side-meta" id="footRight">尚无数据</div>
+    </div>
+  </aside>
 
-  <div class="top">
-    <h1>XiaoAI 控制台</h1>
-    <span class="host" id="host"></span>
+  <div class="main">
+    <header class="topbar">
+      <div class="top-left">
+        <span class="status-chip"><span class="sdot" id="topDot"></span><span id="topStatus">连接中…</span></span>
+        <span class="pill" id="modeBadge">未知模式</span>
+        <span class="pill hidden" id="interlockBadge">互锁: 空闲</span>
+      </div>
+      <div class="top-right">
+        <button type="button" class="btn btn-sm btn-danger" id="globalStopBtn">停止播报/音乐</button>
+        <button type="button" class="btn btn-sm" id="mobileThemeBtn">主题</button>
+        <button type="button" class="btn btn-sm" id="tokenModalBtn">令牌</button>
+      </div>
+    </header>
+
+    <div class="content">
+      <!-- 1. 控制台 -->
+      <section class="pane active" id="pane-overview">
+        <section class="verdict" id="verdict" data-tone="idle">
+          <span class="dot" aria-hidden="true"></span>
+          <div class="vtext">
+            <p class="vtitle" id="vtitle" aria-live="polite">正在读取状态</p>
+            <p class="vdetail" id="vdetail" aria-live="off">验证访问令牌后将实时同步运行状态。</p>
+          </div>
+          <div class="vacts">
+            <button type="button" class="btn btn-sm" id="toggleBtn">暂停</button>
+            <button type="button" class="btn btn-sm" id="refreshBtn">刷新</button>
+          </div>
+        </section>
+
+        <dl class="facts">
+          <div class="fact"><dt>已运行</dt><dd id="fUptime">—</dd></div>
+          <div class="fact"><dt id="fMiddleLabel">上次收包</dt><dd><span id="fPacket">—</span><span class="sub" id="fPacketAt"></span></dd></div>
+          <div class="fact"><dt id="fRightLabel">异常重启</dt><dd id="fRestarts">—</dd></div>
+          <div class="fact"><dt>末轮出声耗时</dt><dd><span id="fLatency">—</span><span class="sub" id="fPhaseSub">阶段：—</span></dd></div>
+        </dl>
+
+        <div class="ctl-grid">
+          <section class="card" aria-label="音量调节">
+            <div class="card-head">
+              <h2>音量调节（松手生效）</h2>
+            </div>
+            <div class="vol-row">
+              <button type="button" class="btn btn-sm" id="volDownBtn">-</button>
+              <button type="button" class="btn btn-sm" id="volUpBtn">+</button>
+              <button type="button" class="btn btn-sm" id="volMuteBtn">静音</button>
+              <div class="vol-slider">
+                <input type="range" id="volRange" min="0" max="100" value="40" aria-label="音量滑块">
+                <span class="vol-num" id="volVal">40</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="card" aria-label="快捷播报">
+            <div class="card-head">
+              <h2>快捷喊话（直接 TTS 播报）</h2>
+            </div>
+            <div class="row">
+              <input id="speakInput" class="grow" type="text" autocomplete="off" aria-label="播报文本" placeholder="输入让音箱直接朗读的文本">
+              <button type="button" class="btn btn-accent" id="speakBtn">播报</button>
+            </div>
+          </section>
+        </div>
+
+        <section class="card" aria-label="音乐控制">
+          <div class="card-head">
+            <h2>音乐播放与队列</h2>
+          </div>
+          <div class="music-now" id="musicNow">状态：等待读取…</div>
+          <div class="row">
+            <button type="button" class="btn btn-sm" id="musicPrevBtn">上一首</button>
+            <button type="button" class="btn btn-sm" id="musicPauseBtn">暂停</button>
+            <button type="button" class="btn btn-sm" id="musicResumeBtn">继续</button>
+            <button type="button" class="btn btn-sm" id="musicNextBtn">下一首</button>
+            <button type="button" class="btn btn-sm" id="musicStopBtn">停止</button>
+          </div>
+          <ol class="music-q hidden" id="musicQueue"></ol>
+        </section>
+      </section>
+
+      <!-- 2. 对话 -->
+      <section class="pane" id="pane-history">
+        <section class="card chat-card">
+          <div class="chat-bar">
+            <span class="pill" id="histSummary">LLM 短期记忆：— · 已记录 — 条</span>
+            <div class="row" style="flex:1;justify-content:flex-end;">
+              <input id="histFilter" type="text" style="max-width:200px;flex:1 1 120px;" placeholder="搜索对话…">
+              <button type="button" class="btn btn-sm" id="histRefreshBtn">刷新</button>
+              <button type="button" class="btn btn-sm" id="histClearCtxBtn">清空记忆</button>
+              <button type="button" class="btn btn-sm btn-danger" id="histClearAllBtn">清空全部</button>
+            </div>
+          </div>
+          <div class="chat-viewport" id="histViewport"></div>
+          <div class="chat-compose">
+            <input id="histChatInput" class="grow" type="text" autocomplete="off" placeholder="发送文字与音箱对话（Enter 发送）…">
+            <button type="button" class="btn btn-primary" id="histChatSendBtn">发送对话</button>
+          </div>
+        </section>
+      </section>
+
+      <!-- 3. 配置（1:1 对齐 agent.yaml 全部 12 个段） -->
+      <section class="pane" id="pane-config">
+        <section class="card">
+          <div class="card-head">
+            <h2>配置管理</h2>
+            <div class="row">
+              <button type="button" class="btn btn-sm" id="cfgReloadViewBtn">刷新</button>
+              <button type="button" class="btn btn-sm" id="cfgExecReloadBtn">热重载磁盘</button>
+              <button type="button" class="btn btn-sm btn-danger" id="cfgRollbackBtn" disabled>恢复上一版 (.bak)</button>
+            </div>
+          </div>
+          <p class="hint" id="cfgPathHint" style="margin:0 0 10px;">配置文件：—</p>
+          <div id="cfgRestartBanner" class="banner hidden"></div>
+          <div id="cfgWarnBanner" class="banner hidden"></div>
+
+          <div class="subtabs" role="tablist" aria-label="配置分组">
+            <button type="button" class="subtab" data-sub="entry" aria-selected="true">运行与拾音</button>
+            <button type="button" class="subtab" data-sub="voice" aria-selected="false">识别与合成</button>
+            <button type="button" class="subtab" data-sub="brain" aria-selected="false">模型与技能</button>
+            <button type="button" class="subtab" data-sub="media" aria-selected="false">音乐与投送</button>
+            <button type="button" class="subtab" data-sub="sys" aria-selected="false">设备与服务</button>
+            <button type="button" class="subtab" data-sub="yaml" aria-selected="false">YAML 源码</button>
+          </div>
+
+          <div id="cfgFormWrap">
+            <!-- Sub 1: 运行与拾音 (runtime -> exclusive/dual + capture) -->
+            <div class="cfg-sec" id="sec-entry">
+              <div class="sec-title"><span>运行模式入口（runtime）</span><span class="pill" data-tone="warn">mode 需重启</span></div>
+              <div class="form-grid">
+                <div class="field"><label for="cRtMode">运行模式</label>
+                  <select id="cRtMode"><option value="exclusive">exclusive（独占接管原生小爱）</option><option value="dual">dual（保留原生小爱 + 外部 KWS）</option></select>
+                </div>
+                <div class="field"><label for="cRtIdle">会话空闲超时 (秒 · 热生效)</label><input id="cRtIdle" type="number" step="1" min="5"></div>
+              </div>
+
+              <div id="exclusiveBlock" class="group-card">
+                <div class="group-head">
+                  <strong>独占模式通道（speech.usock）</strong>
+                  <span class="pill" data-tone="idle">仅 exclusive 模式</span>
+                </div>
+                <div class="group-body form-grid">
+                  <div class="field full"><label for="cRtSock">Speech Socket 路径（只读，运行期不可切换）</label><input id="cRtSock" type="text" readonly></div>
+                </div>
+              </div>
+
+              <div id="dualBlock" class="hidden">
+                <div class="group-card">
+                  <div class="group-head">
+                    <strong>双助手唤醒服务（dual.kws）</strong>
+                    <span class="pill" data-tone="warn">需重启</span>
+                  </div>
+                  <div class="group-body form-grid">
+                    <div class="field"><label for="cDualEp">外部 KWS 地址 (host:port)</label><input id="cDualEp" type="text" placeholder="192.168.31.1:5005"></div>
+                    <div class="field"><label for="cDualPing">UDP 心跳间隔 (ping_interval_s)</label><input id="cDualPing" type="number" min="5"></div>
+                  </div>
+                </div>
+
+                <div class="group-card">
+                  <div class="group-head">
+                    <strong>双助手交互提示（dual）</strong>
+                    <span class="pill" data-tone="ok">热生效</span>
+                  </div>
+                  <div class="group-body">
+                    <div class="form-grid">
+                      <div class="field"><label for="cDualEnter">进入提示语</label><input id="cDualEnter" type="text"></div>
+                      <div class="field"><label for="cDualExit">退出提示语</label><input id="cDualExit" type="text"></div>
+                      <div class="field"><label for="cDualTimeout">会话保持超时 (秒)</label><input id="cDualTimeout" type="number" min="5"></div>
+                      <div class="field"><label for="cDualKw">语音退出词（逗号分隔）</label><input id="cDualKw" type="text"></div>
+                    </div>
+                    <details class="adv">
+                      <summary>提示音文件（enter / exit / thinking earcon）</summary>
+                      <div class="foldbody form-grid">
+                        <div class="field"><label for="cDualEnterWav">进入提示音 (enter_earcon)</label><input id="cDualEnterWav" type="text" placeholder="留空禁用"></div>
+                        <div class="field"><label for="cDualExitWav">退出提示音 (exit_earcon)</label><input id="cDualExitWav" type="text" placeholder="留空禁用"></div>
+                        <div class="field full"><label for="cDualThinkWav">思考提示音 (thinking_earcon)</label><input id="cDualThinkWav" type="text" placeholder="留空禁用"></div>
+                      </div>
+                    </details>
+                  </div>
+                </div>
+
+                <div class="group-card">
+                  <div class="group-head">
+                    <label class="check"><input id="cNiEn" type="checkbox"> <span>启用原生小爱唤醒互锁让位 (dual.native_interlock)</span></label>
+                    <span class="pill" data-tone="warn">需重启</span>
+                  </div>
+                  <div id="niBody" class="group-body">
+                    <div class="form-grid">
+                      <div class="field full"><label for="cNiCmd">事件流命令 event_command（留空只尾随日志）</label><input id="cNiCmd" type="text" placeholder="例如 ubus listen"></div>
+                      <div class="field"><label for="cNiSyslog">系统日志路径 (syslog_path)</label><input id="cNiSyslog" type="text" placeholder="留空禁用"></div>
+                      <div class="field"><label for="cNiInst">指令日志路径 (instruction_log_path)</label><input id="cNiInst" type="text" placeholder="留空禁用"></div>
+                      <div class="field"><label for="cNiMax">最大互锁保护 (max_active_s)</label><input id="cNiMax" type="number" min="1"></div>
+                      <div class="field"><label for="cNiCool">结束后冷却窗 (cooldown_s)</label><input id="cNiCool" type="number" min="0"></div>
+                    </div>
+                    <details class="adv">
+                      <summary>互锁匹配词与轮询间隔（wake / end / instruction patterns）</summary>
+                      <div class="foldbody form-grid">
+                        <div class="field full"><label for="cNiWake">wake_patterns（每行一条）</label><textarea id="cNiWake" rows="3"></textarea></div>
+                        <div class="field full"><label for="cNiEnd">end_patterns（每行一条）</label><textarea id="cNiEnd" rows="2"></textarea></div>
+                        <div class="field full"><label for="cNiInstPat">instruction_patterns（每行一条）</label><textarea id="cNiInstPat" rows="2"></textarea></div>
+                        <div class="field"><label for="cNiPoll">日志轮询间隔 (poll_interval_ms)</label><input id="cNiPoll" type="number" min="20" max="1000"></div>
+                      </div>
+                    </details>
+                  </div>
+                </div>
+
+                <details class="adv">
+                  <summary>硬件 ALSA 多通道采音（dual.capture · 需重启）</summary>
+                  <div class="foldbody form-grid">
+                    <div class="field"><label for="cDcDev">ALSA 设备</label><input id="cDcDev" type="text"></div>
+                    <div class="field"><label for="cDcFmt">格式</label><select id="cDcFmt"><option value="S32_LE">S32_LE</option><option value="S16_LE">S16_LE</option></select></div>
+                    <div class="field"><label for="cDcSr">采样率 (Hz)</label><input id="cDcSr" type="number" step="1000"></div>
+                    <div class="field"><label for="cDcCh">通道数</label><input id="cDcCh" type="number" min="1"></div>
+                    <div class="field"><label for="cDcMic">麦通道 (mic_channel)</label><input id="cDcMic" type="number" min="0"></div>
+                    <div class="field"><label for="cDcRef">回采通道 (ref_channel，可空)</label><input id="cDcRef" type="number" min="0" placeholder="null"></div>
+                    <div class="field"><label for="cDcShift">右移位 (shift_bits)</label><input id="cDcShift" type="number" min="0" max="24"></div>
+                  </div>
+                </details>
+              </div>
+
+              <div class="group-card">
+                <div class="group-head">
+                  <strong>语音断句与 VAD 录音（capture）</strong>
+                  <span class="pill" data-tone="ok">热生效</span>
+                </div>
+                <div class="group-body">
+                  <div class="form-grid">
+                    <div class="field"><label for="cCapTh">VAD 基础阈值</label><input id="cCapTh" type="number" step="0.001" min="0.001"></div>
+                    <div class="field"><label for="cCapGain">麦克风增益</label><input id="cCapGain" type="number" step="0.1" min="0.1"></div>
+                    <div class="field"><label for="cCapSil">兜底静音断句 (silence_ms)</label><input id="cCapSil" type="number" step="50" min="200"></div>
+                    <div class="field"><label for="cCapMax">单轮最长录音 (秒)</label><input id="cCapMax" type="number" step="1" min="3"></div>
+                    <div class="field check full"><label><input id="cCapNoise" type="checkbox"> 启用自适应底噪抬高阈值 (adaptive_noise_floor)</label></div>
+                    <div class="field full" id="capNoiseExtra"><label for="cCapMult">底噪倍数 (noise_floor_multiplier)</label><input id="cCapMult" type="number" step="0.1" min="1"></div>
+                    <div class="field check full"><label><input id="cCapDyn" type="checkbox"> 启用动态静音收尾（短句更快结束，长句容忍更久）</label></div>
+                  </div>
+                  <div class="form-grid" id="capDynExtra" style="margin-top:10px;">
+                    <div class="field"><label for="cCapShortSil">短句静音 (short_utterance_silence_ms)</label><input id="cCapShortSil" type="number" step="50"></div>
+                    <div class="field"><label for="cCapLongSil">长句静音 (long_utterance_silence_ms)</label><input id="cCapLongSil" type="number" step="50"></div>
+                  </div>
+                  <details class="adv">
+                    <summary>底层分块与调试参数</summary>
+                    <div class="foldbody form-grid">
+                      <div class="field"><label for="cCapSr">采样率</label><input id="cCapSr" type="number" step="1000"></div>
+                      <div class="field"><label for="cCapBlock">分块 (block_ms)</label><input id="cCapBlock" type="number" min="10"></div>
+                      <div class="field"><label for="cCapPre">预卷 (pre_roll_ms)</label><input id="cCapPre" type="number" min="0"></div>
+                      <div class="field"><label for="cCapMinSp">最短语音 (min_speech_ms)</label><input id="cCapMinSp" type="number" min="50"></div>
+                      <div class="field"><label for="cCapCool">段间冷却 (cooldown_s)</label><input id="cCapCool" type="number" step="0.1" min="0"></div>
+                      <div class="field check"><label><input id="cCapLevels" type="checkbox"> 打印拾音电平日志 (print_levels)</label></div>
+                    </div>
+                  </details>
+                </div>
+              </div>
+            </div>
+
+            <!-- Sub 2: 识别与合成 (asr + tts) -->
+            <div class="cfg-sec hidden" id="sec-voice">
+              <div class="sec-title"><span>语音识别（asr）</span><span class="pill" data-tone="warn">需重启</span></div>
+              <div class="form-grid" style="margin-bottom:10px;">
+                <div class="field full"><label for="cAsrProv">ASR Provider</label>
+                  <select id="cAsrProv"><option value="open_ai">open_ai（HTTP 分段上传识别）</option><option value="openai_realtime">openai_realtime（WebSocket 实时流式识别）</option></select>
+                </div>
+              </div>
+
+              <div id="asrOpenAiBox" class="group-card">
+                <div class="group-head"><strong>OpenAI 兼容接口（asr.open_ai）</strong></div>
+                <div class="group-body form-grid">
+                  <div class="field full"><label for="cAsrOaiUrl">Base URL</label><input id="cAsrOaiUrl" type="text"></div>
+                  <div class="field"><label for="cAsrOaiModel">Model</label><input id="cAsrOaiModel" type="text"></div>
+                  <div class="field"><label for="cAsrOaiLang">语言 (language，留空混语种)</label><input id="cAsrOaiLang" type="text"></div>
+                  <div class="field"><label for="cAsrOaiKey">API Key（留空保留原值）</label><input id="cAsrOaiKey" type="password" placeholder="未更改"></div>
+                  <div class="field"><label for="cAsrOaiTimeout">超时 (秒)</label><input id="cAsrOaiTimeout" type="number" step="1" min="1"></div>
+                  <div class="field"><label for="cAsrOaiRetries">重试次数</label><input id="cAsrOaiRetries" type="number" min="0" max="5"></div>
+                  <div class="field"><label for="cAsrOaiPrompt">提示词 (prompt)</label><input id="cAsrOaiPrompt" type="text"></div>
+                </div>
+              </div>
+
+              <div id="asrRtBox" class="group-card hidden">
+                <div class="group-head"><strong>Realtime 流式接口（asr.openai_realtime）</strong></div>
+                <div class="group-body">
+                  <div class="form-grid">
+                    <div class="field full"><label for="cAsrRtUrl">Base URL</label><input id="cAsrRtUrl" type="text"></div>
+                    <div class="field"><label for="cAsrRtModel">Model</label><input id="cAsrRtModel" type="text"></div>
+                    <div class="field"><label for="cAsrRtKey">API Key（留空保留原值）</label><input id="cAsrRtKey" type="password" placeholder="未更改"></div>
+                    <div class="field"><label for="cAsrRtSr">目标采样率 (Hz)</label><input id="cAsrRtSr" type="number" step="1000" min="8000"></div>
+                    <div class="field"><label for="cAsrRtChunk">分片时长 (chunk_ms)</label><input id="cAsrRtChunk" type="number" step="20" min="40"></div>
+                    <div class="field"><label for="cAsrRtTimeout">超时 (秒)</label><input id="cAsrRtTimeout" type="number" step="1" min="1"></div>
+                    <div class="field"><label for="cAsrRtRetries">重试次数</label><input id="cAsrRtRetries" type="number" min="0" max="5"></div>
+                    <div class="field check full"><label><input id="cAsrVadEn" type="checkbox"> 启用云端服务端 VAD 断句 (server_vad)</label></div>
+                  </div>
+                  <div id="asrVadBody" class="form-grid" style="margin-top:10px;">
+                    <div class="field"><label for="cAsrVadPad">prefix_padding_ms</label><input id="cAsrVadPad" type="number" step="50" min="0"></div>
+                    <div class="field"><label for="cAsrVadSil">silence_duration_ms</label><input id="cAsrVadSil" type="number" step="100" min="100"></div>
+                    <div class="field"><label for="cAsrVadTh">threshold</label><input id="cAsrVadTh" type="number" step="0.05" min="0" max="1"></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="sec-title"><span>语音合成（tts）</span><span class="pill" data-tone="ok">热生效</span></div>
+              <div class="form-grid">
+                <div class="field full"><label for="cTtsProv">TTS Provider</label>
+                  <select id="cTtsProv"><option value="native">native（系统内置 tts_play.sh）</option><option value="openai">openai（OpenAI 兼容 /v1/audio/speech）</option><option value="doubao">doubao</option></select>
+                </div>
+              </div>
+
+              <p id="ttsNativeHint" class="muted-note">当前使用音箱系统内置 <code>tts_play.sh</code> 发声，由固件原生回声消除托管，无需外部接口与防回声静默窗。</p>
+
+              <div id="ttsOpenAiBox" class="group-card hidden">
+                <div class="group-head"><strong>OpenAI 兼容语音合成（tts.openai）</strong></div>
+                <div class="group-body">
+                  <div class="form-grid">
+                    <div class="field full"><label for="cTtsUrl">Base URL</label><input id="cTtsUrl" type="text"></div>
+                    <div class="field"><label for="cTtsModel">Model</label><input id="cTtsModel" type="text"></div>
+                    <div class="field"><label for="cTtsVoice">Voice</label><input id="cTtsVoice" type="text"></div>
+                    <div class="field"><label for="cTtsKey">API Key（留空保留原值）</label><input id="cTtsKey" type="password" placeholder="未更改"></div>
+                    <div class="field"><label for="cTtsFmt">音频格式</label><input id="cTtsFmt" type="text" placeholder="wav / mp3"></div>
+                  </div>
+                  <details class="adv">
+                    <summary>高级音色与缓存参数（语速 / 采样率 / 风格指令）</summary>
+                    <div class="foldbody form-grid">
+                      <div class="field"><label for="cTtsSpeed">语速 Speed（可空）</label><input id="cTtsSpeed" type="number" step="0.05" placeholder="默认"></div>
+                      <div class="field"><label for="cTtsSr">采样率（可空）</label><input id="cTtsSr" type="number" step="1000" placeholder="默认"></div>
+                      <div class="field"><label for="cTtsTimeout">请求超时 (秒)</label><input id="cTtsTimeout" type="number" step="1" min="1"></div>
+                      <div class="field"><label for="cTtsDir">临时音频目录 (默认 /tmp)</label><input id="cTtsDir" type="text" placeholder="/tmp"></div>
+                      <div class="field full"><label for="cTtsInst">风格指令 Instructions（可空）</label><input id="cTtsInst" type="text"></div>
+                    </div>
+                  </details>
+                </div>
+              </div>
+
+              <div id="ttsExternalBox" class="group-card hidden">
+                <div class="group-head"><strong>外部播放控制与防回声策略</strong></div>
+                <div class="group-body">
+                  <div class="form-grid">
+                    <div class="field check"><label><input id="cTtsFallback" type="checkbox"> 失败时自动回退原生 TTS</label></div>
+                    <div class="field check"><label><input id="cTtsMute" type="checkbox"> 外部播报期间静默采音防回声</label></div>
+                  </div>
+                  <div id="ttsMuteExtra" class="form-grid" style="margin-top:10px;">
+                    <div class="field"><label for="cTtsTail">尾音保护 (playback_tail_ms)</label><input id="cTtsTail" type="number" step="100" min="0"></div>
+                    <div class="field"><label for="cTtsGrace">启动宽限 (playback_startup_grace_ms)</label><input id="cTtsGrace" type="number" step="200" min="0"></div>
+                  </div>
+                  <details class="adv">
+                    <summary>自定义播放命令 (playback_command)</summary>
+                    <div class="foldbody form-grid">
+                      <div class="field full"><label for="cTtsPlayCmd">命令模板（留空使用内置 miplayer）</label><input id="cTtsPlayCmd" type="text" placeholder="内置 miplayer"></div>
+                    </div>
+                  </details>
+                </div>
+              </div>
+
+              <div class="row" style="margin-top:12px;">
+                <input id="ttsPreviewText" class="grow" type="text" value="你好，这是新的语音配置试听" aria-label="试听文本">
+                <button type="button" class="btn btn-accent" id="ttsPreviewBtn">试听一句</button>
+              </div>
+            </div>
+
+            <!-- Sub 3: 模型与技能 (llm + agent master -> weather/search/mcp) -->
+            <div class="cfg-sec hidden" id="sec-brain">
+              <div class="sec-title"><span>大模型对话（llm）</span><span class="pill" data-tone="ok">热生效</span></div>
+              <div class="form-grid">
+                <div class="field"><label for="cLlmProto">协议</label>
+                  <select id="cLlmProto"><option value="open_ai_chat">open_ai_chat</option><option value="anthropic">anthropic</option></select>
+                </div>
+                <div class="field"><label for="cLlmModel">模型</label><input id="cLlmModel" type="text"></div>
+                <div class="field full"><label for="cLlmUrl">Base URL</label><input id="cLlmUrl" type="text"></div>
+                <div class="field"><label for="cLlmKey">API Key（留空保留原值）</label><input id="cLlmKey" type="password" placeholder="未更改"></div>
+                <div class="field"><label for="cLlmTemp">Temperature</label><input id="cLlmTemp" type="number" step="0.1" min="0" max="2"></div>
+              </div>
+              <details class="adv">
+                <summary>高级推理参数（Tokens / 超时 / Thinking）</summary>
+                <div class="foldbody form-grid">
+                  <div class="field"><label for="cLlmMaxTok">Max Tokens</label><input id="cLlmMaxTok" type="number" step="10" min="32"></div>
+                  <div class="field"><label for="cLlmTimeout">超时 (秒)</label><input id="cLlmTimeout" type="number" step="1" min="1"></div>
+                  <div class="field"><label for="cLlmThink">Thinking 模式</label>
+                    <select id="cLlmThink"><option value="disabled">disabled</option><option value="auto">auto</option><option value="enabled">enabled</option></select>
+                  </div>
+                  <div class="field" id="llmBudgetField"><label for="cLlmBudget">Thinking Budget (Anthropic)</label><input id="cLlmBudget" type="number" step="128" min="0"></div>
+                </div>
+              </details>
+
+              <div class="sec-title"><span>工具调用与扩展技能（agent / mcp）</span><span class="pill" data-tone="ok">热生效</span></div>
+              <div class="form-grid">
+                <div class="field check"><label><input id="cAgTools" type="checkbox"> 启用工具调用总开关 (agent.tools_enabled)</label></div>
+                <div class="field"><label for="cAgTz">时区 (timezone)</label><input id="cAgTz" type="text"></div>
+              </div>
+
+              <p id="toolsOffHint" class="muted-note">已关闭工具调用：天气、联网搜索、音乐工具与 MCP 均不会注册给模型，系统会自动在提问前注入当前时间。</p>
+
+              <div id="toolsBody">
+                <div class="form-grid" style="margin-top:10px;">
+                  <div class="field check full"><label><input id="cAgTime" type="checkbox"> 强制在提问前缀注入当前时间 (inject_current_time)</label></div>
+                </div>
+
+                <!-- Weather Card -->
+                <div class="group-card">
+                  <div class="group-head">
+                    <strong>天气查询工具（agent.weather）</strong>
+                    <span class="pill" data-tone="ok">已随工具启用</span>
+                  </div>
+                  <div class="group-body form-grid">
+                    <div class="field"><label for="cAgLoc">默认城市 (default_location)</label><input id="cAgLoc" type="text" placeholder="留空则按 IP 定位"></div>
+                    <div class="field"><label for="cAgWeatherTo">请求超时 (秒)</label><input id="cAgWeatherTo" type="number" step="1" min="1"></div>
+                    <div class="field full"><label for="cAgQweather">和风天气 URL (qweather_url)</label><input id="cAgQweather" type="text"></div>
+                    <div class="field full"><label for="cAgIpUrl">IP 定位 URL (ip_lookup_url)</label><input id="cAgIpUrl" type="text"></div>
+                  </div>
+                </div>
+
+                <!-- Web Search Card -->
+                <div class="group-card">
+                  <div class="group-head">
+                    <label class="check"><input id="cWsEnabled" type="checkbox"> <span>启用联网搜索工具 (agent.web_search)</span></label>
+                  </div>
+                  <div id="wsBody" class="group-body form-grid">
+                    <div class="field full"><label for="cWsUrl">Tavily URL</label><input id="cWsUrl" type="text"></div>
+                    <div class="field full"><label for="cWsKey">Tavily API Key（留空保留原值）</label><input id="cWsKey" type="password" placeholder="未更改"></div>
+                    <div class="field"><label for="cWsDepth">搜索深度</label>
+                      <select id="cWsDepth"><option value="basic">basic</option><option value="advanced">advanced</option></select>
+                    </div>
+                    <div class="field"><label for="cWsMax">返回条数</label><input id="cWsMax" type="number" min="1" max="10"></div>
+                    <div class="field"><label for="cWsTimeout">超时 (秒)</label><input id="cWsTimeout" type="number" step="1" min="1"></div>
+                  </div>
+                </div>
+
+                <!-- MCP Card -->
+                <div class="group-card">
+                  <div class="group-head">
+                    <strong>MCP 外部工具服务器（mcp）</strong>
+                    <button type="button" class="btn btn-sm" id="addMcpBtn">+ 添加 MCP 服务</button>
+                  </div>
+                  <div class="group-body">
+                    <div class="mcp-card">
+                      <div class="mcp-card-head">
+                        <label class="check" style="padding:0;"><input id="cHaEn" type="checkbox"> <span>启用兼容模式 Home Assistant (mcp.home_assistant)</span></label>
+                      </div>
+                      <div id="haBody" class="group-body form-grid">
+                        <div class="field full"><label for="cHaUrl">URL</label><input id="cHaUrl" type="text"></div>
+                        <div class="field"><label for="cHaTimeout">超时 (秒)</label><input id="cHaTimeout" type="number" step="1" min="1"></div>
+                        <div class="field"><label for="cHaToken">Token（留空保留原值）</label><input id="cHaToken" type="password" placeholder="未更改"></div>
+                      </div>
+                    </div>
+                    <div id="mcpServersBox"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Sub 4: 音乐与投送 (music + airplay) -->
+            <div class="cfg-sec hidden" id="sec-media">
+              <div class="group-card" style="margin-top:0;">
+                <div class="group-head">
+                  <label class="check"><input id="cMusicEn" type="checkbox"> <span>启用在线音乐服务 (music.enabled)</span></label>
+                  <span class="pill" data-tone="ok">热生效</span>
+                </div>
+                <div id="musicBody" class="group-body">
+                  <div class="form-grid" style="margin-bottom:10px;">
+                    <div class="field"><label for="cMusicProv">音乐源 (provider)</label>
+                      <select id="cMusicProv"><option value="navidrome">navidrome</option><option value="netease">netease</option></select>
+                    </div>
+                    <div class="field"><label for="cMusicInt">语音打断方式 (interruption.mode)</label>
+                      <select id="cMusicInt"><option value="pause">pause（暂停）</option><option value="duck">duck（压低音量）</option><option value="none">none（不处理）</option></select>
+                    </div>
+                  </div>
+
+                  <div id="naviBox" class="mcp-card" style="margin-bottom:0;">
+                    <div class="sec-title" style="margin-top:0;"><span>Navidrome 参数</span></div>
+                    <div class="form-grid">
+                      <div class="field full"><label for="cNaviUrl">Base URL</label><input id="cNaviUrl" type="text"></div>
+                      <div class="field"><label for="cNaviUser">用户名</label><input id="cNaviUser" type="text"></div>
+                      <div class="field"><label for="cNaviPass">密码（留空保留原值）</label><input id="cNaviPass" type="password" placeholder="未更改"></div>
+                      <div class="field"><label for="cNaviVer">API 版本</label><input id="cNaviVer" type="text"></div>
+                      <div class="field"><label for="cNaviTo">超时 (秒)</label><input id="cNaviTo" type="number" step="1" min="1"></div>
+                    </div>
+                  </div>
+
+                  <div id="neteaseBox" class="mcp-card hidden" style="margin-bottom:0;">
+                    <div class="sec-title" style="margin-top:0;"><span>网易云音乐接口（netease）</span></div>
+                    <div class="form-grid">
+                      <div class="field full"><label for="cNeUrl">API 服务地址 (api_base_url)</label><input id="cNeUrl" type="text"></div>
+                      <div class="field"><label for="cNeMode">登录方式</label><input id="cNeMode" type="text" placeholder="captcha / password"></div>
+                      <div class="field"><label for="cNeAcc">账号</label><input id="cNeAcc" type="text"></div>
+                      <div class="field"><label for="cNePhone">手机号</label><input id="cNePhone" type="text"></div>
+                      <div class="field"><label for="cNeLvl">默认音质 (default_level)</label><input id="cNeLvl" type="text"></div>
+                      <div class="field"><label for="cNePass">明文密码（留空保留原值）</label><input id="cNePass" type="password" placeholder="未更改"></div>
+                      <div class="field"><label for="cNeMd5">MD5 密码（留空保留原值）</label><input id="cNeMd5" type="password" placeholder="未更改"></div>
+                      <div class="field"><label for="cNeCookie">Cookie 文件（可空）</label><input id="cNeCookie" type="text"></div>
+                      <div class="field"><label for="cNeTo">超时 (秒)</label><input id="cNeTo" type="number" step="1" min="1"></div>
+                      <div class="field check full"><label><input id="cNeAutoLogin" type="checkbox"> 启动时自动登录 (login_on_start)</label></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="group-card">
+                <div class="group-head">
+                  <label class="check"><input id="cApEn" type="checkbox"> <span>启用 AirPlay 音频投送接收 (airplay.enabled)</span></label>
+                  <span class="pill" data-tone="warn">需重启</span>
+                </div>
+                <div id="airplayBody" class="group-body">
+                  <div class="form-grid">
+                    <div class="field"><label for="cApName">广播名称</label><input id="cApName" type="text"></div>
+                    <div class="field"><label for="cApPort">监听端口</label><input id="cApPort" type="number" min="1" max="65535"></div>
+                    <div class="field"><label for="cApPass">连接密码（留空保留原值）</label><input id="cApPass" type="password" placeholder="未更改"></div>
+                    <div class="field"><label for="cApHw">MAC 地址 (hwaddr，可空)</label><input id="cApHw" type="text" placeholder="c2:46:38:ad:3e:25"></div>
+                  </div>
+                  <details class="adv">
+                    <summary>AirPlay 输出后端与语音打断参数</summary>
+                    <div class="foldbody form-grid">
+                      <div class="field"><label for="cApBackend">output.backend</label><input id="cApBackend" type="text"></div>
+                      <div class="field"><label for="cApAplay">output.aplay_path</label><input id="cApAplay" type="text"></div>
+                      <div class="field"><label for="cApDev">output.device</label><input id="cApDev" type="text"></div>
+                      <div class="field"><label for="cApFmt">output.format</label><input id="cApFmt" type="text"></div>
+                      <div class="field"><label for="cApIntr">interruption.mode</label><select id="cApIntr"><option value="duck">duck</option><option value="none">none</option></select></div>
+                      <div class="field" id="apDuckField"><label for="cApDuck">duck_gain</label><input id="cApDuck" type="number" step="0.05" min="0" max="1"></div>
+                    </div>
+                  </details>
+                </div>
+              </div>
+            </div>
+
+            <!-- Sub 5: 设备与服务 (server + device) -->
+            <div class="cfg-sec hidden" id="sec-sys">
+              <div class="group-card" style="margin-top:0;">
+                <div class="group-head">
+                  <label class="check"><input id="cSrvEn" type="checkbox"> <span>启用本地 HTTP 控制面与 Web 后台 (server.enabled)</span></label>
+                  <span class="pill" data-tone="warn">需重启</span>
+                </div>
+                <p id="serverOffHint" class="muted-note hidden">警告：关闭并重启后将停止监听 HTTP 端口，本 Web 后台也会断开，之后需改回 agent.yaml。</p>
+                <div id="serverBody" class="group-body form-grid">
+                  <div class="field"><label for="cSrvHost">监听地址 (host)</label><input id="cSrvHost" type="text" placeholder="127.0.0.1"></div>
+                  <div class="field"><label for="cSrvPort">端口 (port)</label><input id="cSrvPort" type="number" min="1" max="65535"></div>
+                  <div class="field full"><label for="cSrvToken">访问令牌 token（留空保留原值；非回环必填）</label><input id="cSrvToken" type="password" placeholder="未更改"></div>
+                </div>
+              </div>
+
+              <div class="group-card">
+                <div class="group-head">
+                  <strong>设备命令与灯效（device）</strong>
+                  <span class="pill" data-tone="warn">需重启</span>
+                </div>
+                <div class="group-body">
+                  <div class="form-grid">
+                    <div class="field check"><label><input id="cDevLedEn" type="checkbox"> 启用设备 LED 指示灯 (led_enabled)</label></div>
+                    <div class="field"><label for="cDevTimeout">设备命令超时 (command_timeout_s)</label><input id="cDevTimeout" type="number" step="1" min="1"></div>
+                  </div>
+                  <div id="ledBody" class="form-grid" style="margin-top:10px;">
+                    <div class="field"><label for="cDevLedL">聆听灯效 (led_listening)</label><input id="cDevLedL" type="number" min="0" max="20"></div>
+                    <div class="field"><label for="cDevLedU">说话灯效 (led_user_speaking)</label><input id="cDevLedU" type="number" min="0" max="20"></div>
+                    <div class="field"><label for="cDevLedT">思考灯效 (led_thinking)</label><input id="cDevLedT" type="number" min="0" max="20"></div>
+                    <div class="field"><label for="cDevLedS">播报灯效 (led_speaking)</label><input id="cDevLedS" type="number" min="0" max="20"></div>
+                  </div>
+                  <details class="adv">
+                    <summary>高级设备 Shell 命令模板（tts / 播放 / 音量 / 打断）</summary>
+                    <div class="foldbody form-grid">
+                      <div class="field full"><label for="cDevTtsCmd">tts_command</label><input id="cDevTtsCmd" type="text"></div>
+                      <div class="field full"><label for="cDevPlayUrl">play_url_command</label><input id="cDevPlayUrl" type="text"></div>
+                      <div class="field full"><label for="cDevStopCmd">stop_audio_command</label><input id="cDevStopCmd" type="text"></div>
+                      <div class="field full"><label for="cDevPauseCmd">pause_audio_command</label><input id="cDevPauseCmd" type="text"></div>
+                      <div class="field full"><label for="cDevResumeCmd">resume_audio_command</label><input id="cDevResumeCmd" type="text"></div>
+                      <div class="field full"><label for="cDevDuckCmd">duck_audio_command</label><input id="cDevDuckCmd" type="text"></div>
+                      <div class="field full"><label for="cDevUnduckCmd">unduck_audio_command</label><input id="cDevUnduckCmd" type="text"></div>
+                      <div class="field full"><label for="cDevAbortCmd">abort_command</label><input id="cDevAbortCmd" type="text"></div>
+                      <div class="field full"><label for="cDevVolUp">volume_up_command</label><input id="cDevVolUp" type="text"></div>
+                      <div class="field full"><label for="cDevVolDown">volume_down_command</label><input id="cDevVolDown" type="text"></div>
+                      <div class="field full"><label for="cDevVolSet">volume_set_command</label><input id="cDevVolSet" type="text"></div>
+                      <div class="field full"><label for="cDevVolMute">volume_mute_command</label><input id="cDevVolMute" type="text"></div>
+                    </div>
+                  </details>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Sub 6: YAML -->
+          <div id="cfgYamlWrap" class="hidden">
+            <p class="hint" style="margin:0 0 8px;">密钥已脱敏为 <code>__REDACTED__</code>，保持不变将自动保留磁盘原密钥。</p>
+            <textarea id="cfgYamlText" class="yaml-ed" spellcheck="false" aria-label="YAML 配置"></textarea>
+            <div class="row" style="margin-top:10px;">
+              <button type="button" class="btn" id="cfgValYamlBtn">仅校验 YAML</button>
+              <button type="button" class="btn btn-primary" id="cfgSaveYamlBtn">保存 YAML 并热重载</button>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <!-- 4. 运维诊断 -->
+      <section class="pane" id="pane-diag">
+        <section class="card">
+          <div class="card-head">
+            <h2>运行自检（Doctor）</h2>
+            <button type="button" class="btn btn-sm btn-accent" id="docRunBtn">运行自检</button>
+          </div>
+          <div id="docSummary" class="hint" style="margin:0;">点击「运行自检」检测 `/tmp` 与 `/data` 剩余空间、互锁文件与上游服务连通性。</div>
+          <div id="docResult" class="hidden" style="margin-top:12px;">
+            <dl class="diag" id="docMeta"></dl>
+            <div id="docWarnBox" class="banner hidden"></div>
+            <table class="tbl">
+              <thead><tr><th>服务</th><th>地址</th><th>状态</th><th>RTT</th></tr></thead>
+              <tbody id="docUpstreams"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h2>在线日志尾部查看</h2>
+            <span class="hint" id="logMeta" style="margin:0;">—</span>
+          </div>
+          <div class="row" style="margin-bottom:8px;">
+            <select id="logLevel" aria-label="日志级别">
+              <option value="">全部级别</option>
+              <option value="ERROR">ERROR</option>
+              <option value="WARN">WARN</option>
+              <option value="INFO">INFO</option>
+              <option value="DEBUG">DEBUG</option>
+            </select>
+            <select id="logLines" aria-label="行数">
+              <option value="100">最近 100 行</option>
+              <option value="200" selected>最近 200 行</option>
+              <option value="500">最近 500 行</option>
+            </select>
+            <input id="logSearch" class="grow" type="text" placeholder="关键字过滤…">
+            <button type="button" class="btn btn-sm" id="logRefreshBtn">刷新</button>
+            <label class="check" style="padding:0;"><input type="checkbox" id="logAuto"> 自动刷新</label>
+          </div>
+          <pre class="raw logbox" id="logBox">切换到本页后点击「刷新」查看日志尾部。</pre>
+        </section>
+
+        <details class="fold" id="diagFold">
+          <summary>原始状态 JSON 与通道详情<span class="count" id="diagCount">—</span></summary>
+          <div class="foldbody">
+            <dl class="diag">
+              <div><dt>运行模式</dt><dd id="dMode">—</dd></div>
+              <div><dt>通道 / socket</dt><dd id="dSocket">—</dd></div>
+              <div><dt>归属</dt><dd id="dOwned">—</dd></div>
+              <div><dt>pid</dt><dd id="dPid">—</dd></div>
+              <div><dt>状态阶段</dt><dd id="dPhase">—</dd></div>
+              <div><dt>末轮耗时</dt><dd id="dLatency">—</dd></div>
+              <div><dt>配置文件</dt><dd id="dConfig">—</dd></div>
+              <div><dt>本次往返</dt><dd id="dRtt">—</dd></div>
+            </dl>
+            <pre class="raw" id="raw">—</pre>
+          </div>
+        </details>
+      </section>
+    </div>
   </div>
+</div>
 
-  <section class="verdict" id="verdict" data-tone="idle">
-    <span class="dot" aria-hidden="true"></span>
-    <div class="vtext">
-      <p class="vtitle" id="vtitle" aria-live="polite">正在读取状态</p>
-      <p class="vdetail" id="vdetail" aria-live="off">页面自身不需要令牌，读状态需要。</p>
+<!-- Sticky Save Bar -->
+<div class="save-bar hidden" id="cfgSaveBar">
+  <span class="sb-msg">检测到配置尚未保存</span>
+  <div class="row">
+    <button type="button" class="btn btn-sm" id="cfgDiscardBtn">放弃修改</button>
+    <button type="button" class="btn btn-sm btn-primary" id="cfgSaveFormBtn">保存并热重载</button>
+  </div>
+</div>
+
+<!-- Auth Gate Overlay -->
+<div class="auth-gate hidden" id="authGate" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+  <div class="auth-card">
+    <h2 id="authTitle">连接 XiaoAI 控制台</h2>
+    <p id="authDesc">填写 <code>agent.yaml</code> 里 <code>server.token</code>。令牌仅保存在当前浏览器本地。</p>
+    <div class="row" style="margin-bottom:12px;">
+      <input id="token" class="grow" type="password" autocomplete="off" spellcheck="false" aria-label="访问令牌" placeholder="输入访问令牌…">
     </div>
-    <div class="vacts">
-      <button type="button" class="btn" id="toggleBtn">暂停</button>
-      <button type="button" class="btn" id="refreshBtn">刷新</button>
+    <div class="row" style="justify-content:flex-end;">
+      <button type="button" class="btn hidden" id="clearBtn">清除令牌</button>
+      <button type="button" class="btn hidden" id="cancelAuthBtn">取消</button>
+      <button type="button" class="btn btn-primary" id="saveBtn">连接</button>
     </div>
-  </section>
+  </div>
+</div>
 
-  <dl class="facts">
-    <div class="fact"><dt>已运行</dt><dd id="fUptime">—</dd></div>
-    <div class="fact"><dt>上次收包</dt><dd><span id="fPacket">—</span><span class="sub" id="fPacketAt"></span></dd></div>
-    <div class="fact"><dt>异常重启</dt><dd id="fRestarts">—</dd></div>
-  </dl>
-
-  <section class="ctl" aria-label="快捷控制">
-    <div class="ctl-head">
-      <h2>快捷控制</h2>
-      <span class="toast" id="ctlToast" aria-live="polite"></span>
-    </div>
-
-    <div class="ctl-group">
-      <div class="ctl-label">常用操作</div>
-      <div class="btnrow">
-        <button type="button" class="btn btn-danger" id="stopBtn">停止播报/音乐</button>
-        <button type="button" class="btn" id="clearHistBtn">清空记忆</button>
-        <button type="button" class="btn" id="reloadBtn">热重载配置</button>
-      </div>
-    </div>
-
-    <div class="ctl-group">
-      <div class="ctl-label">音量调节</div>
-      <div class="btnrow">
-        <button type="button" class="btn" id="volDownBtn">-</button>
-        <button type="button" class="btn" id="volUpBtn">+</button>
-        <button type="button" class="btn" id="volMuteBtn">静音</button>
-      </div>
-    </div>
-
-    <div class="ctl-group">
-      <div class="ctl-label">文字发送 / 播报</div>
-      <div class="sayrow">
-        <input id="sayInput" type="text" autocomplete="off" aria-label="文字内容" placeholder="输入对话内容或直接播报的文本">
-        <button type="button" class="btn btn-accent" id="chatBtn">对话测试</button>
-        <button type="button" class="btn" id="speakBtn">直接播报</button>
-      </div>
-    </div>
-
-    <div class="ctl-group">
-      <div class="ctl-label">音乐控制</div>
-      <div class="btnrow">
-        <button type="button" class="btn" id="musicPrevBtn">上一首</button>
-        <button type="button" class="btn" id="musicPauseBtn">暂停</button>
-        <button type="button" class="btn" id="musicResumeBtn">继续</button>
-        <button type="button" class="btn" id="musicNextBtn">下一首</button>
-        <button type="button" class="btn" id="musicStopBtn">停止</button>
-      </div>
-    </div>
-  </section>
-
-  <details class="fold" id="diagFold">
-    <summary>诊断与原始数据<span class="count" id="diagCount">—</span></summary>
-    <div class="foldbody">
-      <dl class="diag">
-        <div><dt>socket</dt><dd id="dSocket">—</dd></div>
-        <div><dt>归属</dt><dd id="dOwned">—</dd></div>
-        <div><dt>pid</dt><dd id="dPid">—</dd></div>
-        <div><dt>状态阶段</dt><dd id="dPhase">—</dd></div>
-        <div><dt>末轮耗时</dt><dd id="dLatency">—</dd></div>
-        <div><dt>配置文件</dt><dd id="dConfig">—</dd></div>
-        <div><dt>本次往返</dt><dd id="dRtt">—</dd></div>
-      </dl>
-      <pre class="raw" id="raw">—</pre>
-    </div>
-  </details>
-
-  <details class="fold" id="tokenFold">
-    <summary>访问令牌<span class="count" id="tokenState">未设置</span></summary>
-    <div class="foldbody">
-      <div class="tokrow">
-        <input id="token" type="password" autocomplete="off" spellcheck="false" aria-label="访问令牌" placeholder="填 agent.yaml 里 server 段的 token">
-        <button type="button" class="btn" id="saveBtn">保存</button>
-        <button type="button" class="btn" id="clearBtn">清除</button>
-      </div>
-      <p class="hint">只存在这台浏览器里。换 IP 或端口要重填 —— 按 origin 隔离，不是存在设备上。</p>
-    </div>
-  </details>
-
-  <footer class="foot">
-    <span id="footState">—</span>
-    <span id="footRight">尚无数据</span>
-  </footer>
-
-  <noscript><p class="hint">这个页面需要 JavaScript 才能读取状态。</p></noscript>
-</main>
+<div class="gtoast hidden" id="gToast" aria-live="polite"></div>
+<noscript><p class="hint" style="padding:20px;">这个页面需要 JavaScript 才能读取状态。</p></noscript>
 
 <script>
 (function () {
   "use strict";
 
   var KEY = "xiaoai_token";
+  var THEME_KEY = "xiaoai_theme";
   var BASE_MS = 5000;
   var QUIET_S = 600;
   var STALE_AFTER = 3;
   var BAD_TOKEN_MS = 30000;
-  var TIMEOUT_MS = 4000;
-  var FOOT_IDLE = "刷新间隔 5 秒 · 标签页隐藏时自动暂停";
+  var TIMEOUT_MS = 4500;
 
   var $ = function (id) { return document.getElementById(id); };
-
-  var run = { timer: null, failures: 0, lastOkAt: 0, paused: false, busy: false, nextDelay: BASE_MS, noAuth: false, lost: 0 };
+  var run = {
+    timer: null, logTimer: null, chatPollTimer: null, toastTimer: null,
+    failures: 0, lastOkAt: 0, paused: false, busy: false, nextDelay: BASE_MS,
+    noAuth: false, lost: 0, tab: "overview", subTab: "entry",
+    authed: false, authManual: false
+  };
   var snapshot = null;
+  var histEntries = [];
+  var pendingChat = null;
+  var cfgFormData = null;
+  var savedFormSnap = null;
 
-  // 七态。判定顺序即「先修最小的事」：令牌是本地问题，链路是设备问题。
   var S = {
-    AUTH_MISSING: { tone: "idle", title: "还没填访问令牌", detail: "展开下面的「访问令牌」填一次，之后就记在这台浏览器里。" },
-    NO_AUTH:      { tone: "warn", title: "在线，但没启用鉴权", detail: "server.token 为空且只绑回环：本机（或隧道过来）能读，其他主机连不上。要绑内网地址必须先设 token，否则控制面会拒绝启动。" },
-    UNREACHABLE:  { tone: "warn", title: "连不上控制面", detail: "地址端口不对，或 agent.yaml 里 server.enabled 是 false。语音链路不受影响。" },
-    AUTH_BAD:     { tone: "warn", title: "令牌被拒（401）", detail: "和 agent.yaml 的 server.token 不一致，重新粘贴一次。" },
-    SOCKET_LOST:  { tone: "bad",  title: "麦克风被抢回（503）", detail: "进程还活着，但 speech.usock 已经不归它了。需要在设备上执行 start-agent.sh restart。" },
+    AUTH_MISSING: { tone: "idle", title: "等待验证访问令牌", detail: "请填写 server.token 以连接音箱控制面。" },
+    NO_AUTH:      { tone: "warn", title: "在线，但未启用鉴权", detail: "server.token 为空且仅绑回环地址：本机或隧道可访问。" },
+    UNREACHABLE:  { tone: "warn", title: "连不上控制面", detail: "地址端口不对，或 server.enabled 为 false（语音链路不受影响）。" },
+    AUTH_BAD:     { tone: "warn", title: "令牌被拒（401）", detail: "与 agent.yaml 的 server.token 不一致。" },
+    SOCKET_LOST:  { tone: "bad",  title: "麦克风被抢回（503）", detail: "speech.usock 已不归本进程，请在设备执行 start-agent.sh restart。" },
+    OK_DUAL:      { tone: "ok",       title: "在线 · 双助手模式", detail: "" },
     OK_LIVE:      { tone: "ok",       title: "在线", detail: "" },
     OK_QUIET:     { tone: "ok-quiet", title: "在线 · 静默", detail: "" },
     STALE:        { tone: "idle", title: "数据已过期", detail: "" }
   };
 
-  function token() {
-    return ($("token").value || "").trim();
+  function token() { return ($("token").value || "").trim(); }
+
+  function applyTheme(mode) {
+    if (mode === "light" || mode === "dark") document.documentElement.setAttribute("data-theme", mode);
+    else { document.documentElement.removeAttribute("data-theme"); mode = "auto"; }
+    try { localStorage.setItem(THEME_KEY, mode); } catch (e) {}
+    var label = mode === "light" ? "浅色" : (mode === "dark" ? "深色" : "跟随系统");
+    $("themeBtn").textContent = "主题：" + label;
+    $("mobileThemeBtn").textContent = label;
+  }
+  function cycleTheme() {
+    var cur = document.documentElement.getAttribute("data-theme") || "auto";
+    applyTheme(cur === "auto" ? "light" : (cur === "light" ? "dark" : "auto"));
   }
 
   function dur(seconds) {
@@ -391,15 +1141,10 @@
     var d = new Date(ms), now = new Date();
     var pad = function (n) { return n < 10 ? "0" + n : String(n); };
     var hms = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
-    // 「数据时刻 22:10:03」可能是昨晚的，跨天必须带日期。
-    var sameDay = d.getFullYear() === now.getFullYear()
-      && d.getMonth() === now.getMonth()
-      && d.getDate() === now.getDate();
-    return sameDay ? hms : (pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hms);
+    var same = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+    return same ? hms : (pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hms);
   }
 
-  // 不靠浏览器文案匹配：Chrome 是 "Failed to fetch"，Safari 是 "Load failed"，
-  // Firefox 是 "NetworkError when attempting to fetch resource"——按类型判才跨浏览器。
   function netReason(err) {
     if (!err) return "无响应";
     if (err.name === "AbortError") return "请求超时";
@@ -407,14 +1152,49 @@
     return "网络错误";
   }
 
-  // 只读 GET；带 Bearer，不把令牌放进 URL（历史、反代日志、Referer 都会留痕）。
-  function get(path) {
-    var opts = { headers: { Authorization: "Bearer " + token() }, cache: "no-store" };
+  function toast(msg, tone) {
+    var el = $("gToast");
+    if (!msg) { el.classList.add("hidden"); return; }
+    el.textContent = msg;
+    if (tone) el.setAttribute("data-tone", tone); else el.removeAttribute("data-tone");
+    el.classList.remove("hidden");
+    clearTimeout(run.toastTimer);
+    run.toastTimer = setTimeout(function () { el.classList.add("hidden"); }, 4200);
+  }
+
+  function armConfirm(btn, confirmLabel, action) {
+    var orig = btn.getAttribute("data-orig") || btn.textContent;
+    btn.setAttribute("data-orig", orig);
+    if (btn.getAttribute("data-armed") === "1") {
+      clearTimeout(btn._armTid);
+      btn.removeAttribute("data-armed");
+      btn.textContent = orig;
+      btn.classList.remove("btn-danger-fill");
+      action();
+      return;
+    }
+    btn.setAttribute("data-armed", "1");
+    btn.textContent = confirmLabel;
+    btn.classList.add("btn-danger-fill");
+    clearTimeout(btn._armTid);
+    btn._armTid = setTimeout(function () {
+      btn.removeAttribute("data-armed");
+      btn.textContent = orig;
+      btn.classList.remove("btn-danger-fill");
+    }, 3000);
+  }
+
+  function apiReq(method, path, payload, timeoutOverride) {
+    var opts = { method: method, headers: { Authorization: "Bearer " + token() }, cache: "no-store" };
+    if (payload !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(payload);
+    }
     var ctl = null, tid = null;
     if (window.AbortController) {
       ctl = new AbortController();
       opts.signal = ctl.signal;
-      tid = setTimeout(function () { ctl.abort(); }, TIMEOUT_MS);
+      tid = setTimeout(function () { ctl.abort(); }, timeoutOverride || TIMEOUT_MS);
     }
     var done = function () { if (tid) { clearTimeout(tid); tid = null; } };
     return fetch(path, opts).then(function (res) {
@@ -422,415 +1202,924 @@
         done();
         var body = null;
         try { body = JSON.parse(text); } catch (e) { body = null; }
-        return { status: res.status, body: body, text: text };
+        return { ok: res.ok, status: res.status, body: body, text: text };
       });
     }, function (err) { done(); throw err; });
+  }
+  function get(path, t) { return apiReq("GET", path, undefined, t); }
+
+  function postAction(path, payload, okLabel) {
+    toast("正在执行…", "");
+    return apiReq("POST", path, payload || {}, 15000).then(function (r) {
+      if (r.status === 401) {
+        toast("令牌被拒（401），请重新输入", "bad");
+        openAuthGate("令牌与 server.token 不一致，请重新输入。", true);
+        return r;
+      }
+      if (!r.ok || (r.body && r.body.error)) {
+        var reason = (r.body && r.body.error) ? r.body.error : ("HTTP " + r.status);
+        toast("操作失败：" + reason, "bad");
+        return r;
+      }
+      var extra = (r.body && r.body.reply) ? ("：" + String(r.body.reply).slice(0, 28)) : "";
+      if (okLabel) toast(okLabel + extra, "ok");
+      return r;
+    }, function (err) {
+      toast("请求失败：" + netReason(err), "bad");
+      return { ok: false, status: 0, body: null };
+    });
+  }
+
+  function openAuthGate(desc, allowCancel) {
+    $("authDesc").textContent = desc || "填写 agent.yaml 里 server 段的 token。令牌仅保存在本地浏览器。";
+    $("clearBtn").classList.toggle("hidden", !token());
+    $("cancelAuthBtn").classList.toggle("hidden", !allowCancel);
+    $("authGate").classList.remove("hidden");
+    setTimeout(function () { $("token").focus(); }, 30);
+  }
+  function closeAuthGate() { run.authManual = false; $("authGate").classList.add("hidden"); }
+
+  function switchTab(tab) {
+    run.tab = tab;
+    var btns = document.querySelectorAll(".nav-btn");
+    for (var i = 0; i < btns.length; i++) btns[i].setAttribute("aria-selected", btns[i].getAttribute("data-tab") === tab ? "true" : "false");
+    var panes = document.querySelectorAll(".pane");
+    for (var j = 0; j < panes.length; j++) panes[j].classList.toggle("active", panes[j].id === "pane-" + tab);
+    if (tab === "history") loadHistory(true);
+    else if (tab === "config" && !cfgFormData) loadConfig();
+    else if (tab === "diag") loadLogs();
+    updateSaveBar();
+    updateLogTimer();
+  }
+
+  function switchSubTab(sub) {
+    run.subTab = sub;
+    var tabs = document.querySelectorAll(".subtab");
+    for (var i = 0; i < tabs.length; i++) tabs[i].setAttribute("aria-selected", tabs[i].getAttribute("data-sub") === sub ? "true" : "false");
+    var isYaml = sub === "yaml";
+    $("cfgFormWrap").classList.toggle("hidden", isYaml);
+    $("cfgYamlWrap").classList.toggle("hidden", !isYaml);
+    var secs = document.querySelectorAll(".cfg-sec");
+    for (var j = 0; j < secs.length; j++) secs[j].classList.toggle("hidden", secs[j].id !== "sec-" + sub);
+    updateSaveBar();
+  }
+
+  function syncConfigHierarchy() {
+    var isDual = $("cRtMode").value === "dual";
+    $("exclusiveBlock").classList.toggle("hidden", isDual);
+    $("dualBlock").classList.toggle("hidden", !isDual);
+    $("niBody").classList.toggle("hidden", !$("cNiEn").checked);
+
+    $("capNoiseExtra").classList.toggle("hidden", !$("cCapNoise").checked);
+    $("capDynExtra").classList.toggle("hidden", !$("cCapDyn").checked);
+
+    var asrProv = $("cAsrProv").value;
+    $("asrOpenAiBox").classList.toggle("hidden", asrProv !== "open_ai");
+    $("asrRtBox").classList.toggle("hidden", asrProv !== "openai_realtime");
+    $("asrVadBody").classList.toggle("hidden", !$("cAsrVadEn").checked);
+
+    var ttsProv = $("cTtsProv").value;
+    $("ttsNativeHint").classList.toggle("hidden", ttsProv !== "native");
+    $("ttsOpenAiBox").classList.toggle("hidden", ttsProv !== "openai");
+    $("ttsExternalBox").classList.toggle("hidden", ttsProv === "native");
+    $("ttsMuteExtra").classList.toggle("hidden", !$("cTtsMute").checked);
+
+    var showBudget = $("cLlmProto").value === "anthropic" && $("cLlmThink").value === "enabled";
+    $("llmBudgetField").classList.toggle("hidden", !showBudget);
+
+    var toolsOn = $("cAgTools").checked;
+    $("toolsOffHint").classList.toggle("hidden", toolsOn);
+    $("toolsBody").classList.toggle("hidden", !toolsOn);
+    $("wsBody").classList.toggle("hidden", !$("cWsEnabled").checked);
+    $("haBody").classList.toggle("hidden", !$("cHaEn").checked);
+
+    var mcpCards = document.querySelectorAll(".mcp-srv-item");
+    for (var i = 0; i < mcpCards.length; i++) {
+      var en = mcpCards[i].querySelector(".mcp-en").checked;
+      var body = mcpCards[i].querySelector(".mcp-srv-body");
+      if (body) body.classList.toggle("hidden", !en);
+    }
+
+    $("musicBody").classList.toggle("hidden", !$("cMusicEn").checked);
+    var musicProv = $("cMusicProv").value;
+    $("naviBox").classList.toggle("hidden", musicProv !== "navidrome");
+    $("neteaseBox").classList.toggle("hidden", musicProv !== "netease");
+
+    $("airplayBody").classList.toggle("hidden", !$("cApEn").checked);
+    $("apDuckField").classList.toggle("hidden", $("cApIntr").value !== "duck");
+
+    var srvOn = $("cSrvEn").checked;
+    $("serverBody").classList.toggle("hidden", !srvOn);
+    $("serverOffHint").classList.toggle("hidden", srvOn);
+    $("ledBody").classList.toggle("hidden", !$("cDevLedEn").checked);
   }
 
   function render(key, detail) {
     var s = S[key] || S.UNREACHABLE;
     $("verdict").setAttribute("data-tone", s.tone);
-    // 只有文字真的变了才写：live region 里每 5 秒重写一次同样的字，部分读屏会重复播报。
-    if ($("vtitle").textContent !== s.title) {
-      $("vtitle").textContent = s.title;
-      document.title = s.title + " · XiaoAI 控制台";
-    }
+    if ($("vtitle").textContent !== s.title) { $("vtitle").textContent = s.title; document.title = s.title + " · XiaoAI 控制台"; }
     var text = (detail === undefined) ? s.detail : detail;
     if ($("vdetail").textContent !== text) $("vdetail").textContent = text;
-    // 没有可轮询的东西时，「暂停」留着只会让人以为点了有用。
+    var dotTone = (s.tone === "ok" || s.tone === "ok-quiet") ? "ok" : (s.tone === "bad" ? "bad" : (s.tone === "warn" ? "warn" : ""));
+    if (dotTone) $("topDot").setAttribute("data-tone", dotTone); else $("topDot").removeAttribute("data-tone");
+    $("topStatus").textContent = s.title;
     $("toggleBtn").disabled = !token() && !run.noAuth;
   }
 
-  // 用最近一次成功的数据填格子：过期时保留旧值，但结论条已经说明它过期了。
-  function paint(health, status, rtt) {
-    // 只有真正的 health 载荷才覆盖快照：401 的 body 是 {"error":"unauthorized"}，
-    // 用它覆盖会把三张事实卡清成「—」，看着像设备挂了（其实只是令牌错了）。
-    if (health && health.body && health.body.socket) {
-      snapshot = { health: health.body, status: (status && status.body) || null, rtt: rtt, at: Date.now() };
+  function paintMusic(ms) {
+    if (!ms) return;
+    var el = $("musicNow"), qEl = $("musicQueue");
+    if (!ms.playing || !ms.current) {
+      el.textContent = "状态：空闲，当前没有在播放音乐"; qEl.classList.add("hidden"); qEl.textContent = ""; return;
     }
-    var hb = snapshot ? snapshot.health : {};
-    var sb = (snapshot && snapshot.status) || {};
-    var sp = hb.speech || {};
-    var so = hb.socket || {};
-    var hasSnap = !!snapshot;
-    var age = sp.last_packet_age_s;
+    var c = ms.current;
+    var st = ms.paused ? "已暂停" : (ms.interrupted ? "语音打断暂停中" : "正在播放");
+    el.textContent = st + "：" + (c.title || "未知曲目") + (c.artist ? (" - " + c.artist) : "") + "（队列 " + (ms.queue_size || 0) + " 首）";
+    qEl.textContent = "";
+    if (ms.queue && ms.queue.length) {
+      for (var i = 0; i < ms.queue.length; i++) {
+        var li = document.createElement("li");
+        li.textContent = (ms.queue[i].title || "未知") + (ms.queue[i].artist ? (" - " + ms.queue[i].artist) : "");
+        qEl.appendChild(li);
+      }
+      qEl.classList.remove("hidden");
+    } else qEl.classList.add("hidden");
+  }
+
+  function paint(health, status, rtt) {
+    if (health && health.body && health.body.socket) snapshot = { health: health.body, status: (status && status.body) || null, rtt: rtt, at: Date.now() };
+    var hb = snapshot ? snapshot.health : {}, sb = (snapshot && snapshot.status) || {}, sp = hb.speech || {}, so = hb.socket || {};
+    var hasSnap = !!snapshot, isDual = (hb.mode || sb.mode) === "dual", age = sp.last_packet_age_s;
+
+    $("modeBadge").textContent = !hasSnap ? "未知模式" : (isDual ? "dual 双助手" : "exclusive 独占");
+    $("modeBadge").setAttribute("data-tone", isDual ? "ok" : "");
+
+    var ni = hb.native_interlock || sb.native_interlock, ib = $("interlockBadge");
+    if (isDual && ni) {
+      ib.classList.remove("hidden");
+      if (!ni.enabled) { ib.textContent = "原生互锁：关闭"; ib.setAttribute("data-tone", "warn"); }
+      else if (ni.state === "active") { ib.textContent = "原生小爱让位中 (" + ni.active_remaining_s + "s)"; ib.setAttribute("data-tone", "warn"); }
+      else if (ni.state === "cooldown") { ib.textContent = "互锁冷却 (" + ni.cooldown_remaining_s + "s)"; ib.setAttribute("data-tone", "warn"); }
+      else { ib.textContent = "原生互锁：空闲 · " + (ni.wake_count || 0) + " 次"; ib.setAttribute("data-tone", "ok"); }
+    } else ib.classList.add("hidden");
 
     $("fUptime").textContent = hasSnap ? dur(hb.uptime_s) : "—";
-    // 没有数据时说「—」，只有接口真的给了 null 才是「从未收到过」。
-    $("fPacket").textContent = !hasSnap ? "—"
-      : ((age === null || age === undefined) ? "从未" : dur(age) + "前");
-    $("fPacketAt").textContent = (hasSnap && age !== null && age !== undefined)
-      ? clock(snapshot.at - age * 1000) : "";
-    $("fRestarts").textContent = (hasSnap && sp.service_restarts !== null && sp.service_restarts !== undefined)
-      ? sp.service_restarts + " 次" : "—";
+    if (isDual) {
+      $("fMiddleLabel").textContent = "外部 KWS";
+      $("fPacket").textContent = so.path ? so.path.replace(/^udp:\/\//, "") : "未配置";
+      $("fPacketAt").textContent = (ni && ni.has_event_command) ? "事件流 + 日志互锁" : "日志尾随互锁";
+      $("fRightLabel").textContent = "原生让位";
+      $("fRestarts").textContent = ni ? (ni.wake_count + " 次") : "—";
+    } else {
+      $("fMiddleLabel").textContent = "上次收包";
+      $("fPacket").textContent = !hasSnap ? "—" : ((age === null || age === undefined) ? "从未" : dur(age) + "前");
+      $("fPacketAt").textContent = (hasSnap && age !== null && age !== undefined) ? clock(snapshot.at - age * 1000) : "";
+      $("fRightLabel").textContent = "异常重启";
+      $("fRestarts").textContent = (hasSnap && sp.service_restarts !== null && sp.service_restarts !== undefined) ? sp.service_restarts + " 次" : "—";
+    }
 
-    $("dSocket").textContent = so.path || "—";
-    $("dOwned").textContent = so.owned === true ? "归本进程" : (so.owned === false ? "不在本进程" : "未知");
-    $("dPid").textContent = (sb.pid === null || sb.pid === undefined) ? "—" : String(sb.pid);
-    $("dPhase").textContent = sb.phase || "—";
     if (sb.last_turn) {
       var lt = sb.last_turn;
+      $("fLatency").textContent = (lt.e2e_first_audio_ms !== null && lt.e2e_first_audio_ms !== undefined) ? (lt.e2e_first_audio_ms + " ms") : (lt.llm_total_ms + " ms");
       var parts = ["ASR " + lt.asr_ms + "ms"];
       if (lt.llm_ttft_ms !== null && lt.llm_ttft_ms !== undefined) parts.push("首字 " + lt.llm_ttft_ms + "ms");
-      parts.push("LLM " + lt.llm_total_ms + "ms");
-      parts.push("TTS " + lt.tts_ms + "ms");
+      parts.push("LLM " + lt.llm_total_ms + "ms"); parts.push("TTS " + lt.tts_ms + "ms");
       if (lt.e2e_first_audio_ms !== null && lt.e2e_first_audio_ms !== undefined) parts.push("出声 " + lt.e2e_first_audio_ms + "ms");
-      $("dLatency").textContent = parts.join(" · ");
-    } else {
-      $("dLatency").textContent = "—";
-    }
+      $("dLatency").textContent = parts.join(" / ");
+    } else { $("fLatency").textContent = "—"; $("dLatency").textContent = "—"; }
+    $("fPhaseSub").textContent = "阶段：" + (sb.phase || "—");
+    $("dMode").textContent = hb.mode || sb.mode || "—";
+    $("dSocket").textContent = so.path || "—";
+    $("dOwned").textContent = isDual ? "外部 KWS + 原生并存" : (so.owned === true ? "归本进程" : (so.owned === false ? "不在本进程" : "未知"));
+    $("dPid").textContent = (sb.pid === null || sb.pid === undefined) ? "—" : String(sb.pid);
+    $("dPhase").textContent = sb.phase || "—";
     $("dConfig").textContent = sb.config || "—";
-    $("dRtt").textContent = (snapshot && snapshot.rtt !== null && snapshot.rtt !== undefined)
-      ? snapshot.rtt + " ms（页面侧计时）" : "—";
-
-    $("raw").textContent = snapshot
-      ? JSON.stringify({ health: snapshot.health, status: snapshot.status }, null, 2)
-      : "—";
-    $("footRight").textContent = snapshot ? ("数据时刻 " + clock(snapshot.at)) : "尚无数据";
+    $("dRtt").textContent = (snapshot && snapshot.rtt !== null && snapshot.rtt !== undefined) ? snapshot.rtt + " ms" : "—";
+    $("raw").textContent = snapshot ? JSON.stringify({ health: snapshot.health, status: snapshot.status }, null, 2) : "—";
+    $("footRight").textContent = snapshot ? ("同步于 " + clock(snapshot.at)) : "尚无数据";
   }
 
   function accept(health, status, rtt) {
-    var key, detail;
-    var h = health || { status: 0, body: null };
-    var age = null;
-
-    if (!h.status) {
-      // 传输层失败与令牌无关，先判它：否则「没令牌」会把「连不上」盖住。
-      key = "UNREACHABLE";
-      detail = S.UNREACHABLE.detail + "（" + netReason(h.error) + "）";
-    } else if (h.status === 401) {
-      if (token()) {
-        key = "AUTH_BAD";
+    var key, detail, h = health || { status: 0, body: null }, age = null;
+    if (!h.status) { key = "UNREACHABLE"; detail = S.UNREACHABLE.detail + "（" + netReason(h.error) + "）"; }
+    else if (h.status === 401) {
+      run.authed = false; key = token() ? "AUTH_BAD" : "AUTH_MISSING";
+      openAuthGate(token() ? "令牌与 server.token 不一致，请重新输入。" : "这台设备开启了 Bearer 鉴权，请输入 server.token。", false);
+    } else if (h.status === 503) { run.authed = true; if (!run.authManual) closeAuthGate(); key = "SOCKET_LOST"; }
+    else if (h.status === 200 && h.body && h.body.status === "ok") {
+      run.authed = true; if (!run.authManual) closeAuthGate();
+      if (h.body.mode === "dual") {
+        key = "OK_DUAL"; var ni = h.body.native_interlock;
+        detail = "KWS 通道：" + ((h.body.socket && h.body.socket.path) ? h.body.socket.path : "未配置")
+          + " · 原生互锁：" + (ni && ni.enabled ? (ni.state === "active" ? "原生小爱活跃让位中" : (ni.state === "cooldown" ? "冷却保护中" : "空闲待命")) : "已关闭");
       } else {
-        key = "AUTH_MISSING";
-        detail = "这台设备要求令牌。展开下面的「访问令牌」填一次，之后就记在这台浏览器里。";
+        age = (h.body.speech && h.body.speech.last_packet_age_s !== undefined) ? h.body.speech.last_packet_age_s : null;
+        if (age === null || age === undefined) { key = "OK_QUIET"; detail = "启动以来尚未收到音频包。"; }
+        else if (age > QUIET_S) { key = "OK_QUIET"; detail = "已经 " + dur(age) + " 没有声音。"; }
+        else { key = "OK_LIVE"; detail = dur(age) + "前听到过声音。"; }
       }
-    } else if (h.status === 503) {
-      key = "SOCKET_LOST";
-    } else if (h.status === 200 && h.body && h.body.status === "ok") {
-      age = (h.body.speech && h.body.speech.last_packet_age_s !== undefined)
-        ? h.body.speech.last_packet_age_s : null;
-      if (age === null || age === undefined) {
-        key = "OK_QUIET";
-        detail = "启动以来还没收到过音频包。";
-      } else if (age > QUIET_S) {
-        key = "OK_QUIET";
-        detail = "已经 " + dur(age) + " 没有声音。没人说话时没有音频包，这不算故障。";
-      } else {
-        key = "OK_LIVE";
-        detail = dur(age) + "前听到过声音。";
-      }
-      // 不带令牌也拿到了 200：服务端 token 为空（control-api.md 里「回环不鉴权」那种）。
-      // 这时不该继续要令牌，但也不该假装没事——控制面是敞开的。
-      if (!token()) {
-        key = "NO_AUTH";
-        detail = S.NO_AUTH.detail;
-      }
-    } else {
-      key = "UNREACHABLE";
-      detail = "控制面返回 HTTP " + h.status + "，页面不认识这个响应。";
-    }
+      if (!token()) { key = "NO_AUTH"; detail = S.NO_AUTH.detail; }
+    } else { key = "UNREACHABLE"; detail = "控制面返回 HTTP " + h.status + "。"; }
 
-    // 只有「根本拿不到答复」才退避与判过期；503/401 是设备给的明确答复，5 秒照常看它恢复。
-    if (key === "UNREACHABLE") {
-      run.failures += 1;
-      // 指数从 failures-1 起才是 5→10→20→40→60；原来的 2^failures 第一次就等 10 秒。
-      run.nextDelay = Math.min(BASE_MS * Math.pow(2, run.failures - 1), 60000);
-    } else {
-      run.failures = 0;
-      run.nextDelay = (key === "AUTH_BAD" || key === "AUTH_MISSING") ? BAD_TOKEN_MS : BASE_MS;
-    }
-
-    // 一直 503 和刚 503 的处置完全不同：前者基本该重启了，得把持续时间说出来。
+    if (key === "UNREACHABLE") { run.failures += 1; run.nextDelay = Math.min(BASE_MS * Math.pow(2, run.failures - 1), 60000); }
+    else { run.failures = 0; run.nextDelay = (key === "AUTH_BAD" || key === "AUTH_MISSING") ? BAD_TOKEN_MS : BASE_MS; }
     run.lost = (key === "SOCKET_LOST") ? run.lost + 1 : 0;
-    if (key === "SOCKET_LOST" && run.lost >= 3) {
-      detail = "已连续 " + run.lost + " 次（约 " + dur(run.lost * (BASE_MS / 1000))
-        + "）没能拿回麦克风。先在设备上执行 start-agent.sh restart。";
-    }
-
-    if (key !== "UNREACHABLE" && key !== "AUTH_BAD" && key !== "AUTH_MISSING") {
-      run.lastOkAt = Date.now();
-    }
-    // 服务端要不要令牌，由响应本身说了算——它决定「没令牌时还能不能继续轮询」。
-    if (key === "AUTH_MISSING" || key === "AUTH_BAD") {
-      run.noAuth = false;
-    } else if (!token() && key !== "UNREACHABLE") {
-      run.noAuth = true;
-    }
+    if (key !== "UNREACHABLE" && key !== "AUTH_BAD" && key !== "AUTH_MISSING") run.lastOkAt = Date.now();
+    if (key === "AUTH_MISSING" || key === "AUTH_BAD") run.noAuth = false;
+    else if (!token() && key !== "UNREACHABLE") run.noAuth = true;
 
     if (run.failures >= STALE_AFTER) {
-      // 和页脚的「数据时刻」取同一个来源：snapshot.at。原来一个用 run.lastOkAt，
-      // 同一屏会并排出现差几秒的两个时刻。
       var dataAt = (snapshot && snapshot.at) ? snapshot.at : run.lastOkAt;
-      var tail = dataAt
-        ? ("下面的数字是 " + clock(dataAt) + " 的。")
-        : "还没有成功读到过状态。";
-      render("STALE", "已连续 " + run.failures + " 次没拿到数据（" + netReason(h.error) + "）。" + tail);
-    } else {
-      render(key, detail);
-    }
-
+      render("STALE", "已连续 " + run.failures + " 次连接失败（" + netReason(h.error) + "）。" + (dataAt ? ("缓存来自 " + clock(dataAt)) : ""));
+    } else render(key, detail);
     paint(health, status, rtt);
-
-    if (!token() && !run.noAuth) {
-      $("footState").textContent = "没填令牌，不会向设备发请求";
-    } else if (run.nextDelay === BASE_MS) {
-      $("footState").textContent = FOOT_IDLE;
-    } else {
-      $("footState").textContent = "下次刷新 " + Math.round(run.nextDelay / 1000) + " 秒后";
-    }
   }
 
-  // probeOnly：没存令牌时只探一次 /health，用来分辨「服务端要令牌」还是「服务端根本没配令牌」。
-  // 只发一次、不进轮询，所以「开着标签页过夜刷 401」这个顾虑仍然成立。
   function poll(probeOnly) {
     if (run.busy) return;
     run.busy = true;
     var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
     var done = function () { run.busy = false; schedule(); };
-
-    // 两个请求并发：串行的话最坏要 8 秒（各 4 秒超时），页脚写的「5 秒」就成了假话。
-    var healthP = get("/health").then(function (h) { return h; }, function (err) {
-      return { status: 0, body: null, error: err };
-    });
-
-    if (probeOnly) {
-      healthP.then(function (h) { accept(h, null, null); }).then(done, done);
-      return;
-    }
-
+    var healthP = get("/health").then(function (h) { return h; }, function (err) { return { status: 0, body: null, error: err }; });
+    if (probeOnly) { healthP.then(function (h) { accept(h, null, null); }).then(done, done); return; }
     var statusP = get("/status").then(function (st) { return st; }, function () { return null; });
-    Promise.all([healthP, statusP]).then(function (pair) {
+    var musicP = (run.tab === "overview") ? get("/music/status").then(function (m) { return m; }, function () { return null; }) : Promise.resolve(null);
+    Promise.all([healthP, statusP, musicP]).then(function (all) {
       var rtt = (window.performance && performance.now) ? Math.round(performance.now() - t0) : null;
-      accept(pair[0], pair[1], rtt);
+      accept(all[0], all[1], rtt);
+      if (all[2] && all[2].ok && all[2].body) paintMusic(all[2].body);
     }).then(done, done);
   }
+  function schedule() { clearTimeout(run.timer); run.timer = null; if (!run.paused && !document.hidden && (token() || run.noAuth)) run.timer = setTimeout(tick, run.nextDelay); }
+  function tick() { if (!run.paused && !document.hidden && (token() || run.noAuth)) poll(); }
+  function stopPolling() { clearTimeout(run.timer); run.timer = null; }
 
-  function schedule() {
-    clearTimeout(run.timer);
-    run.timer = null;
-    // 没有令牌且服务端要令牌时，一个请求都不排——否则过夜就是一万多条 401。
-    if (run.paused || document.hidden) return;
-    if (!token() && !run.noAuth) return;
-    run.timer = setTimeout(tick, run.nextDelay);
-  }
-
-  function tick() {
-    if (run.paused || document.hidden) return;
-    if (!token() && !run.noAuth) return;
-    poll();
-  }
-
-  function stopPolling() {
-    clearTimeout(run.timer);
-    run.timer = null;
-  }
-
-  // 没有 <form>（CSP form-action 'none'），回车必须自己接，否则贴完令牌下意识敲回车没反应。
-  $("token").addEventListener("keydown", function (e) {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      $("saveBtn").click();
+  // Chat
+  function renderChat(scrollToBottom) {
+    var vp = $("histViewport"), q = ($("histFilter").value || "").trim().toLowerCase();
+    var prevScrollBottom = vp.scrollHeight - vp.scrollTop - vp.clientHeight < 40;
+    vp.textContent = "";
+    var items = histEntries.slice().reverse().filter(function (e) {
+      return !q || (e.user || "").toLowerCase().indexOf(q) >= 0 || (e.assistant || "").toLowerCase().indexOf(q) >= 0;
+    });
+    if (!items.length && !pendingChat) {
+      var empty = document.createElement("p");
+      empty.className = "hint"; empty.style.textAlign = "center"; empty.style.marginTop = "28px";
+      empty.textContent = histEntries.length ? "没有匹配的对话内容。" : "暂无对话记录，在下方发一句话试试吧。";
+      vp.appendChild(empty); return;
     }
-  });
+    for (var i = 0; i < items.length; i++) {
+      (function (item) {
+        var grp = document.createElement("div"); grp.className = "turn-group";
+        var uRow = document.createElement("div"); uRow.className = "msg-row user";
+        var uBub = document.createElement("div"); uBub.className = "bubble"; uBub.textContent = item.user;
+        uRow.appendChild(uBub);
 
-  $("saveBtn").addEventListener("click", function () {
-    var value = token();
-    if (!value) {
-      $("token").focus();
-      return;
-    }
-    try { localStorage.setItem(KEY, value); } catch (e) { /* 隐私模式下存不进去，本次会话仍可用 */ }
-    $("tokenState").textContent = "已保存";
-    $("tokenFold").open = false;
-    run.failures = 0;
-    run.lost = 0;
-    run.noAuth = false;
-    run.nextDelay = BASE_MS;
-    poll();
-  });
-
-  $("clearBtn").addEventListener("click", function () {
-    try { localStorage.removeItem(KEY); } catch (e) { /* 同 */ }
-    $("token").value = "";
-    $("tokenState").textContent = "未设置";
-    $("tokenFold").open = true;
-    snapshot = null;
-    stopPolling();
-    run.failures = 0;
-    run.lost = 0;
-    run.noAuth = false;
-    run.nextDelay = BASE_MS;
-    paint(null, null, null);
-    // 清掉令牌后再探一次：也许这台设备本来就不需要令牌，不该直接判定「未填」。
-    poll(true);
-  });
-
-  $("refreshBtn").addEventListener("click", function () {
-    run.failures = 0;
-    run.nextDelay = BASE_MS;
-    if (!token()) {
-      run.noAuth = false;
-      poll(true);
-      return;
-    }
-    poll();
-  });
-
-  $("toggleBtn").addEventListener("click", function () {
-    run.paused = !run.paused;
-    $("toggleBtn").textContent = run.paused ? "继续" : "暂停";
-    if (run.paused) {
-      stopPolling();
-      $("footState").textContent = "已暂停，不再向设备发请求";
-    } else {
-      run.nextDelay = BASE_MS;
-      poll();
-    }
-  });
-
-  var toastTimer = null;
-  function showToast(msg, tone) {
-    var el = $("ctlToast");
-    el.textContent = msg;
-    if (tone) {
-      el.setAttribute("data-tone", tone);
-    } else {
-      el.removeAttribute("data-tone");
-    }
-    clearTimeout(toastTimer);
-    if (msg) {
-      toastTimer = setTimeout(function () {
-        el.textContent = "";
-        el.removeAttribute("data-tone");
-      }, 4500);
-    }
-  }
-
-  function postAction(path, payload, okLabel) {
-    showToast("正在执行…", "");
-    var opts = {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer " + token(),
-        "Content-Type": "application/json"
-      },
-      cache: "no-store",
-      body: JSON.stringify(payload || {})
-    };
-    return fetch(path, opts).then(function (res) {
-      return res.text().then(function (text) {
-        var body = null;
-        try { body = JSON.parse(text); } catch (e) { body = null; }
-        if (res.status === 401) {
-          showToast("令牌被拒（401），请检查访问令牌", "bad");
-          $("tokenFold").open = true;
-          return { ok: false, status: 401, body: body };
+        var bRow = document.createElement("div"); bRow.className = "msg-row bot";
+        var bBub = document.createElement("div"); bBub.className = "bubble"; bBub.textContent = item.assistant;
+        var meta = document.createElement("div"); meta.className = "msg-meta";
+        var ts = document.createElement("span"); ts.textContent = item.timestamp + " · #" + item.id;
+        meta.appendChild(ts);
+        if (item.interrupted) {
+          var badge = document.createElement("span"); badge.className = "pill"; badge.setAttribute("data-tone", "warn"); badge.textContent = "被打断";
+          meta.appendChild(badge);
         }
-        if (!res.ok || (body && body.error)) {
-          var reason = (body && body.error) ? body.error : ("HTTP " + res.status);
-          showToast("操作失败：" + reason, "bad");
-          return { ok: false, status: res.status, body: body };
-        }
-        var extra = (body && body.reply) ? ("：" + String(body.reply).slice(0, 28)) : "";
-        showToast(okLabel + extra, "ok");
-        return { ok: true, status: res.status, body: body };
+        var del = document.createElement("button"); del.type = "button"; del.className = "msg-del"; del.textContent = "删除";
+        del.addEventListener("click", function () {
+          postAction("/history/delete", { id: item.id }, "已删除记录 #" + item.id).then(function (r) { if (r.ok) loadHistory(false); });
+        });
+        meta.appendChild(del); bRow.appendChild(bBub); bRow.appendChild(meta);
+        grp.appendChild(uRow); grp.appendChild(bRow); vp.appendChild(grp);
+      })(items[i]);
+    }
+    if (pendingChat) {
+      var pGrp = document.createElement("div"); pGrp.className = "turn-group";
+      var pu = document.createElement("div"); pu.className = "msg-row user";
+      var pub = document.createElement("div"); pub.className = "bubble"; pub.textContent = pendingChat.text; pu.appendChild(pub);
+      var pb = document.createElement("div"); pb.className = "msg-row bot pending";
+      var pbb = document.createElement("div"); pbb.className = "bubble"; pbb.textContent = "音箱正在思考并生成回复…"; pb.appendChild(pbb);
+      pGrp.appendChild(pu); pGrp.appendChild(pb); vp.appendChild(pGrp);
+    }
+    if (scrollToBottom || prevScrollBottom) vp.scrollTop = vp.scrollHeight;
+  }
+
+  function loadHistory(scrollToBottom) {
+    return get("/history?limit=150").then(function (r) {
+      if (!r.ok || !r.body) {
+        if (r.status === 401) openAuthGate("请先输入访问令牌。", false);
+        else toast("读取对话失败：" + (r.body && r.body.error ? r.body.error : r.status), "bad");
+        return null;
+      }
+      var b = r.body;
+      histEntries = b.entries || [];
+      $("histSummary").textContent = "LLM 短期记忆：" + b.context_turns + "/" + b.context_max_turns + " 轮（" + b.context_ttl_s + "s） · 共 " + b.total + " 条";
+      if (pendingChat && histEntries.length && histEntries[0].id > pendingChat.prevTopId) {
+        pendingChat = null; clearInterval(run.chatPollTimer); run.chatPollTimer = null;
+      }
+      renderChat(scrollToBottom);
+      return b;
+    }, function (err) { toast("读取对话失败：" + netReason(err), "bad"); return null; });
+  }
+
+  // Config helpers
+  function optStr(el) { var v = (el.value || "").trim(); return v === "" ? null : v; }
+  function optNum(el, isInt) { var v = (el.value || "").trim(); return v === "" ? null : (isInt ? parseInt(v, 10) : Number(v)); }
+  function splitLines(el) { return (el.value || "").split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean); }
+  function splitComma(val) { return (val || "").split(/[，,]/).map(function (s) { return s.trim(); }).filter(Boolean); }
+
+  function renderConfigBanners(warnings, pendingRestart, rejected) {
+    var rb = $("cfgRestartBanner"), pendingAll = (pendingRestart || []).concat(rejected || []);
+    if (pendingAll.length) { rb.classList.remove("hidden"); rb.textContent = "以下配置段修改后需要重启音箱服务才会生效：" + pendingAll.join(", "); }
+    else rb.classList.add("hidden");
+    var wb = $("cfgWarnBanner");
+    if (warnings && warnings.length) { wb.classList.remove("hidden"); wb.textContent = "配置告警：" + warnings.join("；"); }
+    else wb.classList.add("hidden");
+  }
+
+  function appendMcpServerCard(srv) {
+    var box = $("mcpServersBox");
+    var card = document.createElement("div"); card.className = "mcp-card mcp-srv-item";
+    var head = document.createElement("div"); head.className = "mcp-card-head";
+    var chk = document.createElement("label"); chk.className = "check"; chk.style.padding = "0";
+    var cb = document.createElement("input"); cb.type = "checkbox"; cb.className = "mcp-en"; cb.checked = !!srv.enabled;
+    var titleSpan = document.createElement("span"); titleSpan.textContent = "启用此 MCP 服务";
+    chk.appendChild(cb); chk.appendChild(titleSpan);
+    var delBtn = document.createElement("button"); delBtn.type = "button"; delBtn.className = "btn btn-sm btn-danger"; delBtn.textContent = "删除";
+    delBtn.addEventListener("click", function () { card.remove(); updateSaveBar(); });
+    head.appendChild(chk); head.appendChild(delBtn);
+
+    var grid = document.createElement("div"); grid.className = "group-body form-grid mcp-srv-body";
+    function addField(cls, lblText, inputCls, type, val, ph) {
+      var d = document.createElement("div"); d.className = "field " + cls;
+      var l = document.createElement("label"); l.textContent = lblText;
+      var inp = document.createElement("input"); inp.type = type; inp.className = inputCls;
+      if (type === "number") { inp.step = "1"; inp.min = "1"; }
+      inp.value = val !== undefined && val !== null ? String(val) : "";
+      if (ph) inp.placeholder = ph;
+      d.appendChild(l); d.appendChild(inp); grid.appendChild(d);
+    }
+    addField("", "名称 (name)", "mcp-name", "text", srv.name || "", "home_assistant");
+    addField("", "超时 (timeout_s)", "mcp-to", "number", srv.timeout_s || 10, "");
+    addField("full", "服务 URL", "mcp-url", "text", srv.url || "", "http://127.0.0.1:8123/api/mcp");
+    addField("", "允许工具白名单（逗号分隔，空=全部）", "mcp-tools", "text", (srv.tools || []).join(", "), "");
+    addField("", "Token（留空保留原值）", "mcp-tok", "password", "", srv.token_set ? "已设置（留空保留原值）" : "未设置");
+
+    card.appendChild(head); card.appendChild(grid);
+    if (!srv.enabled) grid.classList.add("hidden");
+    box.appendChild(card);
+  }
+
+  function fillConfigForm(f) {
+    cfgFormData = f;
+    // runtime / server / device
+    $("cRtMode").value = f.runtime.mode || "exclusive";
+    $("cRtIdle").value = f.runtime.session_idle_timeout_s;
+    $("cRtSock").value = f.runtime.speech_socket || "";
+    $("cSrvEn").checked = !!f.server.enabled;
+    $("cSrvHost").value = f.server.host || "127.0.0.1";
+    $("cSrvPort").value = f.server.port || 8765;
+    $("cSrvToken").value = ""; $("cSrvToken").placeholder = f.server.token_set ? "已设置（留空保留原值）" : "未设置";
+
+    $("cDevLedEn").checked = !!f.device.led_enabled;
+    $("cDevTimeout").value = f.device.command_timeout_s;
+    $("cDevLedL").value = f.device.led_listening;
+    $("cDevLedU").value = f.device.led_user_speaking;
+    $("cDevLedT").value = f.device.led_thinking;
+    $("cDevLedS").value = f.device.led_speaking;
+    $("cDevTtsCmd").value = f.device.tts_command || "";
+    $("cDevPlayUrl").value = f.device.play_url_command || "";
+    $("cDevStopCmd").value = f.device.stop_audio_command || "";
+    $("cDevPauseCmd").value = f.device.pause_audio_command || "";
+    $("cDevResumeCmd").value = f.device.resume_audio_command || "";
+    $("cDevDuckCmd").value = f.device.duck_audio_command || "";
+    $("cDevUnduckCmd").value = f.device.unduck_audio_command || "";
+    $("cDevAbortCmd").value = f.device.abort_command || "";
+    $("cDevVolUp").value = f.device.volume_up_command || "";
+    $("cDevVolDown").value = f.device.volume_down_command || "";
+    $("cDevVolSet").value = f.device.volume_set_command || "";
+    $("cDevVolMute").value = f.device.volume_mute_command || "";
+
+    // asr
+    $("cAsrProv").value = f.asr.provider || "open_ai";
+    $("cAsrOaiUrl").value = f.asr.open_ai.base_url || "";
+    $("cAsrOaiModel").value = f.asr.open_ai.model || "";
+    $("cAsrOaiLang").value = f.asr.open_ai.language || "";
+    $("cAsrOaiKey").value = ""; $("cAsrOaiKey").placeholder = f.asr.open_ai.api_key_set ? "已设置（留空保留原值）" : "未设置";
+    $("cAsrOaiTimeout").value = f.asr.open_ai.timeout_s;
+    $("cAsrOaiRetries").value = f.asr.open_ai.retries;
+    $("cAsrOaiPrompt").value = f.asr.open_ai.prompt || "";
+
+    $("cAsrRtUrl").value = f.asr.openai_realtime.base_url || "";
+    $("cAsrRtModel").value = f.asr.openai_realtime.model || "";
+    $("cAsrRtKey").value = ""; $("cAsrRtKey").placeholder = f.asr.openai_realtime.api_key_set ? "已设置（留空保留原值）" : "未设置";
+    $("cAsrRtSr").value = f.asr.openai_realtime.target_sample_rate;
+    $("cAsrRtChunk").value = f.asr.openai_realtime.chunk_ms;
+    $("cAsrRtTimeout").value = f.asr.openai_realtime.timeout_s;
+    $("cAsrRtRetries").value = f.asr.openai_realtime.retries;
+    $("cAsrVadEn").checked = !!f.asr.openai_realtime.server_vad.enabled;
+    $("cAsrVadPad").value = f.asr.openai_realtime.server_vad.prefix_padding_ms;
+    $("cAsrVadSil").value = f.asr.openai_realtime.server_vad.silence_duration_ms;
+    $("cAsrVadTh").value = f.asr.openai_realtime.server_vad.threshold;
+
+    // llm
+    $("cLlmProto").value = f.llm.protocol || "open_ai_chat";
+    $("cLlmModel").value = f.llm.model || "";
+    $("cLlmUrl").value = f.llm.base_url || "";
+    $("cLlmKey").value = ""; $("cLlmKey").placeholder = f.llm.api_key_set ? "已设置（留空保留原值）" : "未设置";
+    $("cLlmTemp").value = f.llm.temperature;
+    $("cLlmMaxTok").value = f.llm.max_tokens;
+    $("cLlmTimeout").value = f.llm.timeout_s;
+    $("cLlmThink").value = f.llm.thinking_mode || "disabled";
+    $("cLlmBudget").value = f.llm.thinking_budget_tokens;
+
+    // tts
+    $("cTtsProv").value = f.tts.provider || "native";
+    $("cTtsVoice").value = f.tts.openai_voice || "";
+    $("cTtsModel").value = f.tts.openai_model || "";
+    $("cTtsFmt").value = f.tts.openai_response_format || "wav";
+    $("cTtsUrl").value = f.tts.openai_base_url || "";
+    $("cTtsKey").value = ""; $("cTtsKey").placeholder = f.tts.openai_api_key_set ? "已设置（留空保留原值）" : "未设置";
+    $("cTtsSpeed").value = f.tts.openai_speed !== null && f.tts.openai_speed !== undefined ? f.tts.openai_speed : "";
+    $("cTtsSr").value = f.tts.openai_sample_rate !== null && f.tts.openai_sample_rate !== undefined ? f.tts.openai_sample_rate : "";
+    $("cTtsTimeout").value = f.tts.openai_timeout_s;
+    $("cTtsTail").value = f.tts.playback_tail_ms;
+    $("cTtsGrace").value = f.tts.playback_startup_grace_ms;
+    $("cTtsDir").value = f.tts.openai_output_dir || "";
+    $("cTtsInst").value = f.tts.openai_instructions || "";
+    $("cTtsPlayCmd").value = f.tts.playback_command || "";
+    $("cTtsFallback").checked = !!f.tts.fallback_to_native;
+    $("cTtsMute").checked = !!f.tts.suppress_capture_while_playing;
+
+    // agent & mcp
+    $("cAgTools").checked = !!f.agent.tools_enabled;
+    $("cWsEnabled").checked = !!f.agent.web_search_enabled;
+    $("cAgTime").checked = !!f.agent.inject_current_time;
+    $("cAgTz").value = f.agent.timezone || "Asia/Shanghai";
+    $("cAgLoc").value = f.agent.weather_default_location || "";
+    $("cAgQweather").value = f.agent.weather_qweather_url || "";
+    $("cAgIpUrl").value = f.agent.weather_ip_lookup_url || "";
+    $("cAgWeatherTo").value = f.agent.weather_timeout_s;
+    $("cWsUrl").value = f.agent.web_search_tavily_url || "";
+    $("cWsDepth").value = f.agent.web_search_search_depth || "basic";
+    $("cWsMax").value = f.agent.web_search_max_results;
+    $("cWsTimeout").value = f.agent.web_search_timeout_s;
+    $("cWsKey").value = ""; $("cWsKey").placeholder = f.agent.web_search_api_key_set ? "已设置（留空保留原值）" : "未设置";
+
+    $("cHaEn").checked = !!(f.mcp.home_assistant && f.mcp.home_assistant.enabled);
+    $("cHaUrl").value = (f.mcp.home_assistant && f.mcp.home_assistant.url) || "";
+    $("cHaTimeout").value = (f.mcp.home_assistant && f.mcp.home_assistant.timeout_s) || 5;
+    $("cHaToken").value = ""; $("cHaToken").placeholder = (f.mcp.home_assistant && f.mcp.home_assistant.token_set) ? "已设置（留空保留原值）" : "未设置";
+
+    $("mcpServersBox").textContent = "";
+    var srvs = (f.mcp && f.mcp.servers) || [];
+    for (var i = 0; i < srvs.length; i++) appendMcpServerCard(srvs[i]);
+
+    // dual & capture
+    $("cDualEnter").value = f.dual.enter_prompt || "";
+    $("cDualExit").value = f.dual.exit_prompt || "";
+    $("cDualTimeout").value = f.dual.session_timeout_s;
+    $("cDualKw").value = (f.dual.exit_keywords || []).join("，");
+    $("cDualEnterWav").value = f.dual.enter_earcon || "";
+    $("cDualExitWav").value = f.dual.exit_earcon || "";
+    $("cDualThinkWav").value = f.dual.thinking_earcon || "";
+
+    $("cDualEp").value = f.dual.kws.endpoint || "";
+    $("cDualPing").value = f.dual.kws.ping_interval_s;
+    $("cNiEn").checked = !!f.dual.native_interlock.enabled;
+    $("cNiCmd").value = f.dual.native_interlock.event_command || "";
+    $("cNiSyslog").value = f.dual.native_interlock.syslog_path || "";
+    $("cNiInst").value = f.dual.native_interlock.instruction_log_path || "";
+    $("cNiMax").value = f.dual.native_interlock.max_active_s;
+    $("cNiCool").value = f.dual.native_interlock.cooldown_s;
+    $("cNiWake").value = (f.dual.native_interlock.wake_patterns || []).join("\n");
+    $("cNiEnd").value = (f.dual.native_interlock.end_patterns || []).join("\n");
+    $("cNiInstPat").value = (f.dual.native_interlock.instruction_patterns || []).join("\n");
+    $("cNiPoll").value = f.dual.native_interlock.poll_interval_ms;
+
+    $("cDcDev").value = f.dual.capture.device || "noop";
+    $("cDcFmt").value = f.dual.capture.format || "S32_LE";
+    $("cDcSr").value = f.dual.capture.sample_rate;
+    $("cDcCh").value = f.dual.capture.channels;
+    $("cDcMic").value = f.dual.capture.mic_channel;
+    $("cDcRef").value = f.dual.capture.ref_channel !== null && f.dual.capture.ref_channel !== undefined ? f.dual.capture.ref_channel : "";
+    $("cDcShift").value = f.dual.capture.shift_bits;
+
+    $("cCapSr").value = f.capture.sample_rate;
+    $("cCapTh").value = f.capture.threshold;
+    $("cCapGain").value = f.capture.mic_gain;
+    $("cCapBlock").value = f.capture.block_ms;
+    $("cCapPre").value = f.capture.pre_roll_ms;
+    $("cCapMinSp").value = f.capture.min_speech_ms;
+    $("cCapSil").value = f.capture.silence_ms;
+    $("cCapMax").value = f.capture.max_utterance_s;
+    $("cCapCool").value = f.capture.cooldown_s;
+    $("cCapMult").value = f.capture.noise_floor_multiplier;
+    $("cCapShortSil").value = f.capture.short_utterance_silence_ms;
+    $("cCapLongSil").value = f.capture.long_utterance_silence_ms;
+    $("cCapDyn").checked = !!f.capture.dynamic_silence;
+    $("cCapNoise").checked = !!f.capture.adaptive_noise_floor;
+    $("cCapLevels").checked = !!f.capture.print_levels;
+
+    // music & airplay
+    $("cMusicEn").checked = !!f.music.enabled;
+    $("cMusicProv").value = f.music.provider || "navidrome";
+    $("cMusicInt").value = f.music.interruption_mode || "pause";
+    $("cNaviUrl").value = f.music.navidrome.base_url || "";
+    $("cNaviUser").value = f.music.navidrome.username || "";
+    $("cNaviPass").value = ""; $("cNaviPass").placeholder = f.music.navidrome.password_set ? "已设置（留空保留原值）" : "未设置";
+    $("cNaviVer").value = f.music.navidrome.api_version || "";
+    $("cNaviTo").value = f.music.navidrome.timeout_s;
+
+    $("cNeUrl").value = f.music.netease.api_base_url || "";
+    $("cNeMode").value = f.music.netease.login_mode || "";
+    $("cNeAcc").value = f.music.netease.account || "";
+    $("cNePhone").value = f.music.netease.phone || "";
+    $("cNeLvl").value = f.music.netease.default_level || "";
+    $("cNePass").value = ""; $("cNePass").placeholder = f.music.netease.password_set ? "已设置（留空保留原值）" : "未设置";
+    $("cNeMd5").value = ""; $("cNeMd5").placeholder = f.music.netease.md5_password_set ? "已设置（留空保留原值）" : "未设置";
+    $("cNeCookie").value = f.music.netease.cookie_file || "";
+    $("cNeTo").value = f.music.netease.timeout_s;
+    $("cNeAutoLogin").checked = !!f.music.netease.login_on_start;
+
+    $("cApEn").checked = !!f.airplay.enabled;
+    $("cApName").value = f.airplay.name || "";
+    $("cApPort").value = f.airplay.port;
+    $("cApPass").value = ""; $("cApPass").placeholder = f.airplay.password_set ? "已设置（留空保留原值）" : "未设置";
+    $("cApHw").value = f.airplay.hwaddr || "";
+    $("cApBackend").value = f.airplay.output_backend || "";
+    $("cApAplay").value = f.airplay.output_aplay_path || "";
+    $("cApDev").value = f.airplay.output_device || "";
+    $("cApFmt").value = f.airplay.output_format || "";
+    $("cApIntr").value = f.airplay.interruption_mode || "duck";
+    $("cApDuck").value = f.airplay.interruption_duck_gain;
+
+    syncConfigHierarchy();
+    savedFormSnap = JSON.stringify(collectFormPayload());
+    updateSaveBar();
+  }
+
+  function collectFormPayload() {
+    var mcpCards = document.querySelectorAll(".mcp-srv-item"), srvs = [];
+    for (var i = 0; i < mcpCards.length; i++) {
+      var card = mcpCards[i];
+      var name = (card.querySelector(".mcp-name").value || "").trim();
+      if (!name) continue;
+      srvs.push({
+        name: name,
+        enabled: card.querySelector(".mcp-en").checked,
+        url: card.querySelector(".mcp-url").value.trim(),
+        timeout_s: Number(card.querySelector(".mcp-to").value) || 10,
+        tools: splitComma(card.querySelector(".mcp-tools").value),
+        token: card.querySelector(".mcp-tok").value
       });
-    }, function (err) {
-      showToast("请求失败：" + netReason(err), "bad");
-      return { ok: false, status: 0, body: null };
-    });
+    }
+    return {
+      runtime: { mode: $("cRtMode").value, session_idle_timeout_s: Number($("cRtIdle").value) },
+      server: {
+        enabled: $("cSrvEn").checked, host: $("cSrvHost").value.trim(),
+        port: parseInt($("cSrvPort").value, 10), token: $("cSrvToken").value
+      },
+      device: {
+        command_timeout_s: Number($("cDevTimeout").value),
+        led_enabled: $("cDevLedEn").checked,
+        led_listening: parseInt($("cDevLedL").value, 10),
+        led_user_speaking: parseInt($("cDevLedU").value, 10),
+        led_thinking: parseInt($("cDevLedT").value, 10),
+        led_speaking: parseInt($("cDevLedS").value, 10),
+        tts_command: $("cDevTtsCmd").value.trim(),
+        play_url_command: $("cDevPlayUrl").value.trim(),
+        stop_audio_command: $("cDevStopCmd").value.trim(),
+        pause_audio_command: $("cDevPauseCmd").value.trim(),
+        resume_audio_command: $("cDevResumeCmd").value.trim(),
+        duck_audio_command: $("cDevDuckCmd").value.trim(),
+        unduck_audio_command: $("cDevUnduckCmd").value.trim(),
+        abort_command: $("cDevAbortCmd").value.trim(),
+        volume_up_command: $("cDevVolUp").value.trim(),
+        volume_down_command: $("cDevVolDown").value.trim(),
+        volume_set_command: $("cDevVolSet").value.trim(),
+        volume_mute_command: $("cDevVolMute").value.trim()
+      },
+      asr: {
+        provider: $("cAsrProv").value,
+        open_ai: {
+          base_url: $("cAsrOaiUrl").value.trim(), model: $("cAsrOaiModel").value.trim(),
+          language: $("cAsrOaiLang").value.trim(), prompt: $("cAsrOaiPrompt").value.trim(),
+          timeout_s: Number($("cAsrOaiTimeout").value), retries: parseInt($("cAsrOaiRetries").value, 10),
+          api_key: $("cAsrOaiKey").value
+        },
+        openai_realtime: {
+          base_url: $("cAsrRtUrl").value.trim(), model: $("cAsrRtModel").value.trim(),
+          target_sample_rate: parseInt($("cAsrRtSr").value, 10), chunk_ms: parseInt($("cAsrRtChunk").value, 10),
+          timeout_s: Number($("cAsrRtTimeout").value), retries: parseInt($("cAsrRtRetries").value, 10),
+          api_key: $("cAsrRtKey").value,
+          server_vad: {
+            enabled: $("cAsrVadEn").checked, prefix_padding_ms: parseInt($("cAsrVadPad").value, 10),
+            silence_duration_ms: parseInt($("cAsrVadSil").value, 10), threshold: Number($("cAsrVadTh").value)
+          }
+        }
+      },
+      llm: {
+        protocol: $("cLlmProto").value, base_url: $("cLlmUrl").value.trim(), model: $("cLlmModel").value.trim(),
+        temperature: Number($("cLlmTemp").value), max_tokens: parseInt($("cLlmMaxTok").value, 10),
+        timeout_s: Number($("cLlmTimeout").value), api_key: $("cLlmKey").value,
+        thinking: { mode: $("cLlmThink").value, budget_tokens: parseInt($("cLlmBudget").value, 10) }
+      },
+      tts: {
+        provider: $("cTtsProv").value, fallback_to_native: $("cTtsFallback").checked,
+        playback_command: optStr($("cTtsPlayCmd")), suppress_capture_while_playing: $("cTtsMute").checked,
+        playback_tail_ms: parseInt($("cTtsTail").value, 10), playback_startup_grace_ms: parseInt($("cTtsGrace").value, 10),
+        openai: {
+          base_url: $("cTtsUrl").value.trim(), model: $("cTtsModel").value.trim(),
+          voice: $("cTtsVoice").value.trim(), response_format: $("cTtsFmt").value.trim(),
+          speed: optNum($("cTtsSpeed"), false), sample_rate: optNum($("cTtsSr"), true),
+          instructions: optStr($("cTtsInst")), timeout_s: Number($("cTtsTimeout").value),
+          output_dir: optStr($("cTtsDir")), api_key: $("cTtsKey").value
+        }
+      },
+      agent: {
+        timezone: $("cAgTz").value.trim(), tools_enabled: $("cAgTools").checked, inject_current_time: $("cAgTime").checked,
+        weather: {
+          default_location: $("cAgLoc").value.trim(), qweather_url: $("cAgQweather").value.trim(),
+          ip_lookup_url: $("cAgIpUrl").value.trim(), timeout_s: Number($("cAgWeatherTo").value)
+        },
+        web_search: {
+          enabled: $("cWsEnabled").checked, tavily_url: $("cWsUrl").value.trim(),
+          max_results: parseInt($("cWsMax").value, 10), search_depth: $("cWsDepth").value,
+          timeout_s: Number($("cWsTimeout").value), api_key: $("cWsKey").value
+        }
+      },
+      dual: {
+        enter_prompt: $("cDualEnter").value.trim(), exit_prompt: $("cDualExit").value.trim(),
+        enter_earcon: optStr($("cDualEnterWav")), exit_earcon: optStr($("cDualExitWav")),
+        thinking_earcon: optStr($("cDualThinkWav")), session_timeout_s: parseInt($("cDualTimeout").value, 10),
+        exit_keywords: splitComma($("cDualKw").value),
+        kws: { endpoint: $("cDualEp").value.trim(), ping_interval_s: parseInt($("cDualPing").value, 10) },
+        capture: {
+          device: $("cDcDev").value.trim(), sample_rate: parseInt($("cDcSr").value, 10),
+          channels: parseInt($("cDcCh").value, 10), format: $("cDcFmt").value,
+          mic_channel: parseInt($("cDcMic").value, 10), ref_channel: optNum($("cDcRef"), true),
+          shift_bits: parseInt($("cDcShift").value, 10)
+        },
+        native_interlock: {
+          enabled: $("cNiEn").checked, event_command: $("cNiCmd").value.trim(),
+          syslog_path: optStr($("cNiSyslog")), instruction_log_path: optStr($("cNiInst")),
+          wake_patterns: splitLines($("cNiWake")), end_patterns: splitLines($("cNiEnd")),
+          instruction_patterns: splitLines($("cNiInstPat")),
+          max_active_s: parseInt($("cNiMax").value, 10), cooldown_s: parseInt($("cNiCool").value, 10),
+          poll_interval_ms: parseInt($("cNiPoll").value, 10)
+        }
+      },
+      capture: {
+        sample_rate: parseInt($("cCapSr").value, 10), threshold: Number($("cCapTh").value),
+        mic_gain: Number($("cCapGain").value), block_ms: parseInt($("cCapBlock").value, 10),
+        pre_roll_ms: parseInt($("cCapPre").value, 10), silence_ms: parseInt($("cCapSil").value, 10),
+        min_speech_ms: parseInt($("cCapMinSp").value, 10), max_utterance_s: Number($("cCapMax").value),
+        cooldown_s: Number($("cCapCool").value), print_levels: $("cCapLevels").checked,
+        adaptive_noise_floor: $("cCapNoise").checked, noise_floor_multiplier: Number($("cCapMult").value),
+        dynamic_silence: $("cCapDyn").checked, short_utterance_silence_ms: parseInt($("cCapShortSil").value, 10),
+        long_utterance_silence_ms: parseInt($("cCapLongSil").value, 10)
+      },
+      music: {
+        enabled: $("cMusicEn").checked, provider: $("cMusicProv").value,
+        interruption: { mode: $("cMusicInt").value },
+        navidrome: {
+          base_url: $("cNaviUrl").value.trim(), username: $("cNaviUser").value.trim(),
+          password: $("cNaviPass").value, api_version: $("cNaviVer").value.trim(), timeout_s: Number($("cNaviTo").value)
+        },
+        netease: {
+          api_base_url: $("cNeUrl").value.trim(), login_mode: $("cNeMode").value.trim(),
+          account: $("cNeAcc").value.trim(), phone: $("cNePhone").value.trim(),
+          password: $("cNePass").value, md5_password: $("cNeMd5").value,
+          cookie_file: optStr($("cNeCookie")), default_level: $("cNeLvl").value.trim(),
+          timeout_s: Number($("cNeTo").value), login_on_start: $("cNeAutoLogin").checked
+        }
+      },
+      airplay: {
+        enabled: $("cApEn").checked, name: $("cApName").value.trim(),
+        port: parseInt($("cApPort").value, 10), password: $("cApPass").value,
+        hwaddr: $("cApHw").value.trim(),
+        output: {
+          backend: $("cApBackend").value.trim(), aplay_path: $("cApAplay").value.trim(),
+          device: $("cApDev").value.trim(), format: $("cApFmt").value.trim()
+        },
+        interruption: { mode: $("cApIntr").value, duck_gain: Number($("cApDuck").value) }
+      },
+      mcp: {
+        home_assistant: {
+          enabled: $("cHaEn").checked, url: $("cHaUrl").value.trim(),
+          timeout_s: Number($("cHaTimeout").value), token: $("cHaToken").value
+        },
+        servers: srvs
+      }
+    };
   }
 
-  $("stopBtn").addEventListener("click", function () {
-    postAction("/stop", {}, "已停止播报与音乐");
+  function isFormDirty() { return !!savedFormSnap && JSON.stringify(collectFormPayload()) !== savedFormSnap; }
+  function updateSaveBar() {
+    var show = run.tab === "config" && run.subTab !== "yaml" && isFormDirty();
+    $("cfgSaveBar").classList.toggle("hidden", !show);
+  }
+
+  function loadConfig() {
+    get("/config", 8000).then(function (r) {
+      if (!r.ok || !r.body) {
+        if (r.status === 401) openAuthGate("请先输入访问令牌。", false);
+        else toast("读取配置失败：" + (r.body && r.body.error ? r.body.error : r.status), "bad");
+        return;
+      }
+      var b = r.body;
+      $("cfgPathHint").textContent = "配置文件：" + (b.path || "—");
+      $("cfgRollbackBtn").disabled = !b.has_backup;
+      $("cfgYamlText").value = b.yaml || "";
+      if (b.form) fillConfigForm(b.form);
+      renderConfigBanners(b.warnings, b.pending_restart, b.rejected);
+    }, function (err) { toast("读取配置失败：" + netReason(err), "bad"); });
+  }
+
+  function handleSaveOutcome(res, prefix) {
+    if (!res.ok || !res.body) return;
+    var o = res.body.outcome || {};
+    var applied = (o.applied || []).length ? ("已热生效：" + o.applied.join(", ")) : "无热改项";
+    toast(prefix + "（" + applied + "）", "ok");
+    renderConfigBanners(o.warnings, o.needs_restart, o.rejected);
+    loadConfig();
+  }
+
+  // Doctor & Logs
+  function fmtKib(kib) { return (kib === null || kib === undefined) ? "未知" : (kib / 1024).toFixed(2) + " MiB (" + kib + " KiB)"; }
+  function runDoctor() {
+    $("docSummary").textContent = "正在探测存储余量与上游连通性…";
+    get("/doctor", 10000).then(function (r) {
+      if (!r.ok || !r.body) { $("docSummary").textContent = "自检失败：" + (r.body && r.body.error ? r.body.error : r.status); return; }
+      var d = r.body; $("docSummary").textContent = "最近自检时间：" + clock(Date.now());
+      $("docResult").classList.remove("hidden");
+      var meta = $("docMeta"); meta.textContent = "";
+      var rows = [
+        ["运行模式", d.mode], ["/tmp 剩余空间", fmtKib(d.tmp_free_kib)],
+        [d.data_path + " 剩余空间", fmtKib(d.data_free_kib)], ["PID 文件", d.pid_file || "无"]
+      ];
+      if (d.dual) {
+        rows.push(["外部 KWS", d.dual.kws_endpoint || "未配置"]);
+        rows.push(["采音参数", d.dual.capture_summary]);
+        rows.push(["syslog", (d.dual.syslog_path || "无") + " (存在=" + d.dual.syslog_exists + ")"]);
+        rows.push(["instruction.log", (d.dual.instruction_log_path || "无") + " (存在=" + d.dual.instruction_log_exists + ")"]);
+      } else rows.push(["speech.usock", (d.speech_socket || "—") + " (存在=" + d.speech_socket_exists + ")"]);
+      for (var i = 0; i < rows.length; i++) {
+        var wrap = document.createElement("div");
+        var dt = document.createElement("dt"); dt.textContent = rows[i][0];
+        var dd = document.createElement("dd"); dd.textContent = rows[i][1];
+        wrap.appendChild(dt); wrap.appendChild(dd); meta.appendChild(wrap);
+      }
+      var wb = $("docWarnBox");
+      if (d.warnings && d.warnings.length) { wb.classList.remove("hidden"); wb.textContent = "发现 " + d.warnings.length + " 条配置告警：" + d.warnings.join("；"); }
+      else wb.classList.add("hidden");
+      var tbody = $("docUpstreams"); tbody.textContent = "";
+      var ups = d.upstreams || [];
+      for (var j = 0; j < ups.length; j++) {
+        var u = ups[j], tr = document.createElement("tr");
+        var td1 = document.createElement("td"); td1.textContent = u.label;
+        var td2 = document.createElement("td"); td2.className = "mono"; td2.textContent = u.url;
+        var td3 = document.createElement("td"), badge = document.createElement("span");
+        badge.className = "pill"; badge.setAttribute("data-tone", u.reachable ? "ok" : "bad");
+        badge.textContent = u.reachable ? ("可达" + (u.status_code ? (" " + u.status_code) : "")) : ("不可达: " + (u.error || ""));
+        td3.appendChild(badge);
+        var td4 = document.createElement("td"); td4.textContent = u.reachable ? (u.rtt_ms + " ms") : "—";
+        tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4); tbody.appendChild(tr);
+      }
+    }, function (err) { $("docSummary").textContent = "自检请求失败：" + netReason(err); });
+  }
+
+  function loadLogs() {
+    var url = "/logs?lines=" + encodeURIComponent($("logLines").value) + "&level=" + encodeURIComponent($("logLevel").value) + "&q=" + encodeURIComponent(($("logSearch").value || "").trim());
+    get(url, 6000).then(function (r) {
+      if (!r.ok || !r.body) { $("logMeta").textContent = "读取失败：" + (r.body && r.body.error ? r.body.error : r.status); return; }
+      var b = r.body;
+      if (!b.exists) { $("logMeta").textContent = b.path + "（文件不存在）"; $("logBox").textContent = "暂无日志文件。"; return; }
+      $("logMeta").textContent = b.path + " · " + Math.round((b.file_size_bytes || 0) / 1024) + " KiB" + (b.truncated ? "（末尾 64 KiB）" : "");
+      var box = $("logBox");
+      box.textContent = (b.lines && b.lines.length) ? b.lines.join("\n") : "（没有匹配的日志行）";
+      box.scrollTop = box.scrollHeight;
+    }, function (err) { $("logMeta").textContent = "请求失败：" + netReason(err); });
+  }
+  function updateLogTimer() {
+    clearInterval(run.logTimer); run.logTimer = null;
+    if (run.tab === "diag" && $("logAuto").checked && !document.hidden) run.logTimer = setInterval(loadLogs, 5000);
+  }
+
+  // Bindings
+  var navBtns = document.querySelectorAll(".nav-btn");
+  for (var i = 0; i < navBtns.length; i++) (function (b) { b.addEventListener("click", function () { switchTab(b.getAttribute("data-tab")); }); })(navBtns[i]);
+  var subBtns = document.querySelectorAll(".subtab");
+  for (var j = 0; j < subBtns.length; j++) (function (b) { b.addEventListener("click", function () { switchSubTab(b.getAttribute("data-sub")); }); })(subBtns[j]);
+
+  $("themeBtn").addEventListener("click", cycleTheme);
+  $("mobileThemeBtn").addEventListener("click", cycleTheme);
+  $("tokenModalBtn").addEventListener("click", function () { run.authManual = true; openAuthGate("更新或清除当前浏览器保存的访问令牌。", true); });
+  $("cancelAuthBtn").addEventListener("click", closeAuthGate);
+  $("token").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("saveBtn").click(); } });
+  $("saveBtn").addEventListener("click", function () {
+    var value = token(); if (!value) { $("token").focus(); return; }
+    try { localStorage.setItem(KEY, value); } catch (e) {}
+    run.failures = 0; run.lost = 0; run.noAuth = false; run.nextDelay = BASE_MS;
+    closeAuthGate(); toast("正在验证令牌并连接…", ""); poll();
   });
-  $("clearHistBtn").addEventListener("click", function () {
-    postAction("/history/clear", {}, "已清空对话记忆");
-  });
-  $("reloadBtn").addEventListener("click", function () {
-    postAction("/reload", {}, "已触发热重载配置");
+  $("clearBtn").addEventListener("click", function () {
+    try { localStorage.removeItem(KEY); } catch (e) {}
+    $("token").value = ""; snapshot = null; stopPolling();
+    run.failures = 0; run.lost = 0; run.noAuth = false; run.nextDelay = BASE_MS;
+    paint(null, null, null); poll(true);
   });
 
-  $("volDownBtn").addEventListener("click", function () {
-    postAction("/volume", { action: "down" }, "音量已降低");
+  $("refreshBtn").addEventListener("click", function () { run.failures = 0; run.nextDelay = BASE_MS; if (!token()) { run.noAuth = false; poll(true); return; } poll(); });
+  $("toggleBtn").addEventListener("click", function () {
+    run.paused = !run.paused; $("toggleBtn").textContent = run.paused ? "继续" : "暂停";
+    if (run.paused) { stopPolling(); toast("已暂停自动刷新", ""); } else { run.nextDelay = BASE_MS; poll(); }
   });
-  $("volUpBtn").addEventListener("click", function () {
-    postAction("/volume", { action: "up" }, "音量已提高");
-  });
-  $("volMuteBtn").addEventListener("click", function () {
-    postAction("/volume", { action: "mute" }, "已静音");
+  $("globalStopBtn").addEventListener("click", function () { postAction("/stop", {}, "已停止全部播报与音乐"); });
+  $("volDownBtn").addEventListener("click", function () { postAction("/volume", { action: "down" }, "音量已降低"); });
+  $("volUpBtn").addEventListener("click", function () { postAction("/volume", { action: "up" }, "音量已提高"); });
+  $("volMuteBtn").addEventListener("click", function () { postAction("/volume", { action: "mute" }, "已静音"); });
+  $("volRange").addEventListener("input", function () { $("volVal").textContent = $("volRange").value; });
+  $("volRange").addEventListener("change", function () { var v = parseInt($("volRange").value, 10); postAction("/volume", { action: "set", value: v }, "已设音量为 " + v); });
+
+  function sendSpeak(inputEl, okLabel) {
+    var text = (inputEl.value || "").trim(); if (!text) { toast("请输入内容", "bad"); inputEl.focus(); return; }
+    postAction("/speak", { text: text }, okLabel).then(function (r) { if (r.ok && inputEl.id !== "ttsPreviewText") inputEl.value = ""; });
+  }
+  $("speakBtn").addEventListener("click", function () { sendSpeak($("speakInput"), "已提交播报"); });
+  $("speakInput").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); $("speakBtn").click(); } });
+  $("ttsPreviewBtn").addEventListener("click", function () { sendSpeak($("ttsPreviewText"), "已下发试听"); });
+
+  $("musicPrevBtn").addEventListener("click", function () { postAction("/music/previous", {}, "已切换上一首").then(poll); });
+  $("musicPauseBtn").addEventListener("click", function () { postAction("/music/pause", {}, "已暂停音乐").then(poll); });
+  $("musicResumeBtn").addEventListener("click", function () { postAction("/music/resume", {}, "已继续播放").then(poll); });
+  $("musicNextBtn").addEventListener("click", function () { postAction("/music/next", {}, "已切换下一首").then(poll); });
+  $("musicStopBtn").addEventListener("click", function () { postAction("/music/stop", {}, "已停止音乐").then(poll); });
+
+  $("histRefreshBtn").addEventListener("click", function () { loadHistory(false); });
+  $("histFilter").addEventListener("input", function () { renderChat(false); });
+  $("histClearCtxBtn").addEventListener("click", function () { postAction("/history/clear", { clear_log: false }, "已清空 LLM 短期记忆").then(function () { loadHistory(false); }); });
+  $("histClearAllBtn").addEventListener("click", function () {
+    armConfirm($("histClearAllBtn"), "确认清空全部?", function () { postAction("/history/clear", { clear_log: true }, "已清空全部对话记录").then(function () { loadHistory(false); }); });
   });
 
-  function sendText(path, okLabel) {
-    var text = ($("sayInput").value || "").trim();
-    if (!text) {
-      showToast("请输入内容", "bad");
-      $("sayInput").focus();
-      return;
-    }
-    postAction(path, { text: text }, okLabel).then(function (r) {
-      if (r.ok) $("sayInput").value = "";
+  function sendChatTurn() {
+    var text = ($("histChatInput").value || "").trim(); if (!text) { toast("请输入对话内容", "bad"); $("histChatInput").focus(); return; }
+    var prevTopId = histEntries.length ? histEntries[0].id : 0; $("histChatInput").value = "";
+    pendingChat = { text: text, prevTopId: prevTopId }; renderChat(true);
+    postAction("/chat", { text: text }, "").then(function (r) {
+      if (!r.ok) { pendingChat = null; renderChat(false); return; }
+      if (r.body && r.body.reply) { loadHistory(true); return; }
+      var tries = 0; clearInterval(run.chatPollTimer);
+      run.chatPollTimer = setInterval(function () {
+        tries += 1; loadHistory(true);
+        if (!pendingChat || tries >= 12) { pendingChat = null; clearInterval(run.chatPollTimer); run.chatPollTimer = null; renderChat(false); }
+      }, 1200);
     });
   }
-  $("chatBtn").addEventListener("click", function () {
-    sendText("/chat", "已发送对话");
+  $("histChatSendBtn").addEventListener("click", sendChatTurn);
+  $("histChatInput").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); sendChatTurn(); } });
+
+  $("addMcpBtn").addEventListener("click", function () { appendMcpServerCard({ name: "new_mcp", enabled: true, url: "", timeout_s: 10, tools: [], token_set: false }); syncConfigHierarchy(); updateSaveBar(); });
+  $("cfgFormWrap").addEventListener("input", updateSaveBar);
+  $("cfgFormWrap").addEventListener("change", function () { syncConfigHierarchy(); updateSaveBar(); });
+  $("cfgReloadViewBtn").addEventListener("click", loadConfig);
+  $("cfgExecReloadBtn").addEventListener("click", function () { postAction("/reload", {}, "已触发磁盘配置热重载").then(loadConfig); });
+  $("cfgDiscardBtn").addEventListener("click", function () { if (cfgFormData) fillConfigForm(cfgFormData); toast("已放弃未保存修改", ""); });
+  $("cfgSaveFormBtn").addEventListener("click", function () { postAction("/config/form", collectFormPayload(), "配置已保存").then(function (r) { handleSaveOutcome(r, "配置已保存"); }); });
+  $("cfgValYamlBtn").addEventListener("click", function () {
+    postAction("/config/yaml", { yaml: $("cfgYamlText").value, validate_only: true }, "YAML 校验通过").then(function (r) {
+      if (r.ok && r.body && r.body.outcome) renderConfigBanners(r.body.outcome.warnings, r.body.outcome.needs_restart, r.body.outcome.rejected);
+    });
   });
-  $("speakBtn").addEventListener("click", function () {
-    sendText("/speak", "已提交播报");
+  $("cfgSaveYamlBtn").addEventListener("click", function () {
+    postAction("/config/yaml", { yaml: $("cfgYamlText").value, validate_only: false }, "YAML 已保存").then(function (r) { handleSaveOutcome(r, "YAML 已保存"); });
   });
-  $("sayInput").addEventListener("keydown", function (e) {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      $("chatBtn").click();
-    }
+  $("cfgRollbackBtn").addEventListener("click", function () {
+    armConfirm($("cfgRollbackBtn"), "确认恢复 .bak?", function () { postAction("/config/rollback", {}, "已恢复上一版配置").then(function (r) { handleSaveOutcome(r, "已回滚并重载"); }); });
   });
 
-  $("musicPrevBtn").addEventListener("click", function () {
-    postAction("/music/previous", {}, "已切换上一首");
-  });
-  $("musicPauseBtn").addEventListener("click", function () {
-    postAction("/music/pause", {}, "已暂停音乐");
-  });
-  $("musicResumeBtn").addEventListener("click", function () {
-    postAction("/music/resume", {}, "已继续播放");
-  });
-  $("musicNextBtn").addEventListener("click", function () {
-    postAction("/music/next", {}, "已切换下一首");
-  });
-  $("musicStopBtn").addEventListener("click", function () {
-    postAction("/music/stop", {}, "已停止音乐");
-  });
+  $("docRunBtn").addEventListener("click", runDoctor);
+  $("logRefreshBtn").addEventListener("click", loadLogs);
+  $("logLevel").addEventListener("change", loadLogs);
+  $("logLines").addEventListener("change", loadLogs);
+  $("logSearch").addEventListener("keydown", function (e) { if (e.key === "Enter") loadLogs(); });
+  $("logAuto").addEventListener("change", updateLogTimer);
 
-  // 切到后台就停：手机锁屏、笔记本合盖再挂着，会白白往设备上打请求。
   document.addEventListener("visibilitychange", function () {
-    if (document.hidden) {
-      stopPolling();
-    } else if (!run.paused && (token() || run.noAuth)) {
-      run.nextDelay = BASE_MS;
-      poll();
-    }
+    if (document.hidden) stopPolling();
+    else if (!run.paused && (token() || run.noAuth)) { run.nextDelay = BASE_MS; poll(); }
+    updateLogTimer();
   });
 
   (function init() {
-    var saved = "";
-    try { saved = localStorage.getItem(KEY) || ""; } catch (e) { saved = ""; }
-    $("host").textContent = location.host;
-    $("token").value = saved;
-    $("tokenState").textContent = saved ? "已保存" : "未设置";
-    // 诊断项数量自己数，加一行不会再骗人。
-    $("diagCount").textContent = document.querySelectorAll(".diag > div").length + " 项";
-    $("tokenFold").open = !saved;
-
-    if (saved) {
-      poll();
-    } else {
-      // 没存令牌也探一次：服务端可能压根没配 token（回环不鉴权），
-      // 那样「等你填令牌」就是一条按提示操作也走不出去的死路。只探一次，不轮询。
-      paint(null, null, null);
-      $("footState").textContent = "正在确认这台设备需不需要令牌…";
-      poll(true);
-    }
+    var savedTheme = "auto";
+    try { savedTheme = localStorage.getItem(THEME_KEY) || "auto"; } catch (e) {}
+    applyTheme(savedTheme);
+    var saved = ""; try { saved = localStorage.getItem(KEY) || ""; } catch (e) {}
+    $("host").textContent = location.host; $("token").value = saved;
+    $("diagCount").textContent = document.querySelectorAll("#diagFold .diag > div").length + " 项";
+    if (saved) poll(); else { paint(null, null, null); poll(true); }
   })();
 })();
 </script>

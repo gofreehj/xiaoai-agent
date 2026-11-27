@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -129,6 +130,8 @@ pub struct AgentRuntime {
     view: RwLock<AgentView>,
     mcp: RwLock<McpConnections>,
     history: Mutex<Vec<HistoryTurn>>,
+    conversation_log: Mutex<VecDeque<ConversationEntry>>,
+    next_log_id: AtomicU64,
     control: Arc<Mutex<AgentControl>>,
     last_prewarm_ms: AtomicU64,
 }
@@ -187,6 +190,17 @@ impl HistoryTurn {
     fn chars(&self) -> usize {
         self.user.chars().count() + self.assistant.chars().count()
     }
+}
+
+pub const CONVERSATION_LOG_MAX_ENTRIES: usize = 150;
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ConversationEntry {
+    pub id: u64,
+    pub timestamp: String,
+    pub user: String,
+    pub assistant: String,
+    pub interrupted: bool,
 }
 
 /// 历史最多保留 10 轮问答；同时限制总字符数，避免长回答把上下文吃掉。
@@ -272,6 +286,8 @@ impl AgentRuntime {
             view: RwLock::new(view),
             mcp: RwLock::new(mcp),
             history: Mutex::new(Vec::new()),
+            conversation_log: Mutex::new(VecDeque::new()),
+            next_log_id: AtomicU64::new(1),
             control,
             last_prewarm_ms: AtomicU64::new(0),
         })
@@ -387,7 +403,7 @@ impl AgentRuntime {
 
     async fn finish_turn(&self, message: &str, text: String) -> anyhow::Result<AgentTurnResult> {
         let control = self.control.lock().await;
-        self.push_history(message, &text).await;
+        self.push_history(message, &text, false).await;
         Ok(AgentTurnResult {
             text,
             should_end: control.should_end,
@@ -477,7 +493,35 @@ impl AgentRuntime {
         } else {
             format!("{}（被用户打断）", partial_assistant.trim())
         };
-        self.push_history(user_trimmed, &assistant_record).await;
+        self.push_history(user_trimmed, &assistant_record, true).await;
+    }
+
+    pub fn history_limits() -> (usize, u64) {
+        (HISTORY_MAX_TURNS, HISTORY_TTL.as_secs())
+    }
+
+    pub async fn conversation_snapshot(&self, limit: usize) -> (Vec<ConversationEntry>, usize, usize) {
+        let active_context_turns = {
+            let mut turns = self.history.lock().await;
+            prune_expired_history(&mut turns, std::time::Instant::now(), HISTORY_TTL);
+            turns.len()
+        };
+        let log = self.conversation_log.lock().await;
+        let total = log.len();
+        let cap = limit.clamp(1, CONVERSATION_LOG_MAX_ENTRIES);
+        let entries = log.iter().rev().take(cap).cloned().collect();
+        (entries, total, active_context_turns)
+    }
+
+    pub async fn delete_conversation_entry(&self, id: u64) -> bool {
+        let mut log = self.conversation_log.lock().await;
+        let before = log.len();
+        log.retain(|entry| entry.id != id);
+        log.len() != before
+    }
+
+    pub async fn clear_conversation_log(&self) {
+        self.conversation_log.lock().await.clear();
     }
 
     pub async fn take_last_tool_error(&self) -> Option<ToolFailureInfo> {
@@ -508,16 +552,32 @@ impl AgentRuntime {
         history_to_messages(&turns)
     }
 
-    async fn push_history(&self, user: &str, assistant: &str) {
-        let mut history = self.history.lock().await;
+    async fn push_history(&self, user: &str, assistant: &str, interrupted: bool) {
         let now = std::time::Instant::now();
-        prune_expired_history(&mut history, now, HISTORY_TTL);
-        history.push(HistoryTurn {
+        {
+            let mut history = self.history.lock().await;
+            prune_expired_history(&mut history, now, HISTORY_TTL);
+            history.push(HistoryTurn {
+                user: user.to_string(),
+                assistant: assistant.to_string(),
+                created_at: now,
+            });
+            trim_history(&mut history);
+        }
+
+        let id = self.next_log_id.fetch_add(1, Ordering::Relaxed);
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut log = self.conversation_log.lock().await;
+        log.push_back(ConversationEntry {
+            id,
+            timestamp,
             user: user.to_string(),
             assistant: assistant.to_string(),
-            created_at: now,
+            interrupted,
         });
-        trim_history(&mut history);
+        while log.len() > CONVERSATION_LOG_MAX_ENTRIES {
+            log.pop_front();
+        }
     }
 }
 
@@ -957,5 +1017,56 @@ mod tests {
         assert!(body.contains("data: one"));
         assert!(body.contains("data: two"));
         assert!(body.contains("data: three"));
+    }
+
+    #[tokio::test]
+    async fn conversation_log_survives_session_exit_caps_and_supports_delete_and_clear() {
+        use super::{AgentRuntime, CONVERSATION_LOG_MAX_ENTRIES};
+        use crate::config::{AppConfig, ConfigHandle};
+        use crate::device::Device;
+        use crate::music::MusicService;
+        use std::sync::Arc;
+
+        let mut cfg = AppConfig::default();
+        cfg.agent.tools_enabled = false;
+        let handle = ConfigHandle::new(Arc::new(cfg.clone()));
+        let device = Device::new(cfg.device.clone());
+        let music = Arc::new(MusicService::new(handle.clone(), device.clone()).unwrap());
+        let agent = AgentRuntime::new(handle, device, music).await.unwrap();
+
+        agent.push_history("q1", "a1", false).await;
+        agent.record_partial_turn("q2", "partial").await;
+        assert_eq!(agent.history_len_for_test().await, 2);
+
+        // Ending the LLM session clears LLM context (`history`), NOT the admin UI `conversation_log`.
+        agent.reset_session("user exit command").await;
+        assert_eq!(agent.history_len_for_test().await, 0);
+
+        let (entries, total, ctx_turns) = agent.conversation_snapshot(50).await;
+        assert_eq!(total, 2);
+        assert_eq!(ctx_turns, 0);
+        assert_eq!(entries[0].user, "q2");
+        assert!(entries[0].interrupted);
+        assert_eq!(entries[1].user, "q1");
+        assert!(!entries[1].interrupted);
+
+        assert!(agent.delete_conversation_entry(entries[1].id).await);
+        assert!(!agent.delete_conversation_entry(999_999).await);
+        let (after_del, total_after_del, _) = agent.conversation_snapshot(50).await;
+        assert_eq!(total_after_del, 1);
+        assert_eq!(after_del[0].user, "q2");
+
+        for i in 0..(CONVERSATION_LOG_MAX_ENTRIES + 10) {
+            agent
+                .push_history(&format!("u{i}"), &format!("r{i}"), false)
+                .await;
+        }
+        let (capped, capped_total, _) = agent.conversation_snapshot(200).await;
+        assert_eq!(capped_total, CONVERSATION_LOG_MAX_ENTRIES);
+        assert_eq!(capped.len(), CONVERSATION_LOG_MAX_ENTRIES);
+
+        agent.clear_conversation_log().await;
+        let (_, cleared_total, _) = agent.conversation_snapshot(50).await;
+        assert_eq!(cleared_total, 0);
     }
 }
