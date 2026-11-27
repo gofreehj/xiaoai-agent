@@ -234,6 +234,7 @@ fn build_router_with_hooks(state: Arc<ControlState>, hooks: ControlHooks) -> Rou
         .route("/config/form", post(save_config_form))
         .route("/config/yaml", post(save_config_yaml))
         .route("/config/rollback", post(rollback_config))
+        .route("/autostart", post(set_autostart))
         .route_layer(axum::middleware::from_fn_with_state(
             router_state.clone(),
             require_token,
@@ -604,6 +605,11 @@ struct YamlConfigPayload {
     validate_only: bool,
 }
 
+#[derive(Deserialize)]
+struct AutostartPayload {
+    enabled: bool,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct LogsQuery {
@@ -812,6 +818,37 @@ async fn save_config_yaml(
             StatusCode::BAD_REQUEST,
             no_store(),
             Json(json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn set_autostart(
+    State(state): State<RouterState>,
+    Json(payload): Json<AutostartPayload>,
+) -> Response {
+    let Some(path) = &state.control.config_path else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "config_unavailable" })),
+        )
+            .into_response();
+    };
+    match config_admin::set_autostart_enabled(path, payload.enabled) {
+        Ok(autostart) => (
+            StatusCode::OK,
+            no_store(),
+            Json(json!({
+                "ok": true,
+                "autostart": autostart,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            no_store(),
+            Json(json!({ "error": err.to_string() })),
         )
             .into_response(),
     }
@@ -2001,6 +2038,93 @@ mod tests {
         assert_eq!(doc["mode"], "exclusive");
         assert!(doc["warnings"].is_array());
         assert!(doc["upstreams"].is_array());
+
+        handle.abort();
+        cleanup(&state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn post_autostart_toggles_disabled_marker_and_requires_auth() {
+        let dir = std::env::temp_dir().join(format!("xiaoai-srv-auto-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("agent.yaml");
+        std::fs::write(&cfg_path, "runtime:\n  mode: dual\n").unwrap();
+        let cfg_handle = ConfigHandle::new(Arc::new(AppConfig::load(&cfg_path).unwrap()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new(ControlState {
+            token: "tok".to_string(),
+            mode: "dual".to_string(),
+            socket: still_owned_socket("auto"),
+            liveness: SpeechLiveness::default(),
+            native_monitor: None,
+            started_at: Instant::now(),
+            config_path: Some(cfg_path.clone()),
+            log_path: None,
+            telemetry: RuntimeTelemetry::default(),
+        });
+        let hooks = ControlHooks {
+            config: Some(cfg_handle),
+            ..ControlHooks::default()
+        };
+        let app = build_router_with_hooks(state.clone(), hooks);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let unauth = client
+            .post(format!("http://127.0.0.1:{port}/autostart"))
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), 401);
+
+        let wrong_method = client
+            .get(format!("http://127.0.0.1:{port}/autostart"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), 405);
+
+        let disable_res = client
+            .post(format!("http://127.0.0.1:{port}/autostart"))
+            .bearer_auth("tok")
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disable_res.status(), 200);
+        let disable_body: Value = disable_res.json().await.unwrap();
+        assert_eq!(disable_body["autostart"]["enabled"], false);
+        assert!(dir.join("disabled").exists());
+
+        let cfg_view: Value = client
+            .get(format!("http://127.0.0.1:{port}/config"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cfg_view["autostart"]["enabled"], false);
+
+        let enable_res = client
+            .post(format!("http://127.0.0.1:{port}/autostart"))
+            .bearer_auth("tok")
+            .json(&json!({ "enabled": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(enable_res.status(), 200);
+        let enable_body: Value = enable_res.json().await.unwrap();
+        assert_eq!(enable_body["autostart"]["enabled"], true);
+        assert!(!dir.join("disabled").exists());
 
         handle.abort();
         cleanup(&state);

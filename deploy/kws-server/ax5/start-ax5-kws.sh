@@ -70,10 +70,15 @@ prepare_runtime() {
 
 stop_orphans() {
     for p in /proc/[0-9]*; do
+        opid=${p#/proc/}
+        [ "$opid" = "$$" ] || [ "$opid" = "$PPID" ] && continue
         [ -r "$p/cmdline" ] || continue
-        case "$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)" in
+        cmdline=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null)
+        case "$cmdline" in
+            sh\ -c*|ash\ -c*|*/sh\ -c*|*/ash\ -c*|ssh\ *|sshd:*)
+                continue
+                ;;
             *ax5-kws-server*)
-                opid=${p#/proc/}
                 kill "$opid" 2>/dev/null || true
                 ;;
         esac

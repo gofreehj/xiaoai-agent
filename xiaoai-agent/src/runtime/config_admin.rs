@@ -143,6 +143,46 @@ pub fn backup_path_for(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.bak", path.display()))
 }
 
+/// Return the `/data/open-xiaoai/disabled` style autostart guard path next to `config_path`.
+pub fn autostart_disabled_marker(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("disabled")
+}
+
+/// Read whether boot autostart is currently enabled (true when the `disabled` marker is absent).
+pub fn read_autostart_status(config_path: &Path) -> JsonValue {
+    let marker = autostart_disabled_marker(config_path);
+    json!({
+        "enabled": !marker.exists(),
+        "marker_path": marker.display().to_string(),
+    })
+}
+
+/// Enable or disable boot autostart by removing or creating the `disabled` marker file.
+pub fn set_autostart_enabled(config_path: &Path, enabled: bool) -> anyhow::Result<JsonValue> {
+    let marker = autostart_disabled_marker(config_path);
+    if enabled {
+        if let Err(err) = fs::remove_file(&marker) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+    } else {
+        if let Some(parent) = marker.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&marker)?;
+    }
+    Ok(read_autostart_status(config_path))
+}
+
 fn set_restrictive_perms(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -482,6 +522,7 @@ pub fn read_config_view(path: &Path, effective: &AppConfig) -> anyhow::Result<Js
     Ok(json!({
         "path": path.display().to_string(),
         "has_backup": backup_path_for(path).exists(),
+        "autostart": read_autostart_status(path),
         "yaml": redacted_yaml,
         "form": form,
         "warnings": warnings,
@@ -1010,6 +1051,35 @@ mcp:
         assert_eq!(saved.server.token, "srv-secret");
         assert_eq!(saved.mcp.servers[0].token, "mcp-secret");
         assert_eq!(saved.mcp.servers[0].tools, vec!["light.turn_on".to_string()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autostart_marker_toggles_cleanly_and_reports_in_config_view() {
+        let dir = temp_dir("autostart");
+        let path = dir.join("agent.yaml");
+        fs::write(&path, "runtime:\n  mode: dual\n").unwrap();
+        let effective = AppConfig::load(&path).unwrap();
+
+        let initial = read_config_view(&path, &effective).unwrap();
+        assert_eq!(initial["autostart"]["enabled"], true);
+
+        let off = set_autostart_enabled(&path, false).unwrap();
+        assert_eq!(off["enabled"], false);
+        assert!(dir.join("disabled").exists());
+        assert_eq!(
+            read_config_view(&path, &effective).unwrap()["autostart"]["enabled"],
+            false
+        );
+
+        let on = set_autostart_enabled(&path, true).unwrap();
+        assert_eq!(on["enabled"], true);
+        assert!(!dir.join("disabled").exists());
+        assert_eq!(
+            read_config_view(&path, &effective).unwrap()["autostart"]["enabled"],
+            true
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -530,6 +530,16 @@
                 <div class="field"><label for="cRtIdle">会话空闲超时 (秒 · 热生效)</label><input id="cRtIdle" type="number" step="1" min="5"></div>
               </div>
 
+              <div class="group-card">
+                <div class="group-head">
+                  <label class="check"><input id="cAutostartEn" type="checkbox"> <span>开机自启 XiaoAI Agent（/data/init.sh）</span></label>
+                  <span class="pill" id="cAutostartPill" data-tone="idle">加载中</span>
+                </div>
+                <div class="group-body">
+                  <p class="hint" id="cAutostartHint" style="margin:0;">通过配置同目录的 <code>disabled</code> 标记文件即时控制开机自启，无需重启生效。</p>
+                </div>
+              </div>
+
               <div id="exclusiveBlock" class="group-card">
                 <div class="group-head">
                   <strong>独占模式通道（speech.usock）</strong>
@@ -1920,6 +1930,23 @@
     $("cfgSaveBar").classList.toggle("hidden", !show);
   }
 
+  function renderAutostart(a) {
+    if (!a) return;
+    $("cAutostartEn").checked = !!a.enabled;
+    var pill = $("cAutostartPill");
+    if (pill) {
+      pill.setAttribute("data-tone", a.enabled ? "ok" : "warn");
+      pill.textContent = a.enabled ? "已开启 · 即时生效" : "已关闭 · 即时生效";
+    }
+    var hint = $("cAutostartHint");
+    if (hint) {
+      var mp = a.marker_path || "disabled";
+      hint.textContent = a.enabled
+        ? ("已开启开机自启（" + mp + " 不存在），即时生效。")
+        : ("已关闭开机自启（已写入标记 " + mp + "），即时生效；当前运行中的服务不受影响。");
+    }
+  }
+
   function loadConfig() {
     get("/config", 8000).then(function (r) {
       if (!r.ok || !r.body) {
@@ -1930,6 +1957,7 @@
       var b = r.body;
       $("cfgPathHint").textContent = "配置文件：" + (b.path || "—");
       $("cfgRollbackBtn").disabled = !b.has_backup;
+      if (b.autostart) renderAutostart(b.autostart);
       $("cfgYamlText").value = b.yaml || "";
       if (b.form) fillConfigForm(b.form);
       renderConfigBanners(b.warnings, b.pending_restart, b.rejected);
@@ -2080,6 +2108,27 @@
   $("histChatSendBtn").addEventListener("click", sendChatTurn);
   $("histChatInput").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); sendChatTurn(); } });
 
+  $("cAutostartEn").addEventListener("change", function (e) {
+    e.stopPropagation();
+    var cb = $("cAutostartEn");
+    var nextVal = !!cb.checked;
+    cb.disabled = true;
+    post("/autostart", { enabled: nextVal }, 8000).then(function (r) {
+      cb.disabled = false;
+      if (!r.ok || !r.body) {
+        cb.checked = !nextVal;
+        if (r.status === 401) openAuthGate("访问令牌无效或已过期，请重新输入。", false);
+        else toast("设置开机自启失败：" + (r.body && r.body.error ? r.body.error : r.status), "bad");
+        return;
+      }
+      if (r.body.autostart) renderAutostart(r.body.autostart);
+      toast(nextVal ? "开机自启已开启（已移除 disabled 标记）" : "开机自启已关闭（已写入 disabled 标记）", "ok");
+    }, function (err) {
+      cb.disabled = false;
+      cb.checked = !nextVal;
+      toast("设置开机自启失败：" + netReason(err), "bad");
+    });
+  });
   $("addMcpBtn").addEventListener("click", function () { appendMcpServerCard({ name: "new_mcp", enabled: true, url: "", timeout_s: 10, tools: [], token_set: false }); syncConfigHierarchy(); updateSaveBar(); });
   $("cfgFormWrap").addEventListener("input", updateSaveBar);
   $("cfgFormWrap").addEventListener("change", function () { syncConfigHierarchy(); updateSaveBar(); });

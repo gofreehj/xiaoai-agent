@@ -38,9 +38,15 @@ dual:
 ## 3. 文件清单
 
 - `src/ax5_kws_server.c`：AX5 端 UDP XPCM KWS 服务端（动态 `dlopen` 加载 `libsherpa-onnx-c-api.so`，支持 400ms pre-roll、系统回声抑制窗口与双包防丢）。
+- `include/sherpa-onnx/c-api/c-api.h`：与 AX5 运行时 `libsherpa-onnx-c-api.so`（`v1.12.30` armhf）逐字节核对并附带 `_Static_assert` 偏移校验的最小 C API 头文件，免去外网拉取即可交叉编译 `ax5-kws-server`。
 - `keywords.txt`：带声调拼音唤醒词配置。
 - `start-ax5-kws.sh`：AX5 启停管理脚本（`start | stop | restart | status`）。
-- `deploy_to_ax5.py`：一键交叉编译并部署到 AX5 路由器的脚本。
+- `deploy_to_ax5.py`：一键交叉编译并部署到 AX5 路由器的脚本；若路由器已有 `kws_runtime.tar.gz`，可用 `--reuse-router-bundle` 仅重编 `ax5-kws-server` 增量打包并自动做 `XPONG` 探测校验：
+
+```sh
+python3 deploy/kws-server/ax5/deploy_to_ax5.py \
+  --zig /path/to/zig --reuse-router-bundle
+```
 
 ---
 

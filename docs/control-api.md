@@ -26,7 +26,7 @@ server:
 | `GET /status` | 同上 + `pid` + `mode` + 配置路径 + 阶段/最近一轮时延 + `native_interlock` |
 | `GET /music/status` | 当前音乐播放状态与待播队列（最多 10 首；音乐服务不可用时 503） |
 | `GET /history` | 读取内存对话记录（`?limit=1..150`）及 LLM 短期上下文水位（`context_turns` / `context_ttl_s`），不写 `/data` 闪存 |
-| `GET /config` | 读取当前磁盘配置（所有密钥/Token 脱敏为 `__REDACTED__`）、常用表单视图、启动告警与待重启段 |
+| `GET /config` | 读取当前磁盘配置（所有密钥/Token 脱敏为 `__REDACTED__`）、常用表单视图、`autostart` 标记状态、启动告警与待重启段 |
 | `GET /doctor` | 在线运行自检：`/tmp` 与 `/data` 剩余空间、配置告警、互锁文件检查及 ASR/LLM/天气/MCP/KWS 并行连通性探测 |
 | `GET /logs` | 只读读取运行日志末尾 64 KiB（`?lines=1..500&level=&q=`，默认 `/tmp/xiaoai-agent.log`） |
 | `POST /stop` | 打断当前会话并停止全部输出（TTS + 音乐），幂等 |
@@ -40,6 +40,7 @@ server:
 | `POST /config/form` | 提交常用热配置表单，先校验再原子写入 `agent.yaml`（自动留一份 `0600` 的 `.bak`），热段自动触发重载 |
 | `POST /config/yaml` | body `{"yaml":"...","validate_only":false}`：校验或保存完整 YAML（自动回填 `__REDACTED__` 原密钥） |
 | `POST /config/rollback` | 从 `agent.yaml.bak` 校验并原子恢复上一版配置，随后触发热重载 |
+| `POST /autostart` | body `{"enabled":true\|false}`：删除或创建配置同目录下的 `disabled` 标记文件，即时控制 `/data/init.sh` 开机自启 |
 
 所有写操作**只接受 POST**（GET 返回 405），且除 `/` 外的所有 API 均由路由级中间件 `require_token` 统一做 Bearer 鉴权。`exclusive` 与 `dual` 两种模式都已接线。未接线的端点返回 `503`（`/stop` 除外）。在 `dual` 模式下，当 `NativeWakeMonitor` 检测到原生小爱被唤醒时，正在执行的 `/speak` / `/chat` 任务会立即被中止并静默让位，且原生活跃或冷却保护窗内新到达的 `/speak` / `/chat` 请求会被自动跳过（避免与原生小爱同时出声）。
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import tarfile
@@ -145,12 +146,61 @@ def build_ax5_bundle(
                 if missing:
                     raise FileNotFoundError(f"Missing files in {tar_path}: {missing}")
 
+        env = os.environ.copy()
+        env["COPYFILE_DISABLE"] = "1"
         subprocess.run(
-            ["tar", "-czf", bundle_path, "-C", stage, "bin", "lib", "models"],
+            ["tar", "--format", "ustar", "-czf", bundle_path, "-C", stage, "bin", "lib", "models"],
             check=True,
+            env=env,
         )
     size_mb = os.path.getsize(bundle_path) / (1024 * 1024)
     print(f"Built {bundle_path} ({size_mb:.2f} MiB)")
+
+
+def repack_router_bundle(
+    ax5_ip: str,
+    ax5_env: dict[str, str],
+    ax5_bin: str,
+    bundle_path: str,
+):
+    print(f"Pulling existing /data/kws/kws_runtime.tar.gz from {ax5_ip}...")
+    res = run_ssh(ax5_ip, "cat /data/kws/kws_runtime.tar.gz", ax5_env)
+    if res.returncode != 0 or not res.stdout:
+        raise RuntimeError(f"Failed to pull router bundle: {res.stderr.decode(errors='replace')}")
+    with tempfile.TemporaryDirectory() as stage:
+        old_tar = os.path.join(stage, "old.tar.gz")
+        with open(old_tar, "wb") as f:
+            f.write(res.stdout)
+        unpack_dir = os.path.join(stage, "unpack")
+        os.makedirs(unpack_dir, exist_ok=True)
+        subprocess.run(["tar", "-xzf", old_tar, "-C", unpack_dir], check=True)
+        bin_dst = os.path.join(unpack_dir, "bin", "ax5-kws-server")
+        shutil.copy2(ax5_bin, bin_dst)
+        os.chmod(bin_dst, 0o755)
+        env = os.environ.copy()
+        env["COPYFILE_DISABLE"] = "1"
+        subprocess.run(
+            ["tar", "--format", "ustar", "-czf", bundle_path, "-C", unpack_dir, "bin", "lib", "models"],
+            check=True,
+            env=env,
+        )
+    size_mb = os.path.getsize(bundle_path) / (1024 * 1024)
+    print(f"Repacked {bundle_path} ({size_mb:.2f} MiB)")
+
+
+def verify_xpong(ax5_ip: str, listen_port: int = 5005):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(3.0)
+    try:
+        t0 = time.monotonic()
+        sock.sendto(b"XPCM\x00\x00\x03\x00", (ax5_ip, listen_port))
+        data, addr = sock.recvfrom(64)
+        rtt_ms = (time.monotonic() - t0) * 1000.0
+    finally:
+        sock.close()
+    if data != b"XPONG\n":
+        raise RuntimeError(f"Unexpected UDP XPCM PING reply from {addr}: {data!r}")
+    print(f"UDP XPCM PING -> {addr}: {data!r} (RTT={rtt_ms:.2f} ms)")
 
 
 def deploy_ax5(ax5_ip: str, ax5_env: dict[str, str], bundle_path: str):
@@ -163,15 +213,9 @@ def deploy_ax5(ax5_ip: str, ax5_env: dict[str, str], bundle_path: str):
     run_ssh(
         ax5_ip,
         "/data/kws/start-ax5-kws.sh stop 2>/dev/null || true; "
-        "for p in /proc/[0-9]*; do "
-        "  [ -r \"$p/cmdline\" ] || continue; "
-        "  case \"$(tr '\\0' ' ' <\"$p/cmdline\" 2>/dev/null)\" in "
-        "    *ax5-kws-server*) kill \"${p#/proc/}\" 2>/dev/null || true ;; "
-        "  esac; "
-        "done; "
-        "killall sherpa-onnx-keyword-spotter 2>/dev/null || true; "
-        "rm -rf /tmp/kws_test /tmp/kws /tmp/ax5-kws.log /tmp/ax5_kws_test.log; "
-        "mkdir -p /data/kws",
+        "mkdir -p /data/kws; "
+        "[ -f /data/kws/kws_runtime.tar.gz ] && mv -f /data/kws/kws_runtime.tar.gz /tmp/kws_runtime.tar.gz.bak || true; "
+        "rm -rf /tmp/kws_test /tmp/kws /tmp/ax5-kws.log /tmp/ax5_kws_test.log /tmp/ax5-kws.pid",
         ax5_env,
     )
 
@@ -179,6 +223,7 @@ def deploy_ax5(ax5_ip: str, ax5_env: dict[str, str], bundle_path: str):
     with open(bundle_path, "rb") as f:
         res = run_ssh(ax5_ip, "cat > /data/kws/kws_runtime.tar.gz", ax5_env, stdin_bytes=f.read())
         if res.returncode != 0:
+            run_ssh(ax5_ip, "[ -f /tmp/kws_runtime.tar.gz.bak ] && mv -f /tmp/kws_runtime.tar.gz.bak /data/kws/kws_runtime.tar.gz", ax5_env)
             raise RuntimeError(f"Upload bundle failed: {res.stderr.decode()}")
 
     with open(os.path.join(AX5_DIR, "keywords.txt"), "rb") as f:
@@ -226,12 +271,17 @@ def deploy_ax5(ax5_ip: str, ax5_env: dict[str, str], bundle_path: str):
 
     status = run_ssh(
         ax5_ip,
-        "/data/kws/start-ax5-kws.sh status; rc=$?; tail -n 15 /tmp/ax5-kws.log; df -h /data /tmp; exit $rc",
+        "/data/kws/start-ax5-kws.sh status; rc=$?; tail -n 15 /tmp/ax5-kws.log; exit $rc",
         ax5_env,
     )
     print(status.stdout.decode().strip())
     if status.returncode != 0:
+        run_ssh(ax5_ip, "[ -f /tmp/kws_runtime.tar.gz.bak ] && mv -f /tmp/kws_runtime.tar.gz.bak /data/kws/kws_runtime.tar.gz", ax5_env)
         raise RuntimeError("ax5-kws-server is not running after startup")
+
+    verify_xpong(ax5_ip)
+    df_out = run_ssh(ax5_ip, "rm -f /tmp/kws_runtime.tar.gz.bak && df -h /data /tmp", ax5_env)
+    print(df_out.stdout.decode().strip())
 
 
 def main():
@@ -239,25 +289,38 @@ def main():
     parser.add_argument("--ax5-ip", default=os.environ.get("AX5_IP", "192.168.31.1"))
     parser.add_argument("--ax5-pass", default=os.environ.get("AX5_PASS", "admin"))
     parser.add_argument("--zig", required=True, help="Path to zig binary")
-    parser.add_argument("--sherpa-include", required=True, help="Path to sherpa-onnx include dir")
-    parser.add_argument("--sherpa-libs", required=True, help="Path to stripped sherpa/onnxruntime/libstdc++ libs")
-    parser.add_argument("--glibc-dir", required=True, help="Path to glibc 2.36 armhf runtime libs")
+    parser.add_argument(
+        "--sherpa-include",
+        default=os.path.join(AX5_DIR, "include"),
+        help="Path to sherpa-onnx include dir (defaults to repo include/)",
+    )
+    parser.add_argument("--sherpa-libs", help="Path to stripped sherpa/onnxruntime/libstdc++ libs")
+    parser.add_argument("--glibc-dir", help="Path to glibc 2.36 armhf runtime libs")
     parser.add_argument("--model-dir", default=os.path.join(REPO_ROOT, "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"))
     parser.add_argument("--out-dir", default=os.path.join(AX5_DIR, "dist"))
+    parser.add_argument("--reuse-router-bundle", action="store_true", help="Pull /data/kws/kws_runtime.tar.gz from router and only swap ax5-kws-server")
     parser.add_argument("--build-only", action="store_true")
     args = parser.parse_args()
 
     ax5_bin = compile_ax5_server(args.zig, args.sherpa_include, args.out_dir)
     bundle_path = os.path.join(args.out_dir, "kws_runtime.tar.gz")
-    build_ax5_bundle(ax5_bin, args.model_dir, args.sherpa_libs, args.glibc_dir, bundle_path)
-
-    if args.build_only:
-        print("Build-only complete.")
-        return
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ax5_ask = make_askpass(args.ax5_pass, tmpdir, "ax5") if args.ax5_pass else None
-        deploy_ax5(args.ax5_ip, ssh_env(ax5_ask), bundle_path)
+        ax5_env = ssh_env(ax5_ask)
+
+        if args.reuse_router_bundle:
+            repack_router_bundle(args.ax5_ip, ax5_env, ax5_bin, bundle_path)
+        else:
+            if not args.sherpa_libs or not args.glibc_dir:
+                parser.error("--sherpa-libs and --glibc-dir are required unless --reuse-router-bundle is set")
+            build_ax5_bundle(ax5_bin, args.model_dir, args.sherpa_libs, args.glibc_dir, bundle_path)
+
+        if args.build_only:
+            print("Build-only complete.")
+            return
+
+        deploy_ax5(args.ax5_ip, ax5_env, bundle_path)
 
 
 if __name__ == "__main__":

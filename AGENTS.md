@@ -398,6 +398,13 @@ future shell cannot find a bare `arm-linux-gnueabihf-gcc`, inspect the existing
 Rust target/build setup and the `cargo-zigbuild` glibc 2.25 path before rewriting
 the toolchain assumptions.
 
+Verified LX06 1.94.13 facts: userland uses `/lib/ld-linux-armhf.so.3 -> ld-2.25.so`
+(ARMv7 hard-float, `13.4 MiB` UBIFS `/data` with transparent compression), `dual`
+mode captures from `/etc/asound.conf` PCM `noop` (`48000 Hz`, `8 ch`, `S32_LE`,
+`mic_channel=0`, `ref_channel=6`), and boot autostart is toggled via the
+`disabled` marker file next to `agent.yaml` (exposed in the control plane via
+`POST /autostart` and `GET /config` `autostart`).
+
 ## Runtime Safety
 
 - Avoid NAND writes on the speaker whenever possible; prefer `/tmp` for logs,

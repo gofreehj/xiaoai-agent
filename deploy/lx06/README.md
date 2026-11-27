@@ -32,6 +32,13 @@
 /data/open-xiaoai/xiaoai-agent doctor -c /data/open-xiaoai/agent.yaml
 ```
 
+### LX06 1.94.13 运行环境实测备忘
+
+- **用户态 libc**：`/lib/ld-linux-armhf.so.3 -> ld-2.25.so`（glibc 2.25），可用 `cargo +1.96.0 zigbuild --release --target armv7-unknown-linux-gnueabihf.2.25` 产物直接部署，也支持静态 musl 构建。
+- **双助手采音与提示音**：`/etc/asound.conf` 暴露 `noop` ALSA 设备（`48000 Hz` / `8 ch` / `S32_LE` / `mic_channel=0` / `ref_channel=6`）；`enter_prompt.wav` / `exit_prompt.wav` / `thinking_prompt.wav` 随 `agent.yaml` 同放在 `/data/open-xiaoai/`。
+- **闪存与日志管理**：`/data` 为 `13.4 MiB` UBIFS（带透明压缩）；升级单二进制架构前需先移除旧版 `all_bundle.tar.gz`、`ax5_kws.env` 与 `/tmp/xiaoai-kws`，避免空间不足；`/data/init.sh` 应将 `XIAOAI_AGENT_LOG` 指向 `/tmp/xiaoai-agent.log` 以减少闪存擦写。
+- **开机自启控制**：`/data/init.sh` 通过检查 `/data/open-xiaoai/disabled` 决定开机是否拉起服务，可在 Web 控制台「配置 → 运行与拾音」一键开关或通过 `POST /autostart` 远程切换。
+
 ---
 
 ## 刷机与运维硬红线
