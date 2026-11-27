@@ -223,8 +223,16 @@ pub async fn run_dual_daemon(
     }
 }
 
+struct PendingVoiceQuery {
+    text: String,
+    asr_started_at: Instant,
+    asr_ms: u64,
+    vad_stats: Option<crate::vad::UtteranceStats>,
+    pcm_bytes: usize,
+}
+
 enum OneshotOutcome {
-    Query(String),
+    Query(PendingVoiceQuery),
     NoSpeech,
     ExitImmediately,
     NativeYield,
@@ -255,7 +263,7 @@ async fn probe_oneshot_or_prompt(
     let mut probe_capture = cur_config.capture.clone();
     probe_capture.block_ms = probe_capture.block_ms.min(40);
     let capture_res = kws
-        .capture_utterance(
+        .capture_utterance_with_stats(
             &probe_capture,
             max_timeout,
             Some(Duration::from_millis(ONESHOT_PROBE_MS)),
@@ -267,9 +275,14 @@ async fn probe_oneshot_or_prompt(
         return Ok(OneshotOutcome::NativeYield);
     }
 
-    if let Ok(Some(pcm)) = capture_res {
+    if let Ok(Some(captured)) = capture_res {
+        let pcm_bytes = captured.pcm.len();
+        let vad_stats = captured.stats;
+        let utterance_captured_at = Instant::now();
         audio.set_phase(AgentPhase::Thinking).await;
-        let text_opt = transcribe_pcm_bytes(asr, &pcm, cur_config.capture.sample_rate).await;
+        let text_opt =
+            transcribe_pcm_bytes(asr, &captured.pcm, cur_config.capture.sample_rate).await;
+        let asr_ms = utterance_captured_at.elapsed().as_millis() as u64;
         if let Some(raw_text) = text_opt {
             if is_native_xiaoai_utterance(&raw_text) {
                 info!(
@@ -298,9 +311,17 @@ async fn probe_oneshot_or_prompt(
                         session_id = tracker.session_id,
                         raw = %raw_text,
                         query = %cleaned,
+                        asr_ms,
+                        vad_silence_ms = vad_stats.silence_tail_ms,
                         "One-shot 连说命中，跳过欢迎语直接回答"
                     );
-                    return Ok(OneshotOutcome::Query(cleaned));
+                    return Ok(OneshotOutcome::Query(PendingVoiceQuery {
+                        text: cleaned,
+                        asr_started_at: utterance_captured_at,
+                        asr_ms,
+                        vad_stats: Some(vad_stats),
+                        pcm_bytes,
+                    }));
                 }
                 LocalIntentOutcome::EndSession | LocalIntentOutcome::VolumeHandled => {
                     return Ok(OneshotOutcome::ExitImmediately);
@@ -373,7 +394,7 @@ async fn run_conversation_session(
     tracker: &mut SessionTracker,
     in_flight: &InFlightTurn,
     native_monitor: &NativeWakeMonitor,
-    mut pending_query: Option<String>,
+    mut pending_query: Option<PendingVoiceQuery>,
 ) -> anyhow::Result<SessionExit> {
     let mut last_activity = Instant::now();
     let mut consecutive_noise_turns: u32 = 0;
@@ -385,95 +406,113 @@ async fn run_conversation_session(
         }
         let cur_config = config_handle.get().await;
 
-        let (user_text, asr_started_at, asr_ms) = if let Some(q) = pending_query.take() {
-            (q, Instant::now(), 0u64)
-        } else {
-            let session_timeout = Duration::from_secs(cur_config.dual.session_timeout_s);
-            let remaining = session_timeout.saturating_sub(last_activity.elapsed());
+        let (user_text, source, asr_started_at, asr_ms, vad_stats, pcm_bytes) =
+            if let Some(q) = pending_query.take() {
+                (
+                    q.text,
+                    "oneshot",
+                    q.asr_started_at,
+                    q.asr_ms,
+                    q.vad_stats,
+                    Some(q.pcm_bytes),
+                )
+            } else {
+                let session_timeout = Duration::from_secs(cur_config.dual.session_timeout_s);
+                let remaining = session_timeout.saturating_sub(last_activity.elapsed());
 
-            if remaining.is_zero() {
+                if remaining.is_zero() {
+                    if native_monitor.is_blocked() {
+                        return Ok(SessionExit::NativeYield);
+                    }
+                    info!("连续对话超过超时时间，自动退出");
+                    play_prompt(
+                        audio,
+                        &cur_config,
+                        cur_config.dual.exit_earcon.as_deref(),
+                        &cur_config.dual.exit_prompt,
+                    )
+                    .await;
+                    break;
+                }
+
+                kws.start_stream().await?;
+                audio.set_phase(AgentPhase::Listening).await;
+                info!("麦克风已开启，等待用户提问 (免唤醒连续模式)...");
+
+                let utterance_res = kws
+                    .capture_utterance_with_stats(&cur_config.capture, remaining, None)
+                    .await;
+                kws.stop_stream().await;
+
                 if native_monitor.is_blocked() {
                     return Ok(SessionExit::NativeYield);
                 }
-                info!("连续对话超过超时时间，自动退出");
-                play_prompt(
-                    audio,
-                    &cur_config,
-                    cur_config.dual.exit_earcon.as_deref(),
-                    &cur_config.dual.exit_prompt,
-                )
-                .await;
-                break;
-            }
 
-            kws.start_stream().await?;
-            audio.set_phase(AgentPhase::Listening).await;
-            info!("麦克风已开启，等待用户提问 (免唤醒连续模式)...");
+                let captured = match utterance_res {
+                    Ok(Some(captured)) => captured,
+                    Ok(None) => {
+                        info!("当前轮次未检测到有效声音，检查会话超时");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
 
-            let utterance_res = kws
-                .capture_utterance(&cur_config.capture, remaining, None)
-                .await;
-            kws.stop_stream().await;
+                let pcm_bytes = captured.pcm.len();
+                let vad_stats = captured.stats;
+                let utterance_captured_at = Instant::now();
+                audio.set_phase(AgentPhase::Thinking).await;
+                let text_opt =
+                    transcribe_pcm_bytes(asr, &captured.pcm, cur_config.capture.sample_rate).await;
+                let asr_ms = utterance_captured_at.elapsed().as_millis() as u64;
 
-            if native_monitor.is_blocked() {
-                return Ok(SessionExit::NativeYield);
-            }
-
-            let pcm = match utterance_res {
-                Ok(Some(pcm)) => pcm,
-                Ok(None) => {
-                    info!("当前轮次未检测到有效声音，检查会话超时");
-                    continue;
+                let raw_text = text_opt.unwrap_or_default();
+                if is_native_xiaoai_utterance(&raw_text) {
+                    info!(
+                        session_id = tracker.session_id,
+                        raw = %raw_text,
+                        "连续对话中检测到原生小爱唤醒词，停止回答并静默让位"
+                    );
+                    native_monitor.notify_native_utterance();
+                    return Ok(SessionExit::NativeYield);
                 }
-                Err(e) => return Err(e),
+                let allow_wake_ack =
+                    utterance_captured_at.elapsed() <= Duration::from_millis(MAX_WAKE_ASR_DELAY_MS);
+                let mut ctx = LocalIntentContext {
+                    is_followup: true,
+                    answered_turns,
+                    consecutive_empty_or_noise: &mut consecutive_noise_turns,
+                    max_empty_retries: MAX_CONSECUTIVE_NOISE_TURNS,
+                    allow_wake_ack,
+                    enter_prompt: &cur_config.dual.enter_prompt,
+                    exit_prompt: &cur_config.dual.exit_prompt,
+                    prefer_exit_earcon: true,
+                    speak_exit_on_noise_exhausted: true,
+                };
+
+                match handle_local_intent(&raw_text, &cur_config, audio, agent, &mut ctx).await {
+                    LocalIntentOutcome::ContinueListening => {
+                        tracker.touch();
+                        last_activity = Instant::now();
+                        continue;
+                    }
+                    LocalIntentOutcome::VolumeHandled => {
+                        tracker.touch();
+                        last_activity = Instant::now();
+                        continue;
+                    }
+                    LocalIntentOutcome::EndSession => {
+                        break;
+                    }
+                    LocalIntentOutcome::Chat(cleaned) => (
+                        cleaned,
+                        "followup",
+                        utterance_captured_at,
+                        asr_ms,
+                        Some(vad_stats),
+                        Some(pcm_bytes),
+                    ),
+                }
             };
-
-            let utterance_captured_at = Instant::now();
-            audio.set_phase(AgentPhase::Thinking).await;
-            let text_opt = transcribe_pcm_bytes(asr, &pcm, cur_config.capture.sample_rate).await;
-            let asr_ms = utterance_captured_at.elapsed().as_millis() as u64;
-
-            let raw_text = text_opt.unwrap_or_default();
-            if is_native_xiaoai_utterance(&raw_text) {
-                info!(
-                    session_id = tracker.session_id,
-                    raw = %raw_text,
-                    "连续对话中检测到原生小爱唤醒词，停止回答并静默让位"
-                );
-                native_monitor.notify_native_utterance();
-                return Ok(SessionExit::NativeYield);
-            }
-            let allow_wake_ack =
-                utterance_captured_at.elapsed() <= Duration::from_millis(MAX_WAKE_ASR_DELAY_MS);
-            let mut ctx = LocalIntentContext {
-                is_followup: true,
-                answered_turns,
-                consecutive_empty_or_noise: &mut consecutive_noise_turns,
-                max_empty_retries: MAX_CONSECUTIVE_NOISE_TURNS,
-                allow_wake_ack,
-                enter_prompt: &cur_config.dual.enter_prompt,
-                exit_prompt: &cur_config.dual.exit_prompt,
-                prefer_exit_earcon: true,
-                speak_exit_on_noise_exhausted: true,
-            };
-
-            match handle_local_intent(&raw_text, &cur_config, audio, agent, &mut ctx).await {
-                LocalIntentOutcome::ContinueListening => {
-                    tracker.touch();
-                    last_activity = Instant::now();
-                    continue;
-                }
-                LocalIntentOutcome::VolumeHandled => {
-                    tracker.touch();
-                    last_activity = Instant::now();
-                    continue;
-                }
-                LocalIntentOutcome::EndSession => {
-                    break;
-                }
-                LocalIntentOutcome::Chat(cleaned) => (cleaned, utterance_captured_at, asr_ms),
-            }
-        };
 
         let turn_seq = tracker.begin_turn();
         audio.set_phase(AgentPhase::Thinking).await;
@@ -488,9 +527,13 @@ async fn run_conversation_session(
         let req = TurnPipelineRequest {
             config: &cur_config,
             turn_id: turn_seq,
+            source,
             query: &user_text,
             asr_started_at,
             asr_ms,
+            vad_silence_ms: vad_stats.map(|s| s.silence_tail_ms),
+            speech_voiced_ms: vad_stats.map(|s| s.voiced_ms),
+            pcm_bytes,
             finish_mode: FinishMode::WaitForEnd,
         };
 

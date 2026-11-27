@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -58,21 +59,58 @@ impl AgentPhase {
     }
 }
 
+pub const LATENCY_HISTORY_MAX: usize = 100;
+
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct TurnLatencySnapshot {
+    pub timestamp: String,
     pub turn_id: u64,
+    pub source: String,
+    pub query_preview: String,
+    pub vad_silence_ms: Option<u64>,
+    pub speech_voiced_ms: Option<u64>,
+    pub pcm_bytes: Option<usize>,
     pub asr_ms: u64,
     pub llm_ttft_ms: Option<u64>,
+    pub llm_first_sentence_ms: Option<u64>,
     pub llm_total_ms: u64,
+    pub tool_calls: usize,
+    pub tts_first_audio_ms: Option<u64>,
     pub tts_ms: u64,
     pub e2e_first_audio_ms: Option<u64>,
+    pub e2e_perceived_ms: Option<u64>,
+    pub thinking_earcon_played: bool,
+    pub chunks: usize,
+    pub reply_chars: usize,
+    pub asr_provider: String,
+    pub llm_model: String,
+    pub tts_provider: String,
 }
 
-/// 进程级运行态与最近一轮各阶段耗时快照，供 `/status` 与控制台读取。
+fn summarize_stage(mut values: Vec<u64>) -> Option<Value> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let n = values.len();
+    let sum: u128 = values.iter().map(|&v| v as u128).sum();
+    let avg_ms = ((sum + (n as u128 / 2)) / n as u128) as u64;
+    let p50_idx = (n.saturating_sub(1)) / 2;
+    let p95_idx = ((n * 95 + 99) / 100).saturating_sub(1).min(n - 1);
+    Some(json!({
+        "count": n,
+        "avg_ms": avg_ms,
+        "p50_ms": values[p50_idx],
+        "p95_ms": values[p95_idx],
+        "max_ms": values[n - 1],
+    }))
+}
+
+/// 进程级运行态与最近 N 轮各阶段耗时快照，供 `/status`、`/metrics/latency` 与控制台读取。
 #[derive(Clone, Default)]
 pub struct RuntimeTelemetry {
     phase: Arc<AtomicU8>,
-    last_turn: Arc<Mutex<Option<TurnLatencySnapshot>>>,
+    history: Arc<Mutex<VecDeque<TurnLatencySnapshot>>>,
 }
 
 impl RuntimeTelemetry {
@@ -85,16 +123,57 @@ impl RuntimeTelemetry {
     }
 
     pub fn record_turn(&self, snapshot: TurnLatencySnapshot) {
-        if let Ok(mut guard) = self.last_turn.lock() {
-            *guard = Some(snapshot);
+        if let Ok(mut guard) = self.history.lock() {
+            guard.push_back(snapshot);
+            while guard.len() > LATENCY_HISTORY_MAX {
+                guard.pop_front();
+            }
         }
     }
 
     pub fn last_turn(&self) -> Option<TurnLatencySnapshot> {
-        self.last_turn
+        self.history
             .lock()
             .ok()
-            .and_then(|guard| guard.clone())
+            .and_then(|guard| guard.back().cloned())
+    }
+
+    pub fn recent_turns(&self, limit: usize) -> (Vec<TurnLatencySnapshot>, usize) {
+        let cap = limit.clamp(1, LATENCY_HISTORY_MAX);
+        self.history
+            .lock()
+            .map(|guard| {
+                let total = guard.len();
+                let turns = guard.iter().rev().take(cap).cloned().collect();
+                (turns, total)
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn clear_turns(&self) {
+        if let Ok(mut guard) = self.history.lock() {
+            guard.clear();
+        }
+    }
+
+    pub fn latency_summary(&self) -> Value {
+        let turns: Vec<TurnLatencySnapshot> = self
+            .history
+            .lock()
+            .map(|guard| guard.iter().cloned().collect())
+            .unwrap_or_default();
+        json!({
+            "count": turns.len(),
+            "vad_silence_ms": summarize_stage(turns.iter().filter_map(|t| t.vad_silence_ms).collect()),
+            "asr_ms": summarize_stage(turns.iter().map(|t| t.asr_ms).collect()),
+            "llm_ttft_ms": summarize_stage(turns.iter().filter_map(|t| t.llm_ttft_ms).collect()),
+            "llm_first_sentence_ms": summarize_stage(turns.iter().filter_map(|t| t.llm_first_sentence_ms).collect()),
+            "llm_total_ms": summarize_stage(turns.iter().map(|t| t.llm_total_ms).collect()),
+            "tts_first_audio_ms": summarize_stage(turns.iter().filter_map(|t| t.tts_first_audio_ms).collect()),
+            "tts_ms": summarize_stage(turns.iter().map(|t| t.tts_ms).collect()),
+            "e2e_first_audio_ms": summarize_stage(turns.iter().filter_map(|t| t.e2e_first_audio_ms).collect()),
+            "e2e_perceived_ms": summarize_stage(turns.iter().filter_map(|t| t.e2e_perceived_ms).collect()),
+        })
     }
 }
 
@@ -219,6 +298,8 @@ fn build_router_with_hooks(state: Arc<ControlState>, hooks: ControlHooks) -> Rou
         .route("/config", get(get_config))
         .route("/doctor", get(get_doctor))
         .route("/logs", get(get_logs))
+        .route("/metrics/latency", get(get_latency_metrics))
+        .route("/metrics/latency/clear", post(clear_latency_metrics))
         .route("/stop", post(stop_output))
         .route("/speak", post(speak))
         .route("/chat", post(chat))
@@ -616,6 +697,12 @@ struct LogsQuery {
     lines: Option<usize>,
     level: Option<String>,
     q: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LatencyQuery {
+    limit: Option<usize>,
 }
 
 async fn get_history(State(state): State<RouterState>, Query(query): Query<HistoryQuery>) -> Response {
@@ -1053,6 +1140,31 @@ async fn get_logs(State(state): State<RouterState>, Query(query): Query<LogsQuer
         .into_response()
 }
 
+async fn get_latency_metrics(
+    State(state): State<RouterState>,
+    Query(query): Query<LatencyQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(50);
+    let (turns, count) = state.control.telemetry.recent_turns(limit);
+    let summary = state.control.telemetry.latency_summary();
+    (
+        StatusCode::OK,
+        no_store(),
+        Json(json!({
+            "count": count,
+            "max_entries": LATENCY_HISTORY_MAX,
+            "summary": summary,
+            "turns": turns,
+        })),
+    )
+        .into_response()
+}
+
+async fn clear_latency_metrics(State(state): State<RouterState>) -> Response {
+    state.control.telemetry.clear_turns();
+    (StatusCode::OK, no_store(), Json(json!({ "ok": true }))).into_response()
+}
+
 /// 监控端点被缓存没有任何好处（`fetch` 默认会走 HTTP 缓存），显式禁掉。
 fn no_store() -> [(axum::http::header::HeaderName, &'static str); 2] {
     [
@@ -1443,6 +1555,7 @@ mod tests {
             llm_total_ms: 1300,
             tts_ms: 950,
             e2e_first_audio_ms: Some(1150),
+            ..Default::default()
         });
         let body = status_body(&state);
         assert_eq!(body["pid"], std::process::id());
@@ -2129,5 +2242,103 @@ mod tests {
         handle.abort();
         cleanup(&state);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_latency_endpoints_aggregate_percentiles_require_auth_and_clear() {
+        let (port, state, handle) =
+            spawn_test_server_with_hooks("tok", ControlHooks::default()).await;
+        for (id, vad, asr, ttft, fs, llm, tts_fa, tts, e2e) in [
+            (1, Some(600), 300, Some(400), Some(650), 1000, Some(150), 500, Some(1100)),
+            (2, Some(800), 500, Some(700), Some(900), 1500, Some(250), 700, Some(1650)),
+            (3, Some(1000), 700, Some(900), Some(1150), 2000, Some(350), 900, Some(2200)),
+        ] {
+            state.telemetry.record_turn(TurnLatencySnapshot {
+                timestamp: format!("2026-11-27 20:00:0{id}"),
+                turn_id: id,
+                source: "oneshot".to_string(),
+                query_preview: format!("问题{id}"),
+                vad_silence_ms: vad,
+                speech_voiced_ms: Some(900),
+                pcm_bytes: Some(32000),
+                asr_ms: asr,
+                llm_ttft_ms: ttft,
+                llm_first_sentence_ms: fs,
+                llm_total_ms: llm,
+                tool_calls: usize::from(id == 3),
+                tts_first_audio_ms: tts_fa,
+                tts_ms: tts,
+                e2e_first_audio_ms: e2e,
+                e2e_perceived_ms: e2e.map(|v| v + vad.unwrap_or(0)),
+                ..Default::default()
+            });
+        }
+
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client
+                .get(format!("http://127.0.0.1:{port}/metrics/latency"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(format!("http://127.0.0.1:{port}/metrics/latency/clear"))
+                .bearer_auth("tok")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            405
+        );
+
+        let body: Value = client
+            .get(format!("http://127.0.0.1:{port}/metrics/latency?limit=2"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["count"], 3);
+        let turns = body["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["turn_id"], 3);
+        assert_eq!(turns[1]["turn_id"], 2);
+        assert_eq!(body["summary"]["asr_ms"]["p50_ms"], 500);
+        assert_eq!(body["summary"]["asr_ms"]["p95_ms"], 700);
+        assert_eq!(body["summary"]["asr_ms"]["avg_ms"], 500);
+        assert_eq!(body["summary"]["e2e_perceived_ms"]["p50_ms"], 2450);
+
+        let cleared: Value = client
+            .post(format!("http://127.0.0.1:{port}/metrics/latency/clear"))
+            .bearer_auth("tok")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cleared["ok"], true);
+
+        let after: Value = client
+            .get(format!("http://127.0.0.1:{port}/metrics/latency"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(after["count"], 0);
+        assert_eq!(after["turns"].as_array().unwrap().len(), 0);
+
+        handle.abort();
+        cleanup(&state);
     }
 }

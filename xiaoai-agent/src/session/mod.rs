@@ -353,7 +353,7 @@ impl SessionOrchestrator {
                 }
             };
 
-            let (text, asr_started_at, asr_ms) = if let Some(mut stream) = maybe_stream {
+            let (text, asr_started_at, asr_ms, pcm_bytes) = if let Some(mut stream) = maybe_stream {
                 if stream.server_vad_enabled() {
                     let audio_start = self.audio.clone();
                     let audio_stop = self.audio.clone();
@@ -410,7 +410,7 @@ impl SessionOrchestrator {
                         .ok()
                         .and_then(|g| *g)
                         .unwrap_or_else(Instant::now);
-                    (text, stopped, stopped.elapsed().as_millis() as u64)
+                    (text, stopped, stopped.elapsed().as_millis() as u64, None)
                 } else {
                     let appender = stream.appender();
                     let appender_for_chunk = appender.clone();
@@ -468,7 +468,7 @@ impl SessionOrchestrator {
                             return Err(err.context("ASR failed after retries"));
                         }
                     };
-                    (text, asr_started_at, asr_started_at.elapsed().as_millis() as u64)
+                    (text, asr_started_at, asr_started_at.elapsed().as_millis() as u64, None)
                 }
             } else {
                 let audio_start = self.audio.clone();
@@ -504,6 +504,7 @@ impl SessionOrchestrator {
                         return Ok(());
                     }
                 };
+                let captured_bytes = pcm.len();
 
                 self.audio.set_phase(AgentPhase::Thinking).await;
                 let asr_started_at = Instant::now();
@@ -518,7 +519,12 @@ impl SessionOrchestrator {
                         return Err(err.context("ASR failed after retries"));
                     }
                 };
-                (text, asr_started_at, asr_started_at.elapsed().as_millis() as u64)
+                (
+                    text,
+                    asr_started_at,
+                    asr_started_at.elapsed().as_millis() as u64,
+                    Some(captured_bytes),
+                )
             };
 
             let mut intent_ctx = LocalIntentContext {
@@ -569,9 +575,13 @@ impl SessionOrchestrator {
                 .execute(TurnPipelineRequest {
                     config: &config,
                     turn_id,
+                    source: "exclusive",
                     query: &command,
                     asr_started_at,
                     asr_ms,
+                    vad_silence_ms: None,
+                    speech_voiced_ms: None,
+                    pcm_bytes,
                     finish_mode: FinishMode::DetachForQuietWindow,
                 })
                 .await?;
@@ -858,9 +868,13 @@ mod tests {
                 TurnPipelineRequest {
                     config: &config,
                     turn_id: 101,
+                    source: "test",
                     query: "今天天气怎么样",
                     asr_started_at: Instant::now(),
                     asr_ms: 120,
+                    vad_silence_ms: None,
+                    speech_voiced_ms: None,
+                    pcm_bytes: None,
                     finish_mode: FinishMode::WaitForEnd,
                 },
                 llm_fut,
@@ -892,9 +906,13 @@ mod tests {
                 TurnPipelineRequest {
                     config: &config2,
                     turn_id: 102,
+                    source: "test",
                     query: "讲个故事",
                     asr_started_at: Instant::now(),
                     asr_ms: 80,
+                    vad_silence_ms: None,
+                    speech_voiced_ms: None,
+                    pcm_bytes: None,
                     finish_mode: FinishMode::WaitForEnd,
                 },
                 llm_fut2,
@@ -914,6 +932,66 @@ mod tests {
                 .any(|s| s.contains(MID_STREAM_INTERRUPTED_PROMPT)),
             "zero-chunk error must not speak mid-stream wrap-up prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_pipeline_records_full_stage_breakdown_and_perceived_e2e() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let orch = test_orchestrator(shell).await;
+        let config = orch.config.get().await;
+
+        let (delta_tx, delta_rx) = mpsc::unbounded_channel::<String>();
+        let llm_fut = async move {
+            delta_tx.send("你好，今天天气不错。".to_string()).unwrap();
+            drop(delta_tx);
+            Ok(AgentTurnResult {
+                text: "你好，今天天气不错。".to_string(),
+                should_end: false,
+                end_reason: String::new(),
+                tool_calls: 2,
+            })
+        };
+
+        let res = orch
+            .pipeline()
+            .execute_with_stream(
+                TurnPipelineRequest {
+                    config: &config,
+                    turn_id: 202,
+                    source: "oneshot",
+                    query: "今天天气怎么样",
+                    asr_started_at: Instant::now() - Duration::from_millis(250),
+                    asr_ms: 250,
+                    vad_silence_ms: Some(600),
+                    speech_voiced_ms: Some(900),
+                    pcm_bytes: Some(32_000),
+                    finish_mode: FinishMode::WaitForEnd,
+                },
+                llm_fut,
+                delta_rx,
+            )
+            .await;
+        assert!(res.is_ok());
+
+        let snap = orch
+            .audio
+            .telemetry
+            .last_turn()
+            .expect("pipeline must record TurnLatencySnapshot");
+        assert_eq!(snap.turn_id, 202);
+        assert_eq!(snap.source, "oneshot");
+        assert_eq!(snap.vad_silence_ms, Some(600));
+        assert_eq!(snap.speech_voiced_ms, Some(900));
+        assert_eq!(snap.pcm_bytes, Some(32_000));
+        assert_eq!(snap.asr_ms, 250);
+        assert!(snap.llm_ttft_ms.is_some());
+        assert!(snap.llm_first_sentence_ms.is_some());
+        assert!(snap.tts_first_audio_ms.is_some());
+        assert_eq!(snap.tool_calls, 2);
+        assert_eq!(snap.chunks, 1);
+        let e2e = snap.e2e_first_audio_ms.expect("e2e_first_audio_ms must be recorded");
+        assert!(e2e >= 240);
+        assert_eq!(snap.e2e_perceived_ms, Some(e2e + 600));
     }
 }
 

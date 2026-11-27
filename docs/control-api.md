@@ -29,6 +29,7 @@ server:
 | `GET /config` | 读取当前磁盘配置（所有密钥/Token 脱敏为 `__REDACTED__`）、常用表单视图、`autostart` 标记状态、启动告警与待重启段 |
 | `GET /doctor` | 在线运行自检：`/tmp` 与 `/data` 剩余空间、配置告警、互锁文件检查及 ASR/LLM/天气/MCP/KWS 并行连通性探测 |
 | `GET /logs` | 只读读取运行日志末尾 64 KiB（`?lines=1..500&level=&q=`，默认 `/tmp/xiaoai-agent.log`） |
+| `GET /metrics/latency` | 读取最近 `1..100` 轮全链路耗时明细（VAD静音/ASR/LLM首字与首句/工具次数/TTS/体感E2E）及各阶段 `avg/p50/p95/max` 聚合统计 |
 | `POST /stop` | 打断当前会话并停止全部输出（TTS + 音乐），幂等 |
 | `POST /speak` | body `{"text":"..."}`：让音箱朗读这段文字（排队执行，支持 TTS 试听） |
 | `POST /chat` | body `{"text":"..."}`：把文字当作用户提问，走完整 LLM → TTS 管线（排队执行，返回 `{"ok":true,"queued":true}`） |
@@ -41,6 +42,7 @@ server:
 | `POST /config/yaml` | body `{"yaml":"...","validate_only":false}`：校验或保存完整 YAML（自动回填 `__REDACTED__` 原密钥） |
 | `POST /config/rollback` | 从 `agent.yaml.bak` 校验并原子恢复上一版配置，随后触发热重载 |
 | `POST /autostart` | body `{"enabled":true\|false}`：删除或创建配置同目录下的 `disabled` 标记文件，即时控制 `/data/init.sh` 开机自启 |
+| `POST /metrics/latency/clear` | 清空内存中的全链路耗时采样记录 |
 
 所有写操作**只接受 POST**（GET 返回 405），且除 `/` 外的所有 API 均由路由级中间件 `require_token` 统一做 Bearer 鉴权。`exclusive` 与 `dual` 两种模式都已接线。未接线的端点返回 `503`（`/stop` 除外）。在 `dual` 模式下，当 `NativeWakeMonitor` 检测到原生小爱被唤醒时，正在执行的 `/speak` / `/chat` 任务会立即被中止并静默让位，且原生活跃或冷却保护窗内新到达的 `/speak` / `/chat` 请求会被自动跳过（避免与原生小爱同时出声）。
 

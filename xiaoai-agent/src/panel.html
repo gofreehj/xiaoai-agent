@@ -332,6 +332,20 @@
     color: var(--fg-2); overflow: auto; max-height: 300px; white-space: pre-wrap; word-break: break-word;
   }
   pre.logbox { max-height: 380px; white-space: pre; word-break: normal; }
+  .tbl-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .lat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 8px; margin-bottom: 10px; }
+  .lat-tile { padding: 8px 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--subtle); }
+  .lat-tile .lk { font-size: 11px; color: var(--fg-3); }
+  .lat-tile .lv { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .lat-tile .ls { font-size: 11px; color: var(--fg-2); font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .lat-leg { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--fg-2); margin-bottom: 6px; }
+  .lat-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .lat-bar { display: flex; height: 8px; min-width: 96px; border-radius: 4px; overflow: hidden; background: var(--idle-bg); }
+  .lat-bar > span { display: block; height: 100%; }
+  .lat-v { background: #64748b; }
+  .lat-a { background: #2563eb; }
+  .lat-l { background: #d97706; }
+  .lat-t { background: #0f7a52; }
 
   /* Auth Gate Modal */
   .auth-gate {
@@ -989,6 +1003,33 @@
 
       <!-- 4. 运维诊断 -->
       <section class="pane" id="pane-diag">
+        <section class="card" id="latCard">
+          <div class="card-head">
+            <div>
+              <h2>全链路耗时记录（Latency）</h2>
+              <div class="hint" id="latMeta" style="margin:2px 0 0;">仅保存于内存（最多 100 轮，不写闪存），用于定位说完到出声各阶段耗时。</div>
+            </div>
+            <div class="row">
+              <button type="button" class="btn btn-sm" id="latRefreshBtn">刷新</button>
+              <button type="button" class="btn btn-sm" id="latCopyBtn">复制 JSON</button>
+              <button type="button" class="btn btn-sm btn-danger" id="latClearBtn">清空</button>
+            </div>
+          </div>
+          <div class="lat-grid" id="latSummary"></div>
+          <div class="lat-leg">
+            <span><i class="lat-dot lat-v"></i>VAD静音</span>
+            <span><i class="lat-dot lat-a"></i>ASR</span>
+            <span><i class="lat-dot lat-l"></i>LLM首句</span>
+            <span><i class="lat-dot lat-t"></i>TTS首句</span>
+          </div>
+          <div class="tbl-wrap">
+            <table class="tbl">
+              <thead><tr><th>时间</th><th>来源</th><th>问题</th><th>VAD静音</th><th>ASR</th><th>LLM(首字/首句/总)</th><th>TTS(首/总)</th><th>体感E2E</th><th>阶段占比</th></tr></thead>
+              <tbody id="latTableBody"><tr><td colspan="9" class="hint">切换到本页后自动加载耗时样本…</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
         <section class="card">
           <div class="card-head">
             <h2>运行自检（Doctor）</h2>
@@ -1257,7 +1298,7 @@
     for (var j = 0; j < panes.length; j++) panes[j].classList.toggle("active", panes[j].id === "pane-" + tab);
     if (tab === "history") loadHistory(true);
     else if (tab === "config" && !cfgFormData) loadConfig();
-    else if (tab === "diag") loadLogs();
+    else if (tab === "diag") { loadLatency(); loadLogs(); }
     updateSaveBar();
     updateLogTimer();
   }
@@ -1390,11 +1431,16 @@
 
     if (sb.last_turn) {
       var lt = sb.last_turn;
-      $("fLatency").textContent = (lt.e2e_first_audio_ms !== null && lt.e2e_first_audio_ms !== undefined) ? (lt.e2e_first_audio_ms + " ms") : (lt.llm_total_ms + " ms");
-      var parts = ["ASR " + lt.asr_ms + "ms"];
+      var mainMs = (lt.e2e_perceived_ms !== null && lt.e2e_perceived_ms !== undefined) ? lt.e2e_perceived_ms : lt.e2e_first_audio_ms;
+      $("fLatency").textContent = (mainMs !== null && mainMs !== undefined) ? (mainMs + " ms") : (lt.llm_total_ms + " ms");
+      var parts = [];
+      if (lt.vad_silence_ms !== null && lt.vad_silence_ms !== undefined) parts.push("VAD " + lt.vad_silence_ms + "ms");
+      parts.push("ASR " + lt.asr_ms + "ms");
       if (lt.llm_ttft_ms !== null && lt.llm_ttft_ms !== undefined) parts.push("首字 " + lt.llm_ttft_ms + "ms");
+      if (lt.llm_first_sentence_ms !== null && lt.llm_first_sentence_ms !== undefined) parts.push("首句 " + lt.llm_first_sentence_ms + "ms");
       parts.push("LLM " + lt.llm_total_ms + "ms"); parts.push("TTS " + lt.tts_ms + "ms");
-      if (lt.e2e_first_audio_ms !== null && lt.e2e_first_audio_ms !== undefined) parts.push("出声 " + lt.e2e_first_audio_ms + "ms");
+      if (lt.e2e_perceived_ms !== null && lt.e2e_perceived_ms !== undefined) parts.push("体感 " + lt.e2e_perceived_ms + "ms");
+      else if (lt.e2e_first_audio_ms !== null && lt.e2e_first_audio_ms !== undefined) parts.push("出声 " + lt.e2e_first_audio_ms + "ms");
       $("dLatency").textContent = parts.join(" / ");
     } else { $("fLatency").textContent = "—"; $("dLatency").textContent = "—"; }
     $("fPhaseSub").textContent = "阶段：" + (sb.phase || "—");
@@ -1973,6 +2019,108 @@
     loadConfig();
   }
 
+  // Latency & Doctor & Logs
+  var lastLatencyPayload = null;
+  function fmtOptMs(v) { return (v === null || v === undefined) ? "—" : (v + "ms"); }
+  function renderLatency(d) {
+    lastLatencyPayload = d;
+    $("latMeta").textContent = "内存已记录 " + (d.count || 0) + " / " + (d.max_entries || 100) + " 轮 · 最近更新 " + clock(Date.now());
+    var sum = d.summary || {};
+    var sumBox = $("latSummary"); sumBox.textContent = "";
+    var defs = [
+      ["样本轮数", null, (sum.count || 0) + " 轮", "P50 / P95 / 均值"],
+      ["体感总耗时(含VAD)", sum.e2e_perceived_ms],
+      ["VAD 静音尾", sum.vad_silence_ms],
+      ["ASR 识别", sum.asr_ms],
+      ["LLM 首字", sum.llm_ttft_ms],
+      ["LLM 首句", sum.llm_first_sentence_ms],
+      ["TTS 总计", sum.tts_ms]
+    ];
+    for (var i = 0; i < defs.length; i++) {
+      var def = defs[i], tile = document.createElement("div"); tile.className = "lat-tile";
+      var k = document.createElement("div"); k.className = "lk"; k.textContent = def[0];
+      var v = document.createElement("div"); v.className = "lv";
+      var s = document.createElement("div"); s.className = "ls";
+      if (def[1]) {
+        v.textContent = "P50 " + def[1].p50_ms + "ms";
+        s.textContent = "均值 " + def[1].avg_ms + " · P95 " + def[1].p95_ms + "ms";
+      } else if (def.length > 2) {
+        v.textContent = def[2]; s.textContent = def[3];
+      } else { v.textContent = "—"; s.textContent = "暂无样本"; }
+      tile.appendChild(k); tile.appendChild(v); tile.appendChild(s); sumBox.appendChild(tile);
+    }
+
+    var tbody = $("latTableBody"); tbody.textContent = "";
+    var turns = d.turns || [];
+    if (!turns.length) {
+      var tr0 = document.createElement("tr"), td0 = document.createElement("td");
+      td0.colSpan = 9; td0.className = "hint"; td0.textContent = "暂无记录。对着音箱对话或通过 Web 对话后点「刷新」即可采集各阶段耗时。";
+      tr0.appendChild(td0); tbody.appendChild(tr0); return;
+    }
+    for (var j = 0; j < turns.length; j++) {
+      var t = turns[j], tr = document.createElement("tr");
+      function addCell(txt, cls) {
+        var td = document.createElement("td"); if (cls) td.className = cls; td.textContent = txt; tr.appendChild(td);
+      }
+      var ts = (t.timestamp || "").slice(11) || "—";
+      var src = t.source || "—";
+      if (t.tool_calls) src += " (" + t.tool_calls + "工具)";
+      var llmTxt = fmtOptMs(t.llm_ttft_ms) + " / " + fmtOptMs(t.llm_first_sentence_ms) + " / " + t.llm_total_ms + "ms";
+      var ttsTxt = fmtOptMs(t.tts_first_audio_ms) + " / " + t.tts_ms + "ms";
+      var e2eVal = (t.e2e_perceived_ms !== null && t.e2e_perceived_ms !== undefined) ? t.e2e_perceived_ms : t.e2e_first_audio_ms;
+      addCell(ts, "mono");
+      addCell(src, "");
+      addCell(t.query_preview || "—", "");
+      addCell(fmtOptMs(t.vad_silence_ms), "mono");
+      addCell(t.asr_ms + "ms", "mono");
+      addCell(llmTxt, "mono");
+      addCell(ttsTxt, "mono");
+      addCell(fmtOptMs(e2eVal), "mono");
+
+      var tdBar = document.createElement("td");
+      var bar = document.createElement("div"); bar.className = "lat-bar";
+      var segs = [
+        ["lat-v", t.vad_silence_ms || 0],
+        ["lat-a", t.asr_ms || 0],
+        ["lat-l", (t.llm_first_sentence_ms !== null && t.llm_first_sentence_ms !== undefined) ? t.llm_first_sentence_ms : (t.llm_total_ms || 0)],
+        ["lat-t", t.tts_first_audio_ms || 0]
+      ];
+      var tot = 0; for (var k2 = 0; k2 < segs.length; k2++) tot += segs[k2][1];
+      if (tot > 0) {
+        for (var k3 = 0; k3 < segs.length; k3++) {
+          if (!segs[k3][1]) continue;
+          var sp = document.createElement("span"); sp.className = segs[k3][0];
+          sp.style.width = ((segs[k3][1] / tot) * 100).toFixed(1) + "%";
+          bar.appendChild(sp);
+        }
+      }
+      tdBar.appendChild(bar); tr.appendChild(tdBar); tbody.appendChild(tr);
+    }
+  }
+  function loadLatency() {
+    get("/metrics/latency?limit=50", 8000).then(function (r) {
+      if (!r.ok || !r.body) {
+        if (r.status === 401) openAuthGate("请先输入访问令牌。", false);
+        else toast("加载耗时记录失败：" + (r.body && r.body.error ? r.body.error : r.status), "bad");
+        return;
+      }
+      renderLatency(r.body);
+    }, function (err) { toast("加载耗时记录失败：" + netReason(err), "bad"); });
+  }
+  function copyLatencyJson() {
+    if (!lastLatencyPayload) { toast("暂无可复制数据", "warn"); return; }
+    var text = JSON.stringify(lastLatencyPayload, null, 2);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast("已复制耗时 JSON", "ok"); }, function () { fallbackCopy(text); });
+    } else fallbackCopy(text);
+  }
+  function fallbackCopy(text) {
+    var ta = document.createElement("textarea"); ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); toast("已复制耗时 JSON", "ok"); } catch (e) { toast("复制失败，请手动查看接口", "bad"); }
+    ta.remove();
+  }
+
   // Doctor & Logs
   function fmtKib(kib) { return (kib === null || kib === undefined) ? "未知" : (kib / 1024).toFixed(2) + " MiB (" + kib + " KiB)"; }
   function runDoctor() {
@@ -2148,6 +2296,13 @@
     armConfirm($("cfgRollbackBtn"), "确认恢复 .bak?", function () { postAction("/config/rollback", {}, "已恢复上一版配置").then(function (r) { handleSaveOutcome(r, "已回滚并重载"); }); });
   });
 
+  $("latRefreshBtn").addEventListener("click", loadLatency);
+  $("latCopyBtn").addEventListener("click", copyLatencyJson);
+  $("latClearBtn").addEventListener("click", function () {
+    armConfirm($("latClearBtn"), "确认清空记录?", function () {
+      postAction("/metrics/latency/clear", {}, "已清空耗时采样").then(loadLatency);
+    });
+  });
   $("docRunBtn").addEventListener("click", runDoctor);
   $("logRefreshBtn").addEventListener("click", loadLogs);
   $("logLevel").addEventListener("change", loadLogs);

@@ -528,9 +528,13 @@ impl ControlRunner {
                         .execute(TurnPipelineRequest {
                             config: &cfg,
                             turn_id,
+                            source: "web_chat",
                             query: &text,
                             asr_started_at: std::time::Instant::now(),
                             asr_ms: 0,
+                            vad_silence_ms: None,
+                            speech_voiced_ms: None,
+                            pcm_bytes: None,
                             finish_mode: FinishMode::WaitForEnd,
                         })
                         .await;

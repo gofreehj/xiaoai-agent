@@ -79,6 +79,7 @@ pub struct AgentTurnResult {
     pub text: String,
     pub should_end: bool,
     pub end_reason: String,
+    pub tool_calls: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -368,10 +369,10 @@ impl AgentRuntime {
         text_tx: mpsc::UnboundedSender<String>,
     ) -> anyhow::Result<AgentTurnResult> {
         let (view, message_with_time, history) = self.prepare_turn(message).await;
-        let text = self
+        let (text, tool_calls) = self
             .prompt_stream_once(view, message_with_time, history, text_tx)
             .await?;
-        self.finish_turn(message, text).await
+        self.finish_turn(message, text, tool_calls).await
     }
 
     async fn prepare_turn(&self, message: &str) -> (AgentView, String, Vec<Message>) {
@@ -401,13 +402,19 @@ impl AgentRuntime {
         (view, message_with_time, history)
     }
 
-    async fn finish_turn(&self, message: &str, text: String) -> anyhow::Result<AgentTurnResult> {
+    async fn finish_turn(
+        &self,
+        message: &str,
+        text: String,
+        tool_calls: usize,
+    ) -> anyhow::Result<AgentTurnResult> {
         let control = self.control.lock().await;
         self.push_history(message, &text, false).await;
         Ok(AgentTurnResult {
             text,
             should_end: control.should_end,
             end_reason: control.end_reason.clone(),
+            tool_calls,
         })
     }
 
@@ -450,7 +457,7 @@ impl AgentRuntime {
         prompt: String,
         history: Vec<Message>,
         text_tx: mpsc::UnboundedSender<String>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, usize)> {
         let config = view.config.clone();
         let http_client = view.http_client.clone();
 
@@ -664,7 +671,7 @@ async fn run_agent_stream<M>(
     prompt: String,
     history: Vec<Message>,
     text_tx: mpsc::UnboundedSender<String>,
-) -> anyhow::Result<String>
+) -> anyhow::Result<(String, usize)>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Clone + Unpin + Send + Sync + rig_core::completion::GetTokenUsage,
@@ -677,6 +684,7 @@ where
     let mut full_text = String::new();
     let mut emitted_delta = false;
     let mut pending_unflushed_text = false;
+    let mut tool_calls: usize = 0;
 
     while let Some(item) = stream.next().await {
         match item {
@@ -688,6 +696,16 @@ where
                     pending_unflushed_text = true;
                     full_text.push_str(&text);
                     let _ = text_tx.send(text);
+                }
+            }
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                ..
+            })) => {
+                tool_calls += 1;
+                if pending_unflushed_text {
+                    pending_unflushed_text = false;
+                    full_text.push('\n');
+                    let _ = text_tx.send("\n".to_string());
                 }
             }
             Ok(MultiTurnStreamItem::FinalResponse(res)) => {
@@ -714,7 +732,7 @@ where
         }
     }
 
-    Ok(full_text.trim().to_string())
+    Ok((full_text.trim().to_string(), tool_calls))
 }
 
 pub fn classify_turn_failure_prompt(

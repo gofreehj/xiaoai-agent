@@ -664,16 +664,30 @@ impl ExternalKwsHandle {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn capture_utterance(
         &mut self,
         capture_config: &CaptureConfig,
         timeout_duration: Duration,
         oneshot_probe: Option<Duration>,
     ) -> anyhow::Result<Option<Bytes>> {
+        Ok(self
+            .capture_utterance_with_stats(capture_config, timeout_duration, oneshot_probe)
+            .await?
+            .map(|u| u.pcm))
+    }
+
+    pub async fn capture_utterance_with_stats(
+        &mut self,
+        capture_config: &CaptureConfig,
+        timeout_duration: Duration,
+        oneshot_probe: Option<Duration>,
+    ) -> anyhow::Result<Option<CapturedUtterance>> {
         let Some(ref mut rx) = self.active_rx else {
             anyhow::bail!("尚未开启双模式音频流");
         };
-        capture_dual_utterance(rx, capture_config, timeout_duration, oneshot_probe).await
+        capture_dual_utterance_with_stats(rx, capture_config, timeout_duration, oneshot_probe)
+            .await
     }
 
     pub async fn wait_for_barge_in(&mut self) -> anyhow::Result<BargeInSignal> {
@@ -751,6 +765,12 @@ impl SessionTracker {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CapturedUtterance {
+    pub pcm: Bytes,
+    pub stats: crate::vad::UtteranceStats,
+}
+
 /// Capture a single utterance from the dual-KWS chunk stream using [`SpeechCollector`].
 pub async fn capture_dual_utterance(
     rx: &mut mpsc::Receiver<AudioChunk>,
@@ -758,6 +778,20 @@ pub async fn capture_dual_utterance(
     timeout_duration: Duration,
     oneshot_probe: Option<Duration>,
 ) -> anyhow::Result<Option<Bytes>> {
+    Ok(
+        capture_dual_utterance_with_stats(rx, capture_config, timeout_duration, oneshot_probe)
+            .await?
+            .map(|u| u.pcm),
+    )
+}
+
+/// Capture a single utterance together with VAD timing statistics (`voiced_ms`, `silence_tail_ms`).
+pub async fn capture_dual_utterance_with_stats(
+    rx: &mut mpsc::Receiver<AudioChunk>,
+    capture_config: &CaptureConfig,
+    timeout_duration: Duration,
+    oneshot_probe: Option<Duration>,
+) -> anyhow::Result<Option<CapturedUtterance>> {
     let mut collector = SpeechCollector::new(capture_config);
     let started_at = Instant::now();
     let deadline = started_at + timeout_duration;
@@ -805,7 +839,11 @@ pub async fn capture_dual_utterance(
                 if speech_prefix.is_some() {
                     if let Some(tail) = collector.flush() {
                         let full_pcm = assemble_utterance(speech_prefix.take(), tail);
-                        return Ok(Some(full_pcm));
+                        let stats = collector.take_last_stats().unwrap_or_default();
+                        return Ok(Some(CapturedUtterance {
+                            pcm: full_pcm,
+                            stats,
+                        }));
                     }
                 }
                 anyhow::bail!("外部 KWS 音频流已关闭");
@@ -850,8 +888,12 @@ pub async fn capture_dual_utterance(
                 }
                 SpeechEvent::Utterance(tail) => {
                     let full_pcm = assemble_utterance(speech_prefix.take(), tail);
+                    let stats = collector.take_last_stats().unwrap_or_default();
                     info!(len = full_pcm.len(), "VAD 检测到用户说话结束，切片完成！");
-                    return Ok(Some(full_pcm));
+                    return Ok(Some(CapturedUtterance {
+                        pcm: full_pcm,
+                        stats,
+                    }));
                 }
                 SpeechEvent::SpeechChunk(_) => {}
             }

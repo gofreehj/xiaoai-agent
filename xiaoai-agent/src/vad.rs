@@ -20,6 +20,13 @@ pub enum SpeechEvent {
     Utterance(Bytes),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UtteranceStats {
+    pub voiced_ms: u64,
+    pub silence_tail_ms: u64,
+    pub duration_ms: u64,
+}
+
 pub struct SpeechCollector {
     sample_rate: u32,
     block_bytes: usize,
@@ -46,6 +53,7 @@ pub struct SpeechCollector {
     noise_levels: VecDeque<f64>,
     last_completed: Option<Instant>,
     last_level_log: Instant,
+    last_stats: Option<UtteranceStats>,
 }
 
 impl SpeechCollector {
@@ -80,7 +88,12 @@ impl SpeechCollector {
             noise_levels: VecDeque::with_capacity(NOISE_FLOOR_WINDOW),
             last_completed: None,
             last_level_log: Instant::now(),
+            last_stats: None,
         }
+    }
+
+    pub fn take_last_stats(&mut self) -> Option<UtteranceStats> {
+        self.last_stats.take()
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Vec<SpeechEvent> {
@@ -104,6 +117,11 @@ impl SpeechCollector {
                 tail.len() as f64 / (self.sample_rate as f64 * BYTES_PER_SAMPLE as f64);
             let peak = peak_norm(&tail);
             let voiced_ms = self.voiced_ms;
+            self.last_stats = Some(UtteranceStats {
+                voiced_ms,
+                silence_tail_ms: self.silence_run_ms,
+                duration_ms: (duration_s * 1000.0).round() as u64,
+            });
             self.reset_after_utterance();
             info!(
                 "CAPTURE_UTTERANCE duration={duration_s:.2}s peak={peak:.5} voiced_ms={voiced_ms} end=stream_end"
@@ -236,6 +254,7 @@ impl SpeechCollector {
             utterance.len() as f64 / (self.sample_rate as f64 * BYTES_PER_SAMPLE as f64);
         let peak = peak_norm(&utterance);
         let voiced_ms = self.voiced_ms;
+        let silence_tail_ms = self.silence_run_ms;
         let end_reason = if self.silence_run_ms >= silence_limit_ms {
             "silence"
         } else {
@@ -250,6 +269,12 @@ impl SpeechCollector {
                 SpeechEvent::SpeechRejected,
             ];
         }
+
+        self.last_stats = Some(UtteranceStats {
+            voiced_ms,
+            silence_tail_ms,
+            duration_ms: (duration_s * 1000.0).round() as u64,
+        });
 
         info!(
             "CAPTURE_UTTERANCE duration={duration_s:.2}s peak={peak:.5} voiced_ms={voiced_ms} end={end_reason}"
@@ -500,5 +525,40 @@ mod tests {
         let tail = collector.flush().expect("voiced speech should flush");
         assert_eq!(tail.len(), 2 * 100 * BYTES_PER_SAMPLE);
         assert!(collector.flush().is_none(), "collector should reset after flush");
+    }
+
+    #[test]
+    fn take_last_stats_captures_voiced_and_silence_tail_durations() {
+        let mut config = test_config();
+        config.min_speech_ms = 200;
+        config.silence_ms = 300;
+        let mut collector = SpeechCollector::new(&config);
+
+        assert!(matches!(
+            collector.push(&pcm_block(10_000)).as_slice(),
+            [SpeechEvent::SpeechStart(_)]
+        ));
+        assert!(matches!(
+            collector.push(&pcm_block(10_000)).as_slice(),
+            [SpeechEvent::SpeechChunk(_)]
+        ));
+        assert!(matches!(
+            collector.push(&pcm_block(0)).as_slice(),
+            [SpeechEvent::SpeechChunk(_)]
+        ));
+        assert!(matches!(
+            collector.push(&pcm_block(0)).as_slice(),
+            [SpeechEvent::SpeechChunk(_)]
+        ));
+        let events = collector.push(&pcm_block(0));
+        assert!(events.iter().any(|e| matches!(e, SpeechEvent::Utterance(_))));
+
+        let stats = collector
+            .take_last_stats()
+            .expect("utterance should record VAD stats");
+        assert_eq!(stats.voiced_ms, 200);
+        assert_eq!(stats.silence_tail_ms, 300);
+        assert_eq!(stats.duration_ms, 400);
+        assert!(collector.take_last_stats().is_none());
     }
 }
