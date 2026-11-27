@@ -8,7 +8,7 @@
 ![](https://forthebadge.com/images/badges/makes-people-smile.svg)
 
 An independent voice Agent that runs directly on XiaoAI speakers. With external ASR and LLM service API configuration, the speaker can handle wake word detection, ASR, LLM conversation, tool calls, and TTS replies on device.
-Unlike Open-XiaoAI and [MiGPT](https://github.com/idootop/mi-gpt), XiaoAI Agent does not require a dedicated server for running the Agent, and natively supports both **`exclusive`** mode (full takeover without competing with native XiaoAI) and **`dual`** mode (coexisting with native XiaoAI via a router KWS relay).
+Unlike Open-XiaoAI and [MiGPT](https://github.com/idootop/mi-gpt), XiaoAI Agent does not require a dedicated server for running the Agent, and natively supports both **`exclusive`** mode (full takeover without competing with native XiaoAI) and **`dual`** mode (coexisting with native XiaoAI via built-in UDP XPCM external KWS with on-device native wake interlock).
 
 Tested models & firmware:
 - **XiaoAI Speaker Pro (LX06)** official firmware `1.94.13` (`exclusive` & `dual` modes via built-in [UDP XPCM external KWS](docs/external-kws-protocol.md)) — see [deploy/lx06/README.md](deploy/lx06/README.md), [Python/Docker KWS server](deploy/kws-server/python/README.md), and [Redmi AX5 KWS server](deploy/kws-server/ax5/README.md)
@@ -25,7 +25,9 @@ https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 
 ## Features
 
-- Fully takes over the voice conversation flow: to avoid competing with the native XiaoAI assistant for microphone input, answers, or Xiaomi cloud-side control, this project mutes the native XiaoAI microphone input. Real microphone audio is handled by `xiaoai-agent`, and replies are spoken through the speaker's system TTS command.
+- **Dual first-class runtime modes (`runtime.mode`, single speaker binary)**:
+  - `exclusive`: mutes native XiaoAI microphone input by bind-mounting `speech.usock`, letting `xiaoai-agent` take over the real microphone and full voice pipeline without competing with native XiaoAI or Xiaomi cloud control.
+  - `dual`: preserves native XiaoAI untouched for alarms, timers, and Mi Home routines while streaming mic audio from `xiaoai-agent` to any external KWS backend over the generic [UDP XPCM protocol](docs/external-kws-protocol.md) (`deploy/kws-server/`); includes on-device `NativeWakeMonitor` (optional `ubus` event stream + native log tailing) to immediately cancel active Agent turns, TTS, music, and control-plane `/speak`/`/chat` tasks without dual playback when the user invokes native XiaoAI.
 - No separate server required: the Agent runs directly on the speaker and no longer depends on an independent WebSocket message bridge.
 - Reuses native device audio capabilities: it uses the firmware's built-in resident wake word and VPM audio callback mechanism for a polished audio experience; continuous conversation, VAD, interruption, echo cancellation, and recording during playback are supported.
 - Supports tools and device control: it uses a modern Agent framework and includes built-in time, weather, web search, and Navidrome music playback tools, and can control smart home devices through Home Assistant MCP.

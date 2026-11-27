@@ -25,7 +25,7 @@ https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 
 - **双模式一等支持（`runtime.mode`，全模式单二进制直跑）**：
   - `exclusive`（独占接管）：静音原生小爱输入，由 `xiaoai-agent` 完全接管真实麦克风与对话闭环，不抢答、不误触小米云端控制。
-  - `dual`（外部 KWS 双助手共存）：保留原生小爱处理闹钟、倒计时与米家日常，同时由音箱端内置采集通过通用 [UDP XPCM 协议](./docs/external-kws-protocol.md)接入任意外部 KWS 服务（NAS / Docker / 树莓派 / PC / [红米 AX5](./deploy/kws-server/ax5/README.md)），用自定义唤醒词唤起大模型深度对话；仅需一份 `agent.yaml` 填写 `dual.kws.endpoint` 即可切换，零额外中继进程。
+  - `dual`（外部 KWS 双助手共存）：保留原生小爱处理闹钟、倒计时与米家日常，同时由音箱端内置采集通过通用 [UDP XPCM 协议](./docs/external-kws-protocol.md)接入任意外部 KWS 服务（NAS / Docker / 树莓派 / PC / [红米 AX5](./deploy/kws-server/ax5/README.md)），用自定义唤醒词唤起大模型深度对话；内置 `NativeWakeMonitor` 双源监听（可选 `ubus` 事件流 + 原生日志），喊“小爱同学”时秒级打断豆包对话、TTS、工具调用、音乐与控制面播报并静默让位（零双播放）；仅需一份 `agent.yaml` 填写 `dual.kws.endpoint` 即可切换，零额外中继进程。
 - 无需单独搭建 Agent 后端：主程序直接运行在音箱端侧，仅需配置外部 ASR 与 LLM API；支持自适应底噪 VAD、1.2s 思考提示音、流式分句 TTS 与零延迟本地语音音量/媒体控制。
 - 复用设备原生音频能力：使用固件内置的常驻唤醒和 VPM 音频回调机制，支持连续对话、VAD、中途打断、回声消除与外部 TTS 播放期间的静音窗口防自回声。
 - 支持工具、控制面与设备能力：内置时间、天气、网络搜索、Navidrome 音乐播放工具（含播完自动切歌），支持 Home Assistant MCP、AirPlay 音频输出与带 Bearer 鉴权的本地 HTTP 控制面 / Web 面板（详见 [docs/control-api.md](docs/control-api.md)）。
@@ -167,7 +167,7 @@ kill -HUP "$(cat /tmp/xiaoai-agent/xiaoai-agent.pid)"
 生效范围：
 
 - **立即生效（下一轮对话开始用新值）**：`llm`、`agent`、`music`、`capture`、`tts`、`runtime.session_idle_timeout_s`、`mcp`、`dual.{enter_prompt,exit_prompt,*_earcon,session_timeout_s,exit_keywords}`
-- **需要重启**：`device`（TTS 命令模板、命令超时、LED id）、`asr`、`airplay`、`server`、`runtime.mode`、`dual.kws`、`dual.capture`。这几段在启动时就被各组件快照下来了，热加载只会在日志里告警「需重启」，实际沿用旧值——不会出现「模板还是旧命令、ID 是新值」这种半套配置
+- **需要重启**：`device`（TTS 命令模板、命令超时、LED id）、`asr`、`airplay`、`server`、`runtime.mode`、`dual.kws`、`dual.capture`、`dual.native_interlock`。这几段在启动时就被各组件快照下来了，热加载只会在日志里告警「需重启」，实际沿用旧值——不会出现「模板还是旧命令、ID 是新值」这种半套配置
 - **拒绝**：`runtime.speech_socket`。运行中换 socket 会让 mipns 和 agent 各说各话，只告警不改
 
 配置文件写坏（YAML 语法错）时**保留旧配置继续跑**，只在日志里报错——一次误编辑不该让音箱变哑。在首次启动或改完配置后，也可执行自检命令提前排查配置告警、`/tmp` 空间与上游连通性：

@@ -44,6 +44,8 @@
 | `WAKE:<seq>:<keyword>\n` | 命中唤醒词时回复（`<seq>` 为递增整数） | 立即打断当前输出、回放 pre-wake 缓冲尝试 one-shot 连说并进入对话；若 `<keyword>` 为 `__CMD_EXIT__`，仅在对话/播报中打断并退出（待机忽略） |
 
 > **Wi-Fi 可靠性建议**：命中唤醒词后，服务端可在 20 ms 后重发一次相同 `seq` 的 `WAKE:<seq>:<keyword>\n`；`xiaoai-agent` 内置基于 `seq` 的 5 秒幂等去重。
+>
+> **职责边界**：原生“小爱同学”唤醒打断与防双播放完全由音箱端 `dual.native_interlock`（`NativeWakeMonitor`，详见 [architecture.md](architecture.md)）负责，外部 KWS 服务端**不要**添加“小爱同学”作为热词。
 
 ---
 

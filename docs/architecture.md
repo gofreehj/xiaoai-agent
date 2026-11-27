@@ -15,7 +15,7 @@
 | **唤醒前端** | 固件原生 `mipns-*`（远场 AEC/NS/AGC + VAD） | 内置 `ExternalKwsEngine`（`arecord` + 2.56s 环形缓冲）+ 外部 UDP XPCM KWS 服务 |
 | **唤醒词** | 原生唤醒词（如“小爱同学”） | 自定义热词（如“豆包豆包”，不得与“小爱同学”重叠） |
 | **音频传输** | `/tmp/mico_aivs_lab/usock/speech.usock`（16 kHz mono PCM） | 进程内零拷贝直传 + 通用 [UDP XPCM 协议](external-kws-protocol.md)发往 `dual.kws.endpoint` |
-| **原生小爱状态** | 被 `speech.usock` bind-mount 隔离，仅保留 `common.usock` 供 TTS 使用 | 完整保留并正常运行；检测到硬件回采 `sys_active` 时自动门控防误触发 |
+| **原生小爱状态** | 被 `speech.usock` bind-mount 隔离，仅保留 `common.usock` 供 TTS 使用 | 完整保留并正常运行；检测到硬件回采 `sys_active` 时自动门控防误触发，并通过 `NativeWakeMonitor` 实时监听原生唤醒秒级打断让位 |
 | **部署形态** | 音箱端单二进制 `/data/open-xiaoai/xiaoai-agent` | 同左（零外部中继进程），外部 KWS 可运行在路由器/NAS/PC/Docker 等任意设备 |
 
 > **分工边界**：倒计时、闹钟、提醒等设备原生高频日常功能归属原生小爱（`dual` 模式下直接喊“小爱同学”），Agent 不重复造轮子；Agent 内置轻量**本地语音音量控制**（`mphelper volume_up/down/set`）、**媒体播放控制**与**会话退出**路由，零网络延迟响应。
@@ -99,6 +99,56 @@ Wakeup / ControlCommand::Chat
    - `NativeWakeMonitor` 同时支持可选 `dual.native_interlock.event_command`（如真机验证后的 `ubus listen`）与原生日志尾随（`/tmp/log/messages` + `/tmp/mico_aivs_lab/instruction.log`），结合 `max_active_s` 兜底上限与 `cooldown_s` 冷却窗；一旦检测到「小爱同学」，外层 `tokio::select!` 立即中断 One-shot、录音、ASR、大模型/工具调用、提示音、外部 TTS、控制面 `/speak`/`/chat` 与 Agent 自有音乐并静默让位（不动原生 LED、`tts_play.sh` 与 `mphelper`，`duck` 模式下自动恢复音量）。
 5. **tmpfs 空间保护**：外部 TTS 临时音频限制最长保留 600s 且最多保留 5 个文件，防止 50 MB `/tmp` 被撑爆。
 
+### 3.3 `dual` 模式原生小爱唤醒互锁与防双播放设计
+
+- **核心原则**：
+  - **不耦合外部 KWS 识别“小爱同学”**：直接依赖音箱本地原生 6 麦 `mipns` 的唤醒识别与通知结果（识别率远高于单路外发唤醒），外部 KWS 服务只负责自定义唤醒词（如“豆包豆包”）。
+  - **零侵入 `speech.usock`**：`dual` 模式绝不接管 `/tmp/mico_aivs_lab/usock/speech.usock`，即使 `xiaoai-agent` 崩溃或关闭，原生小爱依然随时可用。
+- **双源实时监听架构（`NativeWakeMonitor`，`frontend/native_monitor.rs`）**：
+
+```text
+  [信号源 A: event_command] ── 可选实时流（如真机验证后的 ubus listen / ubus monitor）
+  [信号源 B: LogTailer]     ── /tmp/log/messages (回退 /var/log/messages)
+                                + /tmp/mico_aivs_lab/instruction.log (仅识别事件，排除 SpeechSynthesizer)
+                                50ms 轮询；启动跳过历史字节；支持 copytruncate 与 inode 轮转
+  [信号源 C: ASR 兜底]      ── is_native_xiaoai_utterance()（句首为“小爱同学”直接拦截）
+           │
+           ▼
+    NativeInterlockState（上升沿唤醒 · 1s 跨源去抖 · max_active_s=15s 防死锁上限 · cooldown_s=5s 冷却窗）
+           │
+           ├──► broadcast::Sender<()> ──► dual.rs 外层 tokio::select!（秒级中止全阶段会话 + 停流）
+           └──► broadcast::Sender<()> ──► ControlRunner 事件循环（秒级 abort /speak 与 /chat）
+```
+
+- **7 类双播放 / 幽灵响应防护闭环**：
+
+| 风险场景 | 根因 | 闭环防护机制 |
+|---|---|---|
+| 1. One-shot 连说与入场欢迎语（“我在，请讲”） | 刚唤醒外部 KWS 就改口喊“小爱同学”，欢迎语可能顶着原声小爱播报 | `dual.rs` 用外层 `tokio::select!` 统一包裹 One-shot 探测、welcome play 与连续对话；命中立刻退出并调用 `kws.stop_stream()` |
+| 2. 连续对话收音 / ASR 窗口竞态 | 原生系统日志写盘慢于语音切片，ASR 已把“小爱同学……”送到大模型 | `probe_oneshot_or_prompt` 与 `run_conversation_session` 在 `handle_local_intent` 前先跑 `is_native_xiaoai_utterance()`，命中触发 `notify_native_utterance()` 并静默让位，不送 LLM 也不播再见语 |
+| 3. LLM 流式生成、工具调用、1.2s 思考提示音与分句 TTS | abort 后已排队合成/预取的句子继续起播 | 外层 `select!` 取消流式管线，`TurnPipeline` 内的 `AbortOnDrop` 立即 abort 思考音子任务，`yield_to_native_dialog` 调用 `PlaybackGate::begin()` 使全部在飞 TTS 令牌失效 |
+| 4. 同步 `tts_play.sh` / `qplayer` 孙进程残留 | `tokio::process::Command::kill_on_drop` 只杀直接 `sh` PID，孙进程继续出声 | `shell.rs::run_shell` 在 Unix 上使用 `.process_group(0)` + `ProcessGroupGuard`，abort/超时立即 `kill -9 -<pgid>`；正常退出则 `disarm()` 以放行合法 `&` 后台播放（`run_shell_detached` 保持不动） |
+| 5. 后台外部 TTS (`xiaoai-tts-*`) 与提示音残留 | `miplayer -f <wav> &` 与 `qplayer` 已脱离 `sh` 等待态在后台发声 | `Device::abort_agent_owned_tts()` 扫描 `/proc/[0-9]*/cmdline` 仅清理 `xiaoai-tts-*` 对应的 `miplayer` 与 `qplayer`；**严禁**误杀原生 `tts_play.sh` 或调用 `mphelper pause` |
+| 6. Agent 音乐误恢复、低音量锁死或熄灭原生灯效 | 会话退出若调用 `release_dialog_focus()` 会发 `shut_led` 与 `mphelper play` | 让位路径调用 `yield_to_native_dialog(true)`：仅置 telemetry 为 `Idle`（**不发 `shut_led`**），调用 `MusicService::yield_to_native()` 清空音乐队列/恢复标记、还原 `mysoftvol`（`duck` 模式）并仅杀 `http(s)://` Agent 音乐 `miplayer`，随后**跳过** `release_dialog_focus()` |
+| 7. 控制面 `/speak`/`/chat` 冲突与待机误唤醒 | 外部 HTTP 控制请求与原生小爱并发，或原生答完后余音重新触发外部 KWS | `ControlRunner` 订阅同一唤醒广播秒级 `abort_running()`，并在 `is_blocked()` 期间跳过 `/speak`/`/chat` 与待机外部 KWS 唤醒；超时退场前检查 `is_blocked()` 跳过再见播报 |
+
+- **`dual.native_interlock` 配置与真机开启 `ubus` 事件流步骤**：
+
+```yaml
+dual:
+  native_interlock:
+    enabled: true
+    # 可选实时事件流：若实机验证存在 ubus 原生唤醒事件，填入 "ubus listen" 并将关键词写入 wake_patterns
+    event_command: ""
+    syslog_path: /tmp/log/messages
+    instruction_log_path: /tmp/mico_aivs_lab/instruction.log
+    max_active_s: 15
+    cooldown_s: 5
+```
+
+1. SSH 登录音箱后执行 `ubus listen`，同时对着音箱喊“小爱同学”，观察是否有实时唤醒 JSON 事件输出；
+2. 若有实时事件，只需在 `agent.yaml` 设置 `dual.native_interlock.event_command: "ubus listen"`（或 `ubus monitor`）并将事件关键字加入 `wake_patterns`（无需改代码或重新编译），即可与日志互锁并发互补工作。
+
 ---
 
 ## 4. 故障隔离、热重载与运维自检
@@ -119,4 +169,4 @@ Wakeup / ControlCommand::Chat
 ### 4.3 启动预检与 `xiaoai-agent doctor`
 
 - 启动时自动执行 `collect_startup_warnings`（仅告警不阻断启动），提前暴露空/占位 `api_key`、`llm.timeout_s < 10s`、`tts_command` 重复加单引号 `'{text}'`，以及 `dual` 模式下 `dual.kws.endpoint` 格式或采集参数越界问题。
-- 运行 `xiaoai-agent doctor -c <agent.yaml>` 可一键离线+在线自检：配置解析与预检告警、运行模式/Socket/PID 状态、`/tmp` 剩余空间，以及 ASR / LLM / 天气 / MCP 与（`dual` 模式下）外部 KWS 服务 UDP RTT 连通性。
+- 运行 `xiaoai-agent doctor -c <agent.yaml>` 可一键离线+在线自检：配置解析与预检告警、运行模式/Socket/PID 状态、`/tmp` 剩余空间，以及 ASR / LLM / 天气 / MCP；在 `dual` 模式下还会额外报告外部 KWS 服务 UDP RTT 连通性及 `native_interlock` 监听源配置与日志文件存在性。

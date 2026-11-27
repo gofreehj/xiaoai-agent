@@ -32,7 +32,7 @@ server:
 | `POST /music/pause` `resume` `next` `previous` `stop` | 音乐控制 |
 | `POST /history/clear` | 清空对话历史 |
 
-所有写操作**只接受 POST**（GET 返回 405），且和读接口一样受 Bearer 鉴权。`exclusive` 与 `dual` 两种模式都已接线。未接线的端点返回 `503`（`/stop` 除外）。
+所有写操作**只接受 POST**（GET 返回 405），且和读接口一样受 Bearer 鉴权。`exclusive` 与 `dual` 两种模式都已接线。未接线的端点返回 `503`（`/stop` 除外）。在 `dual` 模式下，当 `NativeWakeMonitor` 检测到原生小爱被唤醒时，正在执行的 `/speak` / `/chat` 任务会立即被中止并静默让位，且原生活跃或冷却保护窗内新到达的 `/speak` / `/chat` 请求会被自动跳过（避免与原生小爱同时出声）。
 
 鉴权：`Authorization: Bearer <token>`（`token` 为空时不校验）。
 
@@ -68,4 +68,4 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/
 
 ## 自检
 
-`xiaoai-agent doctor -c agent.yaml` 离线检查配置警告、socket/PID、`/tmp` 剩余空间，并探测 ASR/LLM/天气/MCP 的连通性与 RTT。
+`xiaoai-agent doctor -c agent.yaml` 离线检查配置警告、socket/PID、`/tmp` 剩余空间，并探测 ASR/LLM/天气/MCP 的连通性与 RTT；`dual` 模式下还会探测外部 KWS UDP 连通性并输出 `native_interlock` 监听源与日志文件状态。
