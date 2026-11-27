@@ -18,7 +18,17 @@
 # 没有 bash 数组，所以这里也不用（见 docs/flash-troubleshooting.md 第五节）。
 set -u
 
-AGENT_LOG=${XIAOAI_AGENT_LOG:-/data/open-xiaoai/xiaoai-agent.log}
+if [ -z "${XIAOAI_AGENT_LOG:-}" ]; then
+	if [ -r /tmp/xiaoai-agent.log ]; then
+		AGENT_LOG=/tmp/xiaoai-agent.log
+	elif [ -r /data/open-xiaoai/xiaoai-agent.log ]; then
+		AGENT_LOG=/data/open-xiaoai/xiaoai-agent.log
+	else
+		AGENT_LOG=/tmp/xiaoai-agent.log
+	fi
+else
+	AGENT_LOG=$XIAOAI_AGENT_LOG
+fi
 AGENT_CONFIG=${XIAOAI_AGENT_CONFIG:-/data/open-xiaoai/agent.yaml}
 STATE=${XIAOAI_VERIFY_STATE:-/tmp/xiaoai-verify-quiet.offset}
 SLICE=${XIAOAI_VERIFY_SLICE:-/tmp/xiaoai-verify-quiet.slice}

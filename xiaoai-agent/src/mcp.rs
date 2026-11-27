@@ -47,35 +47,8 @@ impl McpConnections {
                 continue;
             }
 
-            // 连接整体加超时：server.timeout_s 只作用于工具调用，
-            // 连接/initialize/list_tools 没有超时会让 HA 离线时卡住整个启动。
-            let wait = std::time::Duration::from_secs_f64(server.timeout_s.max(1.0) * 2.0);
-            let service = match tokio::time::timeout(
-                wait,
-                connect_mcp_server(&server, tool_server.clone()),
-            )
-            .await
-            {
-                Ok(Ok(service)) => {
-                    info!(server = %server.name, "connected MCP tools");
-                    Some(service)
-                }
-                Ok(Err(err)) => {
-                    warn!(server = %server.name, "failed to connect MCP server: {err}");
-                    None
-                }
-                Err(_) => {
-                    warn!(
-                        server = %server.name,
-                        "MCP connect timed out after {:?}, continuing without it",
-                        wait
-                    );
-                    None
-                }
-            };
-
             let supervisor =
-                tokio::spawn(supervise_mcp_server(server, tool_server.clone(), service));
+                tokio::spawn(supervise_mcp_server(server, tool_server.clone(), None));
             supervisors.push(supervisor);
         }
 
@@ -149,6 +122,8 @@ async fn supervise_mcp_server(
     mut service: Option<McpService>,
 ) {
     let mut reconnect_delay = INITIAL_RECONNECT_DELAY;
+    let mut first_attempt = service.is_none();
+    let connect_timeout = Duration::from_secs_f64(server.timeout_s.max(1.0) * 2.0);
 
     loop {
         if let Some(active_service) = service.take() {
@@ -157,25 +132,42 @@ async fn supervise_mcp_server(
             reconnect_delay = INITIAL_RECONNECT_DELAY;
         }
 
-        info!(
-            server = %server.name,
-            reconnect_in_s = reconnect_delay.as_secs(),
-            "waiting to reconnect MCP server"
-        );
-        sleep(reconnect_delay).await;
+        if first_attempt {
+            first_attempt = false;
+        } else {
+            info!(
+                server = %server.name,
+                reconnect_in_s = reconnect_delay.as_secs(),
+                "waiting to reconnect MCP server"
+            );
+            sleep(reconnect_delay).await;
+            reconnect_delay = next_reconnect_delay(reconnect_delay);
+        }
 
-        match connect_mcp_server(&server, tool_server.clone()).await {
-            Ok(new_service) => {
-                info!(server = %server.name, "reconnected MCP tools");
+        match tokio::time::timeout(
+            connect_timeout,
+            connect_mcp_server(&server, tool_server.clone()),
+        )
+        .await
+        {
+            Ok(Ok(new_service)) => {
+                info!(server = %server.name, "connected MCP tools");
                 service = Some(new_service);
                 reconnect_delay = INITIAL_RECONNECT_DELAY;
             }
-            Err(err) => {
-                reconnect_delay = next_reconnect_delay(reconnect_delay);
+            Ok(Err(err)) => {
                 warn!(
                     server = %server.name,
                     retry_in_s = reconnect_delay.as_secs(),
-                    "failed to reconnect MCP server: {err}"
+                    "failed to connect MCP server: {err}"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    server = %server.name,
+                    retry_in_s = reconnect_delay.as_secs(),
+                    "MCP connect timed out after {:?}",
+                    connect_timeout
                 );
             }
         }
@@ -328,5 +320,42 @@ mod tests {
         );
         assert!(handler.tool_allowed("ha_search"));
         assert!(!handler.tool_allowed("ha_restart"));
+    }
+
+    #[tokio::test]
+    async fn connect_returns_immediately_for_unreachable_blackhole_server() {
+        use std::time::Instant;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept connections and never reply (blackhole).
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.mcp.servers.push(McpServerConfig {
+            name: "blackhole".to_string(),
+            enabled: true,
+            url: format!("http://{addr}/mcp"),
+            token: String::new(),
+            timeout_s: 2.0,
+            tools: Vec::new(),
+        });
+
+        let start = Instant::now();
+        let connections = McpConnections::connect(Arc::new(cfg), ToolServer::new().run()).await;
+        let elapsed = start.elapsed();
+        drop(connections);
+        server.abort();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "McpConnections::connect should return immediately without blocking on blackhole server, took {elapsed:?}"
+        );
     }
 }

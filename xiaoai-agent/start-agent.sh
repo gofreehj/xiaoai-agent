@@ -5,7 +5,11 @@ set -u
 AGENT_HOME=${XIAOAI_AGENT_HOME:-/data/open-xiaoai}
 AGENT_BIN=${XIAOAI_AGENT_BIN:-$AGENT_HOME/xiaoai-agent}
 AGENT_CONFIG=${XIAOAI_AGENT_CONFIG:-$AGENT_HOME/agent.yaml}
-AGENT_LOG=${XIAOAI_AGENT_LOG:-$AGENT_HOME/xiaoai-agent.log}
+# Default logs to /tmp (tmpfs) to avoid NAND flash wear and /data exhaustion (LX06 /data is only 13.4 MiB).
+AGENT_LOG=${XIAOAI_AGENT_LOG:-/tmp/xiaoai-agent.log}
+LAUNCHER_LOG=${XIAOAI_LAUNCHER_LOG:-/tmp/xiaoai-agent-launcher.log}
+LOG_MAX_BYTES=${XIAOAI_LOG_MAX_BYTES:-2097152}
+LOG_KEEP_LINES=${XIAOAI_LOG_KEEP_LINES:-1000}
 RUNTIME_DIR=${XIAOAI_RUNTIME_DIR:-/tmp/xiaoai-agent}
 PID_FILE=$RUNTIME_DIR/xiaoai-agent.pid
 WATCHDOG_PID_FILE=$RUNTIME_DIR/watchdog.pid
@@ -221,6 +225,23 @@ stop_watchdog() {
     rm -f "$WATCHDOG_PID_FILE"
 }
 
+trim_log_file() {
+    file=$1
+    max_bytes=${2:-$LOG_MAX_BYTES}
+    keep_lines=${3:-$LOG_KEEP_LINES}
+    [ -f "$file" ] || return 0
+    size=$(wc -c <"$file" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$max_bytes" ] 2>/dev/null; then
+        tail -n "$keep_lines" "$file" >"${file}.trim" 2>/dev/null && mv "${file}.trim" "$file" || true
+    fi
+}
+
+apply_network_workarounds() {
+    if [ "${XIAOAI_DISABLE_IPV6:-0}" = "1" ]; then
+        sysctl -w net.ipv6.conf.wlan0.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+    fi
+}
+
 start_watchdog() {
     agent_pid=$1
     expected_inode=$(socket_inode) || return 1
@@ -228,7 +249,13 @@ start_watchdog() {
     (
         trap '' HUP
         trap 'exit 0' INT TERM
+        ticks=0
         while sleep "$WATCHDOG_INTERVAL"; do
+            ticks=$((ticks + 1))
+            if [ "$((ticks % 12))" -eq 0 ]; then
+                trim_log_file "$AGENT_LOG" "$LOG_MAX_BYTES" "$LOG_KEEP_LINES"
+                trim_log_file "$LAUNCHER_LOG" 524288 500
+            fi
             reason=
             if ! kill -0 "$agent_pid" 2>/dev/null; then
                 reason="agent process exited"
@@ -243,10 +270,10 @@ start_watchdog() {
             [ -n "$reason" ] || continue
             log "$reason; restarting the runtime takeover"
             rm -f "$WATCHDOG_PID_FILE"
-            "$LAUNCHER" restart >>"$AGENT_HOME/xiaoai-agent-launcher.log" 2>&1
+            "$LAUNCHER" restart >>"$LAUNCHER_LOG" 2>&1
             exit
         done
-    ) </dev/null >>"$AGENT_HOME/xiaoai-agent-launcher.log" 2>&1 &
+    ) </dev/null >>"$LAUNCHER_LOG" 2>&1 &
     printf '%s\n' "$!" >"$WATCHDOG_PID_FILE"
 }
 
@@ -365,7 +392,93 @@ release_lock() {
     rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
+is_dual_mode() {
+    [ -r "$AGENT_CONFIG" ] && grep -qE '^\s*mode:\s*"?dual"?' "$AGENT_CONFIG"
+}
+
+start_dual_watchdog() {
+    agent_pid=$1
+    mkdir -p "$RUNTIME_DIR"
+    (
+        trap '' HUP
+        trap 'exit 0' INT TERM
+        ticks=0
+        while sleep "$WATCHDOG_INTERVAL"; do
+            ticks=$((ticks + 1))
+            if [ "$((ticks % 12))" -eq 0 ]; then
+                trim_log_file "$AGENT_LOG" "$LOG_MAX_BYTES" "$LOG_KEEP_LINES"
+                trim_log_file "$LAUNCHER_LOG" 524288 500
+            fi
+            if ! kill -0 "$agent_pid" 2>/dev/null; then
+                log "dual-mode xiaoai-agent process exited; restarting dual mode"
+                rm -f "$WATCHDOG_PID_FILE"
+                "$LAUNCHER" restart >>"$LAUNCHER_LOG" 2>&1
+                exit
+            fi
+        done
+    ) </dev/null >>"$LAUNCHER_LOG" 2>&1 &
+    printf '%s\n' "$!" >"$WATCHDOG_PID_FILE"
+}
+
+start_dual() {
+    acquire_lock || return 1
+
+    if pid_is_running; then
+        log "dual mode already running with PID $(cat "$PID_FILE")"
+        return 0
+    fi
+    rm -f "$PID_FILE"
+
+    [ -x "$AGENT_BIN" ] || fail "agent binary is not executable: $AGENT_BIN" || return 1
+    [ -r "$AGENT_CONFIG" ] || fail "agent config is not readable: $AGENT_CONFIG" || return 1
+
+    apply_network_workarounds
+    trim_log_file "$AGENT_LOG" "$LOG_MAX_BYTES" "$LOG_KEEP_LINES"
+
+    stop_watchdog
+    stop_agent_process
+
+    log "starting $AGENT_BIN in dual mode..."
+    RUST_LOG="$RUST_LOG" "$AGENT_BIN" -c "$AGENT_CONFIG" >>"$AGENT_LOG" 2>&1 &
+    agent_pid=$!
+    mkdir -p "$RUNTIME_DIR"
+    printf '%s\n' "$agent_pid" >"$PID_FILE"
+    [ -w "/proc/$agent_pid/oom_score_adj" ] && echo 100 >"/proc/$agent_pid/oom_score_adj" 2>/dev/null || true
+
+    sleep 1
+    if kill -0 "$agent_pid" 2>/dev/null; then
+        start_dual_watchdog "$agent_pid"
+        log "dual mode started successfully (agent PID: $agent_pid)"
+        return 0
+    fi
+    rm -f "$PID_FILE"
+    fail "dual mode agent failed to stay running; see $AGENT_LOG"
+    return 1
+}
+
+stop_dual() {
+    acquire_lock || return 1
+    log "stopping dual mode..."
+    stop_watchdog
+    stop_agent_process
+    log "dual mode stopped"
+    return 0
+}
+
+status_dual() {
+    if pid_is_running; then
+        log "dual mode running with PID $(cat "$PID_FILE")"
+        return 0
+    fi
+    log "dual mode is not running"
+    return 1
+}
+
 start_agent() {
+    if is_dual_mode; then
+        start_dual
+        return $?
+    fi
     acquire_lock || return 1
     if pid_is_running && pns_is_overlaid && speech_is_protected; then
         log "already running with PID $(cat "$PID_FILE")"
@@ -396,6 +509,9 @@ start_agent() {
         fail "failed to remove the stopped native speech socket"
         return 1
     fi
+
+    apply_network_workarounds
+    trim_log_file "$AGENT_LOG" "$LOG_MAX_BYTES" "$LOG_KEEP_LINES"
 
     log "starting $AGENT_BIN"
     RUST_LOG="$RUST_LOG" "$AGENT_BIN" -c "$AGENT_CONFIG" >>"$AGENT_LOG" 2>&1 &
@@ -447,6 +563,10 @@ start_agent() {
 }
 
 stop_agent() {
+    if is_dual_mode; then
+        stop_dual
+        return $?
+    fi
     if ! acquire_lock; then
         # 前端一点没动：这是唯一一种「让位失败但可以继续运行」的情形。
         return "$EXIT_UNTOUCHED"
@@ -467,6 +587,10 @@ stop_agent() {
 }
 
 status_agent() {
+    if is_dual_mode; then
+        status_dual
+        return $?
+    fi
     if pid_is_running && pns_is_overlaid && speech_is_protected; then
         log "running with PID $(cat "$PID_FILE")"
         return 0
@@ -488,7 +612,11 @@ case "$command" in
         stop_agent
         ;;
     restart)
-        acquire_lock && stop_takeover && release_lock && start_agent
+        if is_dual_mode; then
+            stop_dual && release_lock && sleep 1 && start_dual
+        else
+            acquire_lock && stop_takeover && release_lock && start_agent
+        fi
         ;;
     status)
         status_agent

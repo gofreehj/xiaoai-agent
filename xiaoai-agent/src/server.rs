@@ -1,17 +1,96 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tracing::info;
 
-use crate::config::ServerConfig;
+use crate::agent::AgentRuntime;
+use crate::audio::{AudioCoordinator, FinishMode, VolumeAction};
+use crate::config::{ConfigHandle, ServerConfig};
+use crate::music::MusicService;
+use crate::session::ControlCommand;
 use crate::speech::{SocketOwnership, SpeechLiveness};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AgentPhase {
+    Idle = 0,
+    Listening = 1,
+    UserSpeaking = 2,
+    Thinking = 3,
+    Speaking = 4,
+}
+
+impl AgentPhase {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Listening,
+            2 => Self::UserSpeaking,
+            3 => Self::Thinking,
+            4 => Self::Speaking,
+            _ => Self::Idle,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Listening => "listening",
+            Self::UserSpeaking => "user_speaking",
+            Self::Thinking => "thinking",
+            Self::Speaking => "speaking",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct TurnLatencySnapshot {
+    pub turn_id: u64,
+    pub asr_ms: u64,
+    pub llm_ttft_ms: Option<u64>,
+    pub llm_total_ms: u64,
+    pub tts_ms: u64,
+    pub e2e_first_audio_ms: Option<u64>,
+}
+
+/// 进程级运行态与最近一轮各阶段耗时快照，供 `/status` 与控制台读取。
+#[derive(Clone, Default)]
+pub struct RuntimeTelemetry {
+    phase: Arc<AtomicU8>,
+    last_turn: Arc<Mutex<Option<TurnLatencySnapshot>>>,
+}
+
+impl RuntimeTelemetry {
+    pub fn set_phase(&self, phase: AgentPhase) {
+        self.phase.store(phase as u8, Ordering::Relaxed);
+    }
+
+    pub fn phase(&self) -> AgentPhase {
+        AgentPhase::from_u8(self.phase.load(Ordering::Relaxed))
+    }
+
+    pub fn record_turn(&self, snapshot: TurnLatencySnapshot) {
+        if let Ok(mut guard) = self.last_turn.lock() {
+            *guard = Some(snapshot);
+        }
+    }
+
+    pub fn last_turn(&self) -> Option<TurnLatencySnapshot> {
+        self.last_turn
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+}
 
 /// 控制面能看到的运行时事实。
 ///
@@ -24,13 +103,53 @@ pub struct ControlState {
     pub liveness: SpeechLiveness,
     pub started_at: Instant,
     pub config_path: Option<PathBuf>,
+    pub telemetry: RuntimeTelemetry,
+}
+
+/// 控制面可注入的运行时控制句柄。
+///
+/// 全部字段为 `Option`，未接线时对应端点降级返回 `503`（`/stop` 除外，仍按幂等成功返回）。
+#[derive(Clone, Default)]
+pub struct ControlHooks {
+    pub command_tx: Option<mpsc::Sender<ControlCommand>>,
+    pub audio: Option<AudioCoordinator>,
+    pub music: Option<Arc<MusicService>>,
+    pub agent: Option<Arc<AgentRuntime>>,
+    pub config: Option<ConfigHandle>,
+    pub reload_tx: Option<mpsc::Sender<()>>,
+}
+
+#[derive(Clone)]
+struct RouterState {
+    control: Arc<ControlState>,
+    hooks: ControlHooks,
+}
+
+impl RouterState {
+    fn music(&self) -> Option<&Arc<MusicService>> {
+        self.hooks
+            .music
+            .as_ref()
+            .or_else(|| self.hooks.audio.as_ref().map(|a| &a.music))
+    }
 }
 
 /// 启动控制面。**关闭时返回 `Ok(None)`，不 bind 任何 socket**——issue #9 的
 /// 验收条件之一就是「关闭时零监听」，所以这里不能先 bind 再判断。
+#[allow(dead_code)] // 仅测试直接调用；运行时走 spawn_with_hooks / speak_stream_with_mode
 pub async fn spawn(
     config: &ServerConfig,
     state: Arc<ControlState>,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    spawn_with_hooks(config, state, ControlHooks::default()).await
+}
+
+/// 启动控制面并注入控制句柄（`/stop`、`/speak`、`/chat`、`/reload`、`/volume`、`/music/*`、`/history/clear`）。
+#[allow(dead_code)]
+pub async fn spawn_with_hooks(
+    config: &ServerConfig,
+    state: Arc<ControlState>,
+    hooks: ControlHooks,
 ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
     if !config.enabled {
         info!("本地控制面未启用（server.enabled=false），不监听任何端口");
@@ -60,7 +179,7 @@ pub async fn spawn(
         "本地控制面已启动"
     );
 
-    let app = build_router(state);
+    let app = build_router_with_hooks(state, hooks);
 
     let handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -70,23 +189,43 @@ pub async fn spawn(
     Ok(Some(handle))
 }
 
+#[cfg(test)]
 fn build_router(state: Arc<ControlState>) -> Router {
+    build_router_with_hooks(state, ControlHooks::default())
+}
+
+fn build_router_with_hooks(state: Arc<ControlState>, hooks: ControlHooks) -> Router {
+    let router_state = RouterState {
+        control: state,
+        hooks,
+    };
+
     // 鉴权写成 layer，而不是让每个 handler 自己记得调 authorize：
-    // #9 下一步就是 /stop、/play/*，新增端点的人只要漏抄那几行就是一个
-    // **无鉴权的控制端点**，而路由结构不会提醒他。现在默认受保护，
-    // 要公开必须显式挂到下面这条 Router 上。
+    // 所有非 `/` 路由默认受保护，且状态变更端点一律只允许 POST（防 CSRF）。
     let api = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/music/status", get(music_status))
+        .route("/stop", post(stop_output))
+        .route("/speak", post(speak))
+        .route("/chat", post(chat))
+        .route("/reload", post(reload))
+        .route("/volume", post(volume))
+        .route("/music/pause", post(music_pause))
+        .route("/music/resume", post(music_resume))
+        .route("/music/next", post(music_next))
+        .route("/music/previous", post(music_previous))
+        .route("/music/stop", post(music_stop))
+        .route("/history/clear", post(clear_history))
         .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
+            router_state.clone(),
             require_token,
         ));
 
     Router::new()
         .route("/", get(panel))
         .merge(api)
-        .with_state(state)
+        .with_state(router_state)
 }
 
 /// 统一的 Bearer 校验。**所有非公开路由都过这里**。
@@ -95,11 +234,11 @@ fn build_router(state: Arc<ControlState>) -> Router {
 /// 端点都必须要求 `Authorization`，且不该用 GET（`<img>`/`<a>`/`<form>` 都能触发
 /// GET，但都带不上 Bearer——GET + 不鉴权 = CSRF 跳板）。
 async fn require_token(
-    State(state): State<Arc<ControlState>>,
+    State(state): State<RouterState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    match authorize(&state.token, request.headers()) {
+    match authorize(&state.control.token, request.headers()) {
         Ok(()) => next.run(request).await,
         Err(status) => (status, Json(json!({ "error": "unauthorized" }))).into_response(),
     }
@@ -112,9 +251,9 @@ async fn panel() -> Response {
     // 面板只有内联样式与脚本：
     // - `default-src 'none'` + `connect-src 'self'`：页面永远不加载外部资源（和
     //   「无 CDN」的目标一致），请求只能打到本机；
-    // - `frame-ancestors 'none'`：不能被嵌进 iframe —— 第二步加了「停止播放」
+    // - `frame-ancestors 'none'`：不能被嵌进 iframe —— 加了「停止播放」
     //   这类按钮后，点击劫持就成立了。
-    let csp = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';                connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    let csp = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
     (
         [
             (axum::http::header::CONTENT_SECURITY_POLICY, csp),
@@ -130,13 +269,321 @@ async fn panel() -> Response {
 /// 也不会因为 JS 里出现 `"#` 而静默截断。
 const PANEL_HTML: &str = include_str!("panel.html");
 
-async fn health(State(state): State<Arc<ControlState>>) -> Response {
-    let (status, body) = health_response(&state);
+async fn health(State(state): State<RouterState>) -> Response {
+    let (status, body) = health_response(&state.control);
     (status, no_store(), Json(body)).into_response()
 }
 
-async fn status(State(state): State<Arc<ControlState>>) -> Response {
-    (StatusCode::OK, no_store(), Json(status_body(&state))).into_response()
+async fn status(State(state): State<RouterState>) -> Response {
+    (StatusCode::OK, no_store(), Json(status_body(&state.control))).into_response()
+}
+
+#[derive(Deserialize)]
+struct TextPayload {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct VolumePayload {
+    action: String,
+    value: Option<i32>,
+}
+
+async fn stop_output(State(state): State<RouterState>) -> Response {
+    if let Some(audio) = &state.hooks.audio {
+        audio.stop_all_output().await;
+    }
+    if let Some(tx) = &state.hooks.command_tx {
+        let _ = tx.send(ControlCommand::Stop).await;
+    }
+    (
+        StatusCode::OK,
+        no_store(),
+        Json(json!({ "ok": true, "action": "stop" })),
+    )
+        .into_response()
+}
+
+async fn speak(State(state): State<RouterState>, Json(payload): Json<TextPayload>) -> Response {
+    let text = payload.text.trim();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store(),
+            Json(json!({ "error": "empty_text" })),
+        )
+            .into_response();
+    }
+
+    if let (Some(audio), Some(config)) = (&state.hooks.audio, &state.hooks.config) {
+        let cfg = config.get().await;
+        match audio.speak_once(&cfg.tts, text, FinishMode::WaitForEnd).await {
+            Ok(()) => {
+                return (StatusCode::OK, no_store(), Json(json!({ "ok": true }))).into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    no_store(),
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(tx) = &state.hooks.command_tx {
+        if tx.send(ControlCommand::Speak(text.to_string())).await.is_ok() {
+            return (StatusCode::OK, no_store(), Json(json!({ "ok": true }))).into_response();
+        }
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        no_store(),
+        Json(json!({ "error": "speak_unavailable" })),
+    )
+        .into_response()
+}
+
+async fn chat(State(state): State<RouterState>, Json(payload): Json<TextPayload>) -> Response {
+    let text = payload.text.trim();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            no_store(),
+            Json(json!({ "error": "empty_text" })),
+        )
+            .into_response();
+    }
+
+    if let Some(tx) = &state.hooks.command_tx {
+        if tx.send(ControlCommand::Chat(text.to_string())).await.is_ok() {
+            return (
+                StatusCode::OK,
+                no_store(),
+                Json(json!({ "ok": true, "queued": true })),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(agent) = &state.hooks.agent {
+        let (delta_tx, _delta_rx) = mpsc::unbounded_channel();
+        match agent.run_turn_stream(text, delta_tx).await {
+            Ok(result) => {
+                if !result.text.trim().is_empty() {
+                    if let (Some(audio), Some(config)) = (&state.hooks.audio, &state.hooks.config) {
+                        let cfg = config.get().await;
+                        let _ = audio
+                            .speak_once(&cfg.tts, &result.text, FinishMode::WaitForEnd)
+                            .await;
+                    }
+                }
+                return (
+                    StatusCode::OK,
+                    no_store(),
+                    Json(json!({ "ok": true, "reply": result.text })),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    no_store(),
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        no_store(),
+        Json(json!({ "error": "chat_unavailable" })),
+    )
+        .into_response()
+}
+
+async fn reload(State(state): State<RouterState>) -> Response {
+    if let Some(tx) = &state.hooks.reload_tx {
+        if tx.send(()).await.is_ok() {
+            return (
+                StatusCode::OK,
+                no_store(),
+                Json(json!({ "ok": true, "action": "reload" })),
+            )
+                .into_response();
+        }
+    }
+    if let Some(tx) = &state.hooks.command_tx {
+        if tx.send(ControlCommand::Reload).await.is_ok() {
+            return (
+                StatusCode::OK,
+                no_store(),
+                Json(json!({ "ok": true, "action": "reload" })),
+            )
+                .into_response();
+        }
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        no_store(),
+        Json(json!({ "error": "reload_unavailable" })),
+    )
+        .into_response()
+}
+
+async fn volume(State(state): State<RouterState>, Json(payload): Json<VolumePayload>) -> Response {
+    let action = match payload.action.trim().to_ascii_lowercase().as_str() {
+        "up" => VolumeAction::Up,
+        "down" => VolumeAction::Down,
+        "mute" => VolumeAction::Mute,
+        "set" => match payload.value {
+            Some(v) if (0..=100).contains(&v) => VolumeAction::Set(v as u8),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    no_store(),
+                    Json(json!({ "error": "invalid_volume_value" })),
+                )
+                    .into_response();
+            }
+        },
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                no_store(),
+                Json(json!({ "error": "invalid_volume_action" })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(audio) = &state.hooks.audio {
+        match audio.execute_volume(action).await {
+            Ok(()) => {
+                return (StatusCode::OK, no_store(), Json(json!({ "ok": true }))).into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    no_store(),
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if let Some(tx) = &state.hooks.command_tx {
+        if tx.send(ControlCommand::Volume(action)).await.is_ok() {
+            return (StatusCode::OK, no_store(), Json(json!({ "ok": true }))).into_response();
+        }
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        no_store(),
+        Json(json!({ "error": "volume_unavailable" })),
+    )
+        .into_response()
+}
+
+async fn music_status(State(state): State<RouterState>) -> Response {
+    let Some(music) = state.music() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "music_unavailable" })),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, no_store(), Json(music.status().await)).into_response()
+}
+
+async fn music_pause(State(state): State<RouterState>) -> Response {
+    let Some(music) = state.music() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "music_unavailable" })),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, no_store(), Json(music.pause().await)).into_response()
+}
+
+async fn music_resume(State(state): State<RouterState>) -> Response {
+    let Some(music) = state.music() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "music_unavailable" })),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, no_store(), Json(music.resume().await)).into_response()
+}
+
+async fn music_next(State(state): State<RouterState>) -> Response {
+    let Some(music) = state.music() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "music_unavailable" })),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, no_store(), Json(music.next().await)).into_response()
+}
+
+async fn music_previous(State(state): State<RouterState>) -> Response {
+    let Some(music) = state.music() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "music_unavailable" })),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, no_store(), Json(music.previous().await)).into_response()
+}
+
+async fn music_stop(State(state): State<RouterState>) -> Response {
+    let Some(music) = state.music() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "music_unavailable" })),
+        )
+            .into_response();
+    };
+    (StatusCode::OK, no_store(), Json(music.stop().await)).into_response()
+}
+
+async fn clear_history(State(state): State<RouterState>) -> Response {
+    let mut handled = false;
+    if let Some(agent) = &state.hooks.agent {
+        agent.reset_session("clear history").await;
+        handled = true;
+    }
+    if let Some(tx) = &state.hooks.command_tx {
+        if tx.send(ControlCommand::ClearHistory).await.is_ok() {
+            handled = true;
+        }
+    }
+    if handled {
+        (StatusCode::OK, no_store(), Json(json!({ "ok": true }))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            no_store(),
+            Json(json!({ "error": "history_unavailable" })),
+        )
+            .into_response()
+    }
 }
 
 /// 监控端点被缓存没有任何好处（`fetch` 默认会走 HTTP 缓存），显式禁掉。
@@ -176,6 +623,8 @@ fn status_body(state: &ControlState) -> Value {
         "pid": std::process::id(),
         "uptime_s": state.started_at.elapsed().as_secs(),
         "config": state.config_path.as_ref().map(|p| p.display().to_string()),
+        "phase": state.telemetry.phase().as_str(),
+        "last_turn": state.telemetry.last_turn(),
         "socket": {
             "path": state.socket.path().display().to_string(),
             "owned": state.socket.still_owned(),
@@ -253,6 +702,7 @@ mod tests {
             liveness,
             started_at: Instant::now(),
             config_path: None,
+            telemetry: RuntimeTelemetry::default(),
         })
     }
 
@@ -369,14 +819,53 @@ mod tests {
 
         // 除了面板，**每一条**路由都必须要求鉴权。这是路由级断言：
         // 新增端点忘了挂 layer 会直接红。
-        for path in ["/health", "/status"] {
-            let unauth = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
+        let client = reqwest::Client::new();
+        for path in ["/health", "/status", "/music/status"] {
+            let unauth = client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .send()
                 .await
                 .unwrap();
-            assert_eq!(unauth.status(), 401, "{path} 无令牌必须 401");
+            assert_eq!(unauth.status(), 401, "GET {path} 无令牌必须 401");
+        }
+        for path in [
+            "/stop",
+            "/speak",
+            "/chat",
+            "/reload",
+            "/volume",
+            "/music/stop",
+            "/music/pause",
+            "/music/resume",
+            "/music/next",
+            "/music/previous",
+            "/history/clear",
+        ] {
+            let unauth = client
+                .post(format!("http://127.0.0.1:{port}{path}"))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unauth.status(), 401, "POST {path} 无令牌必须 401");
         }
 
-        let authed = reqwest::Client::new()
+        // 状态变更端点绝不允许 GET（防 CSRF），哪怕带了合法令牌也必须 405 Method Not Allowed。
+        for path in ["/stop", "/speak", "/volume", "/reload", "/history/clear"] {
+            let get_mut = client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .bearer_auth("s3cret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                get_mut.status(),
+                405,
+                "GET {path} 必须 405 Method Not Allowed"
+            );
+        }
+
+        let authed = client
             .get(format!("http://127.0.0.1:{port}/health"))
             .bearer_auth("s3cret")
             .send()
@@ -432,11 +921,26 @@ mod tests {
         cleanup(&state);
     }
 
-    /// `/status` 除了健康字段，还要给出排查用的 pid（与健康判据无关，单独一条）。
+    /// `/status` 除了健康字段，还要给出排查用的 pid、阶段与最近一轮耗时（与健康判据无关，单独一条）。
     #[test]
-    fn status_reports_the_process_id() {
+    fn status_reports_the_process_id_and_telemetry() {
         let state = state_with_ownership("t", unattributed());
-        assert_eq!(status_body(&state)["pid"], std::process::id());
+        state.telemetry.set_phase(AgentPhase::Thinking);
+        state.telemetry.record_turn(TurnLatencySnapshot {
+            turn_id: 9,
+            asr_ms: 420,
+            llm_ttft_ms: Some(610),
+            llm_total_ms: 1300,
+            tts_ms: 950,
+            e2e_first_audio_ms: Some(1150),
+        });
+        let body = status_body(&state);
+        assert_eq!(body["pid"], std::process::id());
+        assert_eq!(body["phase"], "thinking");
+        assert_eq!(body["last_turn"]["turn_id"], 9);
+        assert_eq!(body["last_turn"]["asr_ms"], 420);
+        assert_eq!(body["last_turn"]["llm_ttft_ms"], 610);
+        assert_eq!(body["last_turn"]["e2e_first_audio_ms"], 1150);
     }
 
     /// 判据二：inode 换成了原生的（被让位/被抢回）→ 503。
@@ -505,5 +1009,253 @@ mod tests {
         for host in ["0.0.0.0", "192.168.1.181", "[::]"] {
             assert!(!is_loopback(host), "{host} 不该判为回环");
         }
+    }
+
+    async fn test_audio_and_config(
+        shell: Arc<crate::shell::RecordingShell>,
+    ) -> (AudioCoordinator, ConfigHandle, Arc<MusicService>) {
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.airplay.enabled = false;
+        cfg.tts.provider = crate::config::TtsProvider::Native;
+        let config_handle = ConfigHandle::new(Arc::new(cfg.clone()));
+        let device = crate::device::Device::with_runner(cfg.device.clone(), shell);
+        let playback = Arc::new(crate::tts::PlaybackGate::default());
+        let tts = crate::tts::TtsRouter::new(device.clone(), playback.clone());
+        let music = Arc::new(MusicService::new(config_handle.clone(), device.clone()).unwrap());
+        let airplay = crate::airplay::AirPlayService::start(cfg.airplay)
+            .await
+            .unwrap();
+        let audio = AudioCoordinator::new(
+            device,
+            cfg.device,
+            playback,
+            tts,
+            music.clone(),
+            airplay,
+            RuntimeTelemetry::default(),
+            Arc::new(crate::tts::TtsHealth::default()),
+        );
+        (audio, config_handle, music)
+    }
+
+    async fn spawn_test_server_with_hooks(
+        token: &str,
+        hooks: ControlHooks,
+    ) -> (u16, Arc<ControlState>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = state_with_ownership(token, still_owned_socket(&format!("hooks-{port}")));
+        let app = build_router_with_hooks(state.clone(), hooks);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (port, state, handle)
+    }
+
+    #[tokio::test]
+    async fn post_stop_aborts_audio_and_emits_control_command() {
+        let shell = Arc::new(crate::shell::RecordingShell::always_ok());
+        let (audio, _cfg, _music) = test_audio_and_config(shell.clone()).await;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let hooks = ControlHooks {
+            command_tx: Some(cmd_tx),
+            audio: Some(audio.clone()),
+            ..ControlHooks::default()
+        };
+        let (port, state, handle) = spawn_test_server_with_hooks("tok", hooks).await;
+
+        let res = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/stop"))
+            .bearer_auth("tok")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["action"], "stop");
+        assert!(matches!(cmd_rx.try_recv(), Ok(ControlCommand::Stop)));
+        assert!(shell.count_matching("killall tts_play.sh miplayer") >= 1);
+
+        handle.abort();
+        cleanup(&state);
+    }
+
+    #[tokio::test]
+    async fn post_volume_validates_and_dispatches_actions() {
+        let shell = Arc::new(crate::shell::RecordingShell::always_ok());
+        let (audio, _cfg, _music) = test_audio_and_config(shell.clone()).await;
+        let hooks = ControlHooks {
+            audio: Some(audio),
+            ..ControlHooks::default()
+        };
+        let (port, state, handle) = spawn_test_server_with_hooks("tok", hooks).await;
+        let client = reqwest::Client::new();
+
+        for payload in [
+            json!({"action": "up"}),
+            json!({"action": "down"}),
+            json!({"action": "mute"}),
+            json!({"action": "set", "value": 50}),
+        ] {
+            let res = client
+                .post(format!("http://127.0.0.1:{port}/volume"))
+                .bearer_auth("tok")
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200, "payload={payload}");
+            let body: Value = res.json().await.unwrap();
+            assert_eq!(body["ok"], true);
+        }
+
+        assert_eq!(shell.count_matching("volume_up"), 1);
+        assert_eq!(shell.count_matching("volume_down"), 1);
+        assert_eq!(shell.count_matching("volume_set 0"), 1);
+        assert_eq!(shell.count_matching("volume_set 50"), 1);
+
+        for bad in [
+            json!({"action": "bogus"}),
+            json!({"action": "set"}),
+            json!({"action": "set", "value": 101}),
+            json!({"action": "set", "value": -1}),
+        ] {
+            let res = client
+                .post(format!("http://127.0.0.1:{port}/volume"))
+                .bearer_auth("tok")
+                .json(&bad)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 400, "bad payload={bad} must return 400");
+        }
+
+        handle.abort();
+        cleanup(&state);
+    }
+
+    #[tokio::test]
+    async fn post_speak_rejects_empty_and_accepts_valid_text() {
+        let shell = Arc::new(crate::shell::RecordingShell::always_ok());
+        let (audio, config, _music) = test_audio_and_config(shell.clone()).await;
+        let hooks = ControlHooks {
+            audio: Some(audio),
+            config: Some(config),
+            ..ControlHooks::default()
+        };
+        let (port, state, handle) = spawn_test_server_with_hooks("tok", hooks).await;
+        let client = reqwest::Client::new();
+
+        let empty = client
+            .post(format!("http://127.0.0.1:{port}/speak"))
+            .bearer_auth("tok")
+            .json(&json!({"text": "   "}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), 400, "空文本必须返回 400");
+
+        let ok = client
+            .post(format!("http://127.0.0.1:{port}/speak"))
+            .bearer_auth("tok")
+            .json(&json!({"text": "你好小爱"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 200);
+        let body: Value = ok.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert!(shell.count_matching("你好小爱") >= 1);
+
+        handle.abort();
+        cleanup(&state);
+    }
+
+    #[tokio::test]
+    async fn post_history_clear_reload_chat_and_music_endpoints_work() {
+        let shell = Arc::new(crate::shell::RecordingShell::always_ok());
+        let (audio, _config, music) = test_audio_and_config(shell.clone()).await;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+        let (reload_tx, mut reload_rx) = mpsc::channel(4);
+        let hooks = ControlHooks {
+            command_tx: Some(cmd_tx),
+            audio: Some(audio),
+            music: Some(music),
+            reload_tx: Some(reload_tx),
+            ..ControlHooks::default()
+        };
+        let (port, state, handle) = spawn_test_server_with_hooks("tok", hooks).await;
+        let client = reqwest::Client::new();
+
+        // /history/clear
+        let res = client
+            .post(format!("http://127.0.0.1:{port}/history/clear"))
+            .bearer_auth("tok")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.json::<Value>().await.unwrap()["ok"], true);
+        assert!(matches!(cmd_rx.try_recv(), Ok(ControlCommand::ClearHistory)));
+
+        // /reload
+        let res = client
+            .post(format!("http://127.0.0.1:{port}/reload"))
+            .bearer_auth("tok")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert!(reload_rx.try_recv().is_ok());
+
+        // /chat empty -> 400, valid -> 200
+        let empty_chat = client
+            .post(format!("http://127.0.0.1:{port}/chat"))
+            .bearer_auth("tok")
+            .json(&json!({"text": ""}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty_chat.status(), 400);
+
+        let ok_chat = client
+            .post(format!("http://127.0.0.1:{port}/chat"))
+            .bearer_auth("tok")
+            .json(&json!({"text": "今天天气怎么样"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_chat.status(), 200);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(ControlCommand::Chat(ref text)) if text == "今天天气怎么样"
+        ));
+
+        // GET /music/status + POST /music/stop
+        let ms = client
+            .get(format!("http://127.0.0.1:{port}/music/status"))
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ms.status(), 200);
+        assert_eq!(ms.json::<Value>().await.unwrap()["playing"], false);
+
+        let mstop = client
+            .post(format!("http://127.0.0.1:{port}/music/stop"))
+            .bearer_auth("tok")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mstop.status(), 200);
+        assert_eq!(mstop.json::<Value>().await.unwrap()["stopped"], true);
+
+        handle.abort();
+        cleanup(&state);
     }
 }

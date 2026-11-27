@@ -170,6 +170,46 @@
   .tokrow input:focus-visible { outline: 2px solid var(--ok); outline-offset: 1px; }
   .hint { margin: 0; font-size: 12px; line-height: 1.55; color: var(--fg-3); }
 
+  .ctl {
+    margin-top: 12px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .ctl-head {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+    margin-bottom: 10px;
+  }
+  .ctl-head h2 { margin: 0; font-size: 13.5px; font-weight: 600; color: var(--fg-2); }
+  .toast {
+    font-size: 12px; color: var(--fg-3);
+    min-height: 1.2em; text-align: right;
+  }
+  .toast[data-tone="ok"]  { color: var(--ok); }
+  .toast[data-tone="bad"] { color: var(--bad); }
+
+  .ctl-group { margin-top: 10px; }
+  .ctl-group:first-of-type { margin-top: 0; }
+  .ctl-label { font-size: 11.5px; color: var(--fg-3); margin-bottom: 6px; }
+  .btnrow { display: flex; gap: 7px; flex-wrap: wrap; }
+  .btn-danger { border-color: var(--bad); color: var(--bad); }
+  .btn-danger:hover { background: var(--bad-bg); color: var(--bad); }
+  .btn-accent { border-color: var(--ok); color: var(--ok); }
+  .btn-accent:hover { background: var(--ok-bg); color: var(--ok); }
+
+  .sayrow { display: flex; gap: 8px; flex-wrap: wrap; }
+  .sayrow input {
+    flex: 1 1 200px; min-width: 0;
+    font: inherit; font-size: 13px;
+    padding: 8px 11px;
+    border: 1px solid var(--line-strong);
+    border-radius: 9px;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  .sayrow input:focus-visible { outline: 2px solid var(--ok); outline-offset: 1px; }
+
   footer.foot {
     display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap;
     margin-top: 14px;
@@ -217,6 +257,51 @@
     <div class="fact"><dt>异常重启</dt><dd id="fRestarts">—</dd></div>
   </dl>
 
+  <section class="ctl" aria-label="快捷控制">
+    <div class="ctl-head">
+      <h2>快捷控制</h2>
+      <span class="toast" id="ctlToast" aria-live="polite"></span>
+    </div>
+
+    <div class="ctl-group">
+      <div class="ctl-label">常用操作</div>
+      <div class="btnrow">
+        <button type="button" class="btn btn-danger" id="stopBtn">停止播报/音乐</button>
+        <button type="button" class="btn" id="clearHistBtn">清空记忆</button>
+        <button type="button" class="btn" id="reloadBtn">热重载配置</button>
+      </div>
+    </div>
+
+    <div class="ctl-group">
+      <div class="ctl-label">音量调节</div>
+      <div class="btnrow">
+        <button type="button" class="btn" id="volDownBtn">-</button>
+        <button type="button" class="btn" id="volUpBtn">+</button>
+        <button type="button" class="btn" id="volMuteBtn">静音</button>
+      </div>
+    </div>
+
+    <div class="ctl-group">
+      <div class="ctl-label">文字发送 / 播报</div>
+      <div class="sayrow">
+        <input id="sayInput" type="text" autocomplete="off" aria-label="文字内容" placeholder="输入对话内容或直接播报的文本">
+        <button type="button" class="btn btn-accent" id="chatBtn">对话测试</button>
+        <button type="button" class="btn" id="speakBtn">直接播报</button>
+      </div>
+    </div>
+
+    <div class="ctl-group">
+      <div class="ctl-label">音乐控制</div>
+      <div class="btnrow">
+        <button type="button" class="btn" id="musicPrevBtn">上一首</button>
+        <button type="button" class="btn" id="musicPauseBtn">暂停</button>
+        <button type="button" class="btn" id="musicResumeBtn">继续</button>
+        <button type="button" class="btn" id="musicNextBtn">下一首</button>
+        <button type="button" class="btn" id="musicStopBtn">停止</button>
+      </div>
+    </div>
+  </section>
+
   <details class="fold" id="diagFold">
     <summary>诊断与原始数据<span class="count" id="diagCount">—</span></summary>
     <div class="foldbody">
@@ -224,6 +309,8 @@
         <div><dt>socket</dt><dd id="dSocket">—</dd></div>
         <div><dt>归属</dt><dd id="dOwned">—</dd></div>
         <div><dt>pid</dt><dd id="dPid">—</dd></div>
+        <div><dt>状态阶段</dt><dd id="dPhase">—</dd></div>
+        <div><dt>末轮耗时</dt><dd id="dLatency">—</dd></div>
         <div><dt>配置文件</dt><dd id="dConfig">—</dd></div>
         <div><dt>本次往返</dt><dd id="dRtt">—</dd></div>
       </dl>
@@ -380,6 +467,18 @@
     $("dSocket").textContent = so.path || "—";
     $("dOwned").textContent = so.owned === true ? "归本进程" : (so.owned === false ? "不在本进程" : "未知");
     $("dPid").textContent = (sb.pid === null || sb.pid === undefined) ? "—" : String(sb.pid);
+    $("dPhase").textContent = sb.phase || "—";
+    if (sb.last_turn) {
+      var lt = sb.last_turn;
+      var parts = ["ASR " + lt.asr_ms + "ms"];
+      if (lt.llm_ttft_ms !== null && lt.llm_ttft_ms !== undefined) parts.push("首字 " + lt.llm_ttft_ms + "ms");
+      parts.push("LLM " + lt.llm_total_ms + "ms");
+      parts.push("TTS " + lt.tts_ms + "ms");
+      if (lt.e2e_first_audio_ms !== null && lt.e2e_first_audio_ms !== undefined) parts.push("出声 " + lt.e2e_first_audio_ms + "ms");
+      $("dLatency").textContent = parts.join(" · ");
+    } else {
+      $("dLatency").textContent = "—";
+    }
     $("dConfig").textContent = sb.config || "—";
     $("dRtt").textContent = (snapshot && snapshot.rtt !== null && snapshot.rtt !== undefined)
       ? snapshot.rtt + " ms（页面侧计时）" : "—";
@@ -588,6 +687,119 @@
       run.nextDelay = BASE_MS;
       poll();
     }
+  });
+
+  var toastTimer = null;
+  function showToast(msg, tone) {
+    var el = $("ctlToast");
+    el.textContent = msg;
+    if (tone) {
+      el.setAttribute("data-tone", tone);
+    } else {
+      el.removeAttribute("data-tone");
+    }
+    clearTimeout(toastTimer);
+    if (msg) {
+      toastTimer = setTimeout(function () {
+        el.textContent = "";
+        el.removeAttribute("data-tone");
+      }, 4500);
+    }
+  }
+
+  function postAction(path, payload, okLabel) {
+    showToast("正在执行…", "");
+    var opts = {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + token(),
+        "Content-Type": "application/json"
+      },
+      cache: "no-store",
+      body: JSON.stringify(payload || {})
+    };
+    return fetch(path, opts).then(function (res) {
+      return res.text().then(function (text) {
+        var body = null;
+        try { body = JSON.parse(text); } catch (e) { body = null; }
+        if (res.status === 401) {
+          showToast("令牌被拒（401），请检查访问令牌", "bad");
+          $("tokenFold").open = true;
+          return { ok: false, status: 401, body: body };
+        }
+        if (!res.ok || (body && body.error)) {
+          var reason = (body && body.error) ? body.error : ("HTTP " + res.status);
+          showToast("操作失败：" + reason, "bad");
+          return { ok: false, status: res.status, body: body };
+        }
+        var extra = (body && body.reply) ? ("：" + String(body.reply).slice(0, 28)) : "";
+        showToast(okLabel + extra, "ok");
+        return { ok: true, status: res.status, body: body };
+      });
+    }, function (err) {
+      showToast("请求失败：" + netReason(err), "bad");
+      return { ok: false, status: 0, body: null };
+    });
+  }
+
+  $("stopBtn").addEventListener("click", function () {
+    postAction("/stop", {}, "已停止播报与音乐");
+  });
+  $("clearHistBtn").addEventListener("click", function () {
+    postAction("/history/clear", {}, "已清空对话记忆");
+  });
+  $("reloadBtn").addEventListener("click", function () {
+    postAction("/reload", {}, "已触发热重载配置");
+  });
+
+  $("volDownBtn").addEventListener("click", function () {
+    postAction("/volume", { action: "down" }, "音量已降低");
+  });
+  $("volUpBtn").addEventListener("click", function () {
+    postAction("/volume", { action: "up" }, "音量已提高");
+  });
+  $("volMuteBtn").addEventListener("click", function () {
+    postAction("/volume", { action: "mute" }, "已静音");
+  });
+
+  function sendText(path, okLabel) {
+    var text = ($("sayInput").value || "").trim();
+    if (!text) {
+      showToast("请输入内容", "bad");
+      $("sayInput").focus();
+      return;
+    }
+    postAction(path, { text: text }, okLabel).then(function (r) {
+      if (r.ok) $("sayInput").value = "";
+    });
+  }
+  $("chatBtn").addEventListener("click", function () {
+    sendText("/chat", "已发送对话");
+  });
+  $("speakBtn").addEventListener("click", function () {
+    sendText("/speak", "已提交播报");
+  });
+  $("sayInput").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      $("chatBtn").click();
+    }
+  });
+
+  $("musicPrevBtn").addEventListener("click", function () {
+    postAction("/music/previous", {}, "已切换上一首");
+  });
+  $("musicPauseBtn").addEventListener("click", function () {
+    postAction("/music/pause", {}, "已暂停音乐");
+  });
+  $("musicResumeBtn").addEventListener("click", function () {
+    postAction("/music/resume", {}, "已继续播放");
+  });
+  $("musicNextBtn").addEventListener("click", function () {
+    postAction("/music/next", {}, "已切换下一首");
+  });
+  $("musicStopBtn").addEventListener("click", function () {
+    postAction("/music/stop", {}, "已停止音乐");
   });
 
   // 切到后台就停：手机锁屏、笔记本合盖再挂着，会白白往设备上打请求。

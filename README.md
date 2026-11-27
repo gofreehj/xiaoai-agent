@@ -9,7 +9,11 @@
 
 运行在小爱音箱端侧的独立语音 Agent。仅需配置外部 ASR 与大模型服务 API，即可在音箱端侧完成唤醒、ASR、LLM 对话、工具调用和 TTS 回复。
 与 Open-XiaoAI 和 [MiGPT](https://github.com/idootop/mi-gpt) 项目不同，XiaoAI Agent 无需部署专门的服务端运行 Agent，也不会与原生小爱同学抢麦、抢答或触发小米云端控制。
-目前仅在 Xiaomi 智能音箱 Pro（OH2P）固件 `1.62.2` 上测试成功，其他型号和固件版本需要自行适配并承担风险。
+目前已在以下机型和固件版本上完整测试通过：
+- **小爱音箱 Pro（LX06）** 官方固件 `1.94.13` —— 提供 **[小白保姆级刷机与部署指南](./deploy/lx06/FLASH_GUIDE.md)**（开箱即用，免编译免虚拟机）
+- **Xiaomi 智能音箱 Pro（OH2P）** 官方固件 `1.62.2` —— 详细记录见 [OH2P 构建记录](./deploy/OH2P_1.62.2_BUILD_NOTES.md)
+
+其他型号和固件版本需要自行适配并承担风险。
 
 https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 
@@ -19,26 +23,47 @@ https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 > 不依赖 `speech.usock`；本 agent 恰恰依赖固件原生语音前端送出的 `speech.usock`。
 > 换机型前先按 [docs/models.md](docs/models.md) 的 6 条前提自查。
 
-- 完全接管语音对话流程：为了避免和原生小爱同学抢麦、抢答或触发小米云端控制，本项目会将原生小爱的麦克风输入静音，真实麦克风音频由 `xiaoai-agent` 接管，使用音箱系统 TTS 命令播报回复。
-- 无需单独搭建服务器：Agent 直接运行在音箱上，不再依赖独立的 WebSocket 消息桥接层。
-- 复用设备原生音频能力：使用固件内置的常驻唤醒和 VPM 音频回调机制，音频体验完美；支持连续对话、VAD、中途打断、回声消除、播放时录音。
-- 支持工具和设备控制：使用现代 Agent 框架支撑，内置时间、天气、网络搜索、Navidrome 音乐播放工具，并可通过 Home Assistant MCP 控制智能家居。
-- 支持 AirPlay 音频输出：音箱可以作为 AirPlay 音频接收端，播放来自 iPhone、iPad、Mac 等设备的音频流。
-- 保留音箱其它系统能力：麦克风输入会被 `xiaoai-agent` 接管，但蓝牙网关等非语音对话服务不受到影响，且 LED 指示灯动态可以自定义控制。
+- **双模式一等支持（`runtime.mode`，全模式单二进制直跑）**：
+  - `exclusive`（独占接管）：静音原生小爱输入，由 `xiaoai-agent` 完全接管真实麦克风与对话闭环，不抢答、不误触小米云端控制。
+  - `dual`（外部 KWS 双助手共存）：保留原生小爱处理闹钟、倒计时与米家日常，同时由音箱端内置采集通过通用 [UDP XPCM 协议](./docs/external-kws-protocol.md)接入任意外部 KWS 服务（NAS / Docker / 树莓派 / PC / [红米 AX5](./deploy/kws-server/ax5/README.md)），用自定义唤醒词唤起大模型深度对话；仅需一份 `agent.yaml` 填写 `dual.kws.endpoint` 即可切换，零额外中继进程。
+- 无需单独搭建 Agent 后端：主程序直接运行在音箱端侧，仅需配置外部 ASR 与 LLM API；支持自适应底噪 VAD、1.2s 思考提示音、流式分句 TTS 与零延迟本地语音音量/媒体控制。
+- 复用设备原生音频能力：使用固件内置的常驻唤醒和 VPM 音频回调机制，支持连续对话、VAD、中途打断、回声消除与外部 TTS 播放期间的静音窗口防自回声。
+- 支持工具、控制面与设备能力：内置时间、天气、网络搜索、Navidrome 音乐播放工具（含播完自动切歌），支持 Home Assistant MCP、AirPlay 音频输出与带 Bearer 鉴权的本地 HTTP 控制面 / Web 面板（详见 [docs/control-api.md](docs/control-api.md)）。
+- 保留音箱其它系统能力：蓝牙网关等非语音对话服务不受影响，LED 指示灯动态可自定义控制。
+
+## 文档导航（单一信息源）
+
+| 文档 | 内容 |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | 模块化架构、双模式交互流水线、打断/静音窗口、热重载与自检设计 |
+| [docs/external-kws-protocol.md](docs/external-kws-protocol.md) | `dual` 模式通用外部 KWS 协议规范（UDP XPCM），支持自建 NAS/Docker/路由器唤醒服务 |
+| [docs/models.md](docs/models.md) | 机型支持矩阵（LX06 / OH2P）、硬件差异与换机型 6 项前提自查 |
+| [docs/control-api.md](docs/control-api.md) | 本地控制面 HTTP API、鉴权规则、Web 面板与 `doctor` 诊断 |
+| [deploy/lx06/README.md](deploy/lx06/README.md) | LX06 刷机、打包、回滚红线与保姆级指南入口 |
+| [deploy/kws-server/python/README.md](deploy/kws-server/python/README.md) | `dual` 通用参考实现：Python / Docker Sherpa-ONNX 唤醒服务端 |
+| [deploy/kws-server/ax5/README.md](deploy/kws-server/ax5/README.md) | `dual` 参考实现之一：红米 AX5 路由器 Sherpa-ONNX 唤醒服务端 |
+| [AGENTS.md](AGENTS.md) | 面向开发与 AI Coding Agent 的全仓工程不变量与测试纪律 |
 
 ## 代码结构
 
 ```text
 .
-├── xiaoai-agent/              # Rust 编写的音箱端 Agent
+├── xiaoai-agent/              # Rust 编写的音箱端单二进制 Agent（frontend/audio/session/brain/control/runtime）
+├── docs/                      # 权威文档（architecture / external-kws-protocol / models / control-api）
+├── deploy/kws-server/         # 通用外部 KWS 参考服务端（python/ Docker 通用版 · ax5/ 路由器版）
+├── deploy/lx06/               # LX06（小爱音箱 Pro）刷机指南、补丁、构建脚本与模板
 ├── deploy/client-patch/       # 用于制作带 SSH 和启动钩子的补丁固件
 ├── deploy/flash-tool/         # macOS 刷机辅助工具
 ├── deploy/OH2P_1.62.2_BUILD_NOTES.md # OH2P 构建踩坑记录
 ├── upstream-open-xiaoai/      # 上游 Open-XiaoAI 快照说明和许可证
-└── AGENTS.md                  # README 的工程补充说明
+└── AGENTS.md                  # 工程不变量与测试规范
 ```
 
 `deploy/client-patch/`、`deploy/flash-tool/` 和 `upstream-open-xiaoai/` 主要来自其它开源项目。
+
+LX06 机型走独立目录 [`deploy/lx06/`](./deploy/lx06/README.md)：规格、补丁、构建脚本和运行时模板
+各自自包含，不改动本仓库其它机型的默认配置。同步上游与 CocoJiao fork 的约定见
+[`deploy/lx06/UPSTREAM.md`](./deploy/lx06/UPSTREAM.md)。
 
 ## 使用流程
 
@@ -141,11 +166,17 @@ kill -HUP "$(cat /tmp/xiaoai-agent/xiaoai-agent.pid)"
 
 生效范围：
 
-- **立即生效（下一轮对话开始用新值）**：`llm`、`agent`、`music`、`capture`、`tts`、`runtime.session_idle_timeout_s`、`mcp`
-- **需要重启**：`device`（TTS 命令模板、命令超时、LED id）、`asr`、`airplay`。这几段在启动时就被各组件快照下来了，热加载只会在日志里告警「需重启」，实际沿用旧值——不会出现「模板还是旧命令、ID 是新值」这种半套配置
+- **立即生效（下一轮对话开始用新值）**：`llm`、`agent`、`music`、`capture`、`tts`、`runtime.session_idle_timeout_s`、`mcp`、`dual.{enter_prompt,exit_prompt,*_earcon,session_timeout_s,exit_keywords}`
+- **需要重启**：`device`（TTS 命令模板、命令超时、LED id）、`asr`、`airplay`、`server`、`runtime.mode`、`dual.kws`、`dual.capture`。这几段在启动时就被各组件快照下来了，热加载只会在日志里告警「需重启」，实际沿用旧值——不会出现「模板还是旧命令、ID 是新值」这种半套配置
 - **拒绝**：`runtime.speech_socket`。运行中换 socket 会让 mipns 和 agent 各说各话，只告警不改
 
-配置文件写坏（YAML 语法错）时**保留旧配置继续跑**，只在日志里报错——一次误编辑不该让音箱变哑。热加载的具体分类见 [AGENTS.md](./AGENTS.md) 的 "Configuration Hot Reload"。
+配置文件写坏（YAML 语法错）时**保留旧配置继续跑**，只在日志里报错——一次误编辑不该让音箱变哑。在首次启动或改完配置后，也可执行自检命令提前排查配置告警、`/tmp` 空间与上游连通性：
+
+```sh
+/data/open-xiaoai/xiaoai-agent doctor -c /data/open-xiaoai/agent.yaml
+```
+
+热加载与架构边界详见 [docs/architecture.md](./docs/architecture.md) 与 [AGENTS.md](./AGENTS.md)。
 
 #### Home Assistant MCP（推荐 HA-MCP）
 

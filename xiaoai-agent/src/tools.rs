@@ -1,6 +1,6 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Context;
 use chrono::Datelike;
 use chrono_tz::Tz;
 use rig_core::completion::ToolDefinition;
@@ -8,9 +8,11 @@ use rig_core::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tracing::warn;
 
-use crate::agent::AgentControl;
-use crate::config::{timeout_duration, AppConfig};
+use crate::agent::{AgentControl, ToolFailureInfo};
+use crate::config::AppConfig;
 use crate::music::MusicService;
 use crate::weather::WeatherService;
 
@@ -156,12 +158,14 @@ impl Tool for GetCurrentTime {
 #[derive(Clone)]
 pub struct GetWeather {
     service: WeatherService,
+    control: Arc<Mutex<AgentControl>>,
 }
 
 impl GetWeather {
-    pub fn new(config: Arc<AppConfig>) -> Self {
+    pub fn new(config: Arc<AppConfig>, control: Arc<Mutex<AgentControl>>) -> Self {
         Self {
             service: WeatherService::new(config),
+            control,
         }
     }
 }
@@ -191,26 +195,97 @@ impl Tool for GetWeather {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        Ok(as_json_text(
-            self.service
-                .get_weather(args.location.as_deref().unwrap_or(""))
-                .await,
-        ))
+        let value = self
+            .service
+            .get_weather(args.location.as_deref().unwrap_or(""))
+            .await;
+        if let Some(err_msg) = value.get("error").and_then(Value::as_str) {
+            let is_timeout = err_msg.to_ascii_lowercase().contains("timed out")
+                || err_msg.contains("超时");
+            self.control.lock().await.last_tool_error = Some(ToolFailureInfo {
+                tool: "get_weather",
+                message: err_msg.to_string(),
+                is_timeout,
+            });
+        } else {
+            self.control.lock().await.last_tool_error = None;
+        }
+        Ok(as_json_text(value))
     }
 }
+
+const WEB_SEARCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const WEB_SEARCH_MAX_RETRIES: usize = 2;
 
 #[derive(Clone)]
 pub struct WebSearch {
     config: Arc<AppConfig>,
     client: reqwest::Client,
+    control: Arc<Mutex<AgentControl>>,
 }
 
 impl WebSearch {
-    pub fn new(config: Arc<AppConfig>) -> Self {
+    pub fn new(config: Arc<AppConfig>, control: Arc<Mutex<AgentControl>>) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(WEB_SEARCH_CONNECT_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             config,
-            client: reqwest::Client::new(),
+            client,
+            control,
         }
+    }
+
+    async fn search_once(
+        &self,
+        url: &str,
+        api_key: &str,
+        request: &Map<String, Value>,
+        attempt_timeout: Duration,
+    ) -> Result<Value, (bool, bool, anyhow::Error)> {
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(api_key)
+            .json(request)
+            .timeout(attempt_timeout)
+            .send()
+            .await
+            .map_err(|err| {
+                let is_timeout = err.is_timeout() || err.is_connect();
+                (
+                    true,
+                    is_timeout,
+                    anyhow::Error::new(err).context("Tavily search request failed"),
+                )
+            })?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|err| {
+            let is_timeout = err.is_timeout();
+            (
+                true,
+                is_timeout,
+                anyhow::Error::new(err).context("failed to read Tavily search response"),
+            )
+        })?;
+        if !status.is_success() {
+            let retryable =
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            return Err((
+                retryable,
+                false,
+                anyhow::anyhow!(
+                    "Tavily search request failed with status {status}: {}",
+                    truncate_chars(&body, 300)
+                ),
+            ));
+        }
+        serde_json::from_str(&body)
+            .map_err(|err| (false, false, anyhow::Error::new(err).context("invalid Tavily search response JSON")))
     }
 }
 
@@ -284,35 +359,59 @@ impl Tool for WebSearch {
             );
         }
 
-        let response = self
-            .client
-            .post(settings.tavily_url.trim())
-            .bearer_auth(settings.api_key.trim())
-            .json(&request)
-            .timeout(timeout_duration(settings.timeout_s))
-            .send()
-            .await
-            .context("Tavily search request failed")?;
+        let attempt_timeout = Duration::from_secs_f64(settings.timeout_s.clamp(0.5, 12.0));
+        let mut last_err: Option<(bool, anyhow::Error)> = None;
 
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .context("failed to read Tavily search response")?;
-        if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "Tavily search request failed with status {status}: {}",
-                truncate_chars(&body, 300)
-            )
-            .into());
+        for attempt in 0..=WEB_SEARCH_MAX_RETRIES {
+            match self
+                .search_once(
+                    settings.tavily_url.trim(),
+                    settings.api_key.trim(),
+                    &request,
+                    attempt_timeout,
+                )
+                .await
+            {
+                Ok(data) => {
+                    self.control.lock().await.last_tool_error = None;
+                    return Ok(as_json_text(summarize_tavily_response(
+                        query,
+                        data,
+                        max_results,
+                    )));
+                }
+                Err((retryable, is_timeout, err)) => {
+                    warn!(
+                        attempt = attempt + 1,
+                        max_attempts = WEB_SEARCH_MAX_RETRIES + 1,
+                        retryable,
+                        is_timeout,
+                        error = %err,
+                        "web_search 请求失败"
+                    );
+                    last_err = Some((is_timeout, err));
+                    if !retryable || attempt == WEB_SEARCH_MAX_RETRIES {
+                        break;
+                    }
+                    sleep(Duration::from_millis(80)).await;
+                }
+            }
         }
-        let data: Value =
-            serde_json::from_str(&body).context("invalid Tavily search response JSON")?;
-        Ok(as_json_text(summarize_tavily_response(
-            query,
-            data,
-            max_results,
-        )))
+
+        let (is_timeout, err) =
+            last_err.unwrap_or_else(|| (false, anyhow::anyhow!("Tavily search request failed")));
+        let err_msg = err.to_string();
+        self.control.lock().await.last_tool_error = Some(ToolFailureInfo {
+            tool: "web_search",
+            message: err_msg.clone(),
+            is_timeout,
+        });
+        // 返回结构化工具错误而不是抛出 Err，避免 rig 多轮重试死等超时后被误判成“大模型异常”。
+        Ok(as_json_text(json!({
+            "error": err_msg,
+            "tool": "web_search",
+            "timeout": is_timeout,
+        })))
     }
 }
 
@@ -661,10 +760,10 @@ mod tests {
             GetCurrentTime::new(config.clone())
                 .definition(String::new())
                 .await,
-            GetWeather::new(config.clone())
+            GetWeather::new(config.clone(), control.clone())
                 .definition(String::new())
                 .await,
-            WebSearch::new(config.clone())
+            WebSearch::new(config.clone(), control.clone())
                 .definition(String::new())
                 .await,
             EndConversation::new(control)
@@ -783,5 +882,105 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn web_search_retries_after_timeout_and_succeeds() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Attempt 1: accept and hold open past 0.6s attempt timeout without replying
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(900), async {
+                let mut buf = [0u8; 512];
+                let _ = s1.read(&mut buf).await;
+                sleep(Duration::from_millis(850)).await;
+            })
+            .await;
+
+            // Attempt 2: return 200 OK JSON cleanly
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = s2.read(&mut buf).await;
+            let body = r#"{"answer":"ok","results":[{"title":"T","url":"https://e.com","content":"hello"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s2.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let mut cfg = (*example_config()).clone();
+        cfg.agent.web_search.enabled = true;
+        cfg.agent.web_search.api_key = "test-key".into();
+        cfg.agent.web_search.tavily_url = format!("http://{addr}/search");
+        cfg.agent.web_search.timeout_s = 0.6;
+        let control = Arc::new(Mutex::new(AgentControl::default()));
+        let tool = WebSearch::new(Arc::new(cfg), control.clone());
+
+        let out = tool
+            .call(WebSearchArgs {
+                query: "天气".into(),
+                topic: String::new(),
+                time_range: String::new(),
+                max_results: Some(1),
+            })
+            .await
+            .expect("retry should recover after 1st timeout");
+
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["answer"], "ok");
+        assert!(control.lock().await.last_tool_error.is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_search_records_tool_timeout_error_instead_of_throwing() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            // Drop every request without responding or let it exceed 0.5s timeout 3 times
+            let mut held = Vec::new();
+            for _ in 0..3 {
+                if let Ok((sock, _)) = listener.accept().await {
+                    held.push(sock);
+                }
+            }
+            sleep(Duration::from_secs(2)).await;
+        });
+
+        let mut cfg = (*example_config()).clone();
+        cfg.agent.web_search.enabled = true;
+        cfg.agent.web_search.api_key = "test-key".into();
+        cfg.agent.web_search.tavily_url = format!("http://{addr}/search");
+        cfg.agent.web_search.timeout_s = 0.5;
+        let control = Arc::new(Mutex::new(AgentControl::default()));
+        let tool = WebSearch::new(Arc::new(cfg), control.clone());
+
+        let out = tool
+            .call(WebSearchArgs {
+                query: "限行".into(),
+                topic: String::new(),
+                time_range: String::new(),
+                max_results: None,
+            })
+            .await
+            .expect("should return structured JSON tool error");
+
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["tool"], "web_search");
+        assert_eq!(parsed["timeout"], true);
+        let recorded = control.lock().await.last_tool_error.clone().unwrap();
+        assert_eq!(recorded.tool, "web_search");
+        assert!(recorded.is_timeout);
+        server.abort();
     }
 }

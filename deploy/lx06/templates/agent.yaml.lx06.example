@@ -1,0 +1,86 @@
+# LX06 runtime template. Copy this file to agent.yaml on the speaker and set
+# its permission to 0600. Values below are literals: the Agent does not expand
+# ${ENV}; edit the API-key fields on the device instead of committing secrets.
+runtime:
+  # mode: exclusive（独占接管原生小爱）| dual（保留原生小爱 + 外部 KWS 服务）
+  mode: exclusive
+  speech_socket: /tmp/mico_aivs_lab/usock/speech.usock
+  session_idle_timeout_s: 20
+
+# 若使用 dual 双助手模式，取消下方注释并填写外部 KWS 服务地址（见 docs/external-kws-protocol.md）：
+# dual:
+#   kws:
+#     endpoint: "192.168.31.1:5005"
+#     ping_interval_s: 30
+#   # LX06 默认采集参数（无需修改，可省略）：device=noop, sample_rate=48000, channels=8, format=S32_LE, mic_channel=0, ref_channel=6, shift_bits=9
+#   enter_prompt: "我在，请讲"
+#   exit_prompt: "已退出对话模式，再见"
+#   session_timeout_s: 60
+
+device:
+  # LX06 tts_play.sh has no shebang, only consumes $1, and returns 1 when no music was playing prior to TTS.
+  # Do NOT wrap {text} in extra quotes: Device::run_template already applies shell_words::quote.
+  tts_command: "sh /usr/sbin/tts_play.sh {text}; true"
+  command_timeout_s: 30.0
+  play_url_command: "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &"
+  stop_audio_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
+  abort_command: "for p in /proc/[0-9]*; do [ -r \"$p/cmdline\" ] || continue; cmd=$(tr '\\0' ' ' <\"$p/cmdline\" 2>/dev/null); case \"$cmd\" in *tts_play.sh*) kill -9 \"${p#/proc/}\" 2>/dev/null || true ;; *miplayer*) case \"$cmd\" in *http://*|*https://*) ;; *) kill -9 \"${p#/proc/}\" 2>/dev/null || true ;; esac ;; esac; done; mphelper pause 2>/dev/null || true; ubus call mediaplayer media_control '{\"player\":\"mediaplayer\",\"action\":\"pause\",\"volume\":0}' 2>/dev/null || true; ubus call mediaplayer player_play_operation '{\"media\":\"app_ios\",\"action\":\"stop\"}' 2>/dev/null || true"
+  led_enabled: true
+  led_listening: 3
+  led_user_speaking: 4
+  led_thinking: 2
+  # 音量命令（默认值即 LX06 可用，需要时取消注释覆盖；{level} 为 0-100）：
+  # volume_up_command: "mphelper volume_up >/dev/null 2>&1 || true"
+  # volume_down_command: "mphelper volume_down >/dev/null 2>&1 || true"
+  # volume_set_command: "mphelper volume_set {level} >/dev/null 2>&1 || true"
+  # volume_mute_command: "mphelper volume_set 0 >/dev/null 2>&1 || true"
+  led_speaking: 5
+
+capture:
+  sample_rate: 16000
+  block_ms: 50
+  silence_ms: 800
+  cooldown_s: 0.3
+  # 自适应 VAD / 动态静音（默认开启，可省略；silence_ms 仍作为兜底）：
+  # adaptive_noise_floor: true
+  # noise_floor_multiplier: 2.5
+  # dynamic_silence: true
+  # short_utterance_silence_ms: 600
+  # long_utterance_silence_ms: 1050
+
+asr:
+  provider: open_ai
+  open_ai:
+    base_url: https://api.openai.com/v1
+    api_key: EMPTY
+    model: whisper-1
+    language: zh
+    timeout_s: 10   # 默认 10
+  # Optional streaming ASR (FunASR / OpenAI Realtime) for lower latency:
+  # provider: openai_realtime
+  # openai_realtime:
+  #   base_url: https://api.openai.com/v1
+  #   api_key: EMPTY
+  #   model: gpt-realtime-whisper
+  #   target_sample_rate: 16000
+
+llm:
+  protocol: open_ai_chat
+  base_url: https://api.openai.com/v1
+  api_key: EMPTY
+  model: gpt-5.4-mini
+  timeout_s: 20   # 默认 20；低于 10 会在启动时给出警告
+
+agent:
+  timezone: Asia/Shanghai
+  inject_current_time: true
+  weather:
+    # ipapi.co may return 403 on Cloudflare; ip-api.com works reliably in CN.
+    ip_lookup_url: "http://ip-api.com/json/?lang=zh-CN"
+
+tts:
+  provider: native
+  fallback_to_native: true
+  suppress_capture_while_playing: true
+  playback_tail_ms: 500
+  playback_startup_grace_ms: 3000

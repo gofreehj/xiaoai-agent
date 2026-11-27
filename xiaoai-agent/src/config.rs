@@ -23,6 +23,7 @@ pub struct AppConfig {
     pub airplay: AirPlayConfig,
     pub tts: TtsConfig,
     pub server: ServerConfig,
+    pub dual: DualKwsConfig,
 }
 
 impl AppConfig {
@@ -50,12 +51,16 @@ impl AppConfig {
             return;
         };
         resolve_optional_path(root, &mut self.music.netease.cookie_file);
+        resolve_optional_path(root, &mut self.dual.enter_earcon);
+        resolve_optional_path(root, &mut self.dual.exit_earcon);
+        resolve_optional_path(root, &mut self.dual.thinking_earcon);
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RuntimeConfig {
+    pub mode: String,
     pub speech_socket: String,
     pub session_idle_timeout_s: f64,
 }
@@ -63,10 +68,143 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            mode: "exclusive".to_string(),
             speech_socket: "/tmp/mico_aivs_lab/usock/speech.usock".to_string(),
             session_idle_timeout_s: 20.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DualKwsConfig {
+    pub kws: ExternalKwsConfig,
+    pub capture: DualCaptureConfig,
+    pub enter_prompt: String,
+    pub exit_prompt: String,
+    pub enter_earcon: Option<PathBuf>,
+    pub exit_earcon: Option<PathBuf>,
+    pub thinking_earcon: Option<PathBuf>,
+    pub session_timeout_s: u64,
+    pub exit_keywords: Vec<String>,
+}
+
+impl DualKwsConfig {
+    fn hot_view(
+        &self,
+    ) -> (
+        &String,
+        &String,
+        &Option<PathBuf>,
+        &Option<PathBuf>,
+        &Option<PathBuf>,
+        u64,
+        &Vec<String>,
+    ) {
+        (
+            &self.enter_prompt,
+            &self.exit_prompt,
+            &self.enter_earcon,
+            &self.exit_earcon,
+            &self.thinking_earcon,
+            self.session_timeout_s,
+            &self.exit_keywords,
+        )
+    }
+}
+
+impl Default for DualKwsConfig {
+    fn default() -> Self {
+        Self {
+            kws: ExternalKwsConfig::default(),
+            capture: DualCaptureConfig::default(),
+            enter_prompt: "我在，请讲".to_string(),
+            exit_prompt: "已退出对话模式，再见".to_string(),
+            enter_earcon: Some(PathBuf::from("enter_prompt.wav")),
+            exit_earcon: Some(PathBuf::from("exit_prompt.wav")),
+            thinking_earcon: Some(PathBuf::from("thinking_prompt.wav")),
+            session_timeout_s: 60,
+            exit_keywords: vec![
+                "退出".to_string(),
+                "再见".to_string(),
+                "退下".to_string(),
+                "闭嘴".to_string(),
+                "取消".to_string(),
+                "没事了".to_string(),
+                "结束对话".to_string(),
+                "结束".to_string(),
+                "关闭".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExternalKwsConfig {
+    /// 外部 UDP XPCM KWS 服务地址，例如 "192.168.31.1:5005"。
+    pub endpoint: String,
+    /// 待机期间 UDP PING 保活心跳间隔（秒）。
+    pub ping_interval_s: u64,
+}
+
+impl Default for ExternalKwsConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            ping_interval_s: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+pub enum DualCaptureFormat {
+    #[default]
+    #[serde(rename = "S32_LE", alias = "s32_le")]
+    S32Le,
+    #[serde(rename = "S16_LE", alias = "s16_le")]
+    S16Le,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DualCaptureConfig {
+    pub device: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub format: DualCaptureFormat,
+    pub mic_channel: u16,
+    pub ref_channel: Option<u16>,
+    pub shift_bits: u8,
+}
+
+impl Default for DualCaptureConfig {
+    fn default() -> Self {
+        Self {
+            device: "noop".to_string(),
+            sample_rate: 48_000,
+            channels: 8,
+            format: DualCaptureFormat::S32Le,
+            mic_channel: 0,
+            ref_channel: Some(6),
+            shift_bits: 9,
+        }
+    }
+}
+
+pub fn has_valid_host_port(endpoint: &str) -> bool {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Some((host, port_str)) = trimmed.rsplit_once(':') else {
+        return false;
+    };
+    let host = host.trim();
+    if host.is_empty() || (host.starts_with('[') != host.ends_with(']')) {
+        return false;
+    }
+    port_str.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +221,10 @@ pub struct DeviceConfig {
     pub duck_audio_command: String,
     pub unduck_audio_command: String,
     pub abort_command: String,
+    pub volume_up_command: String,
+    pub volume_down_command: String,
+    pub volume_set_command: String,
+    pub volume_mute_command: String,
     pub led_enabled: bool,
     pub led_listening: u8,
     pub led_user_speaking: u8,
@@ -113,6 +255,10 @@ impl Default for DeviceConfig {
                 "v=$(cat /tmp/xiaoai-mysoftvol.before 2>/dev/null); if [ -n \"$v\" ]; then amixer sset mysoftvol \"${v}%\" >/dev/null 2>&1 || true; fi; rm -f /tmp/xiaoai-mysoftvol.before"
                     .to_string(),
             abort_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause 2>/dev/null || true; ubus call mediaplayer media_control '{\"player\":\"mediaplayer\",\"action\":\"pause\",\"volume\":0}' 2>/dev/null || true; ubus call mediaplayer player_play_operation '{\"media\":\"app_ios\",\"action\":\"stop\"}' 2>/dev/null || true".to_string(),
+            volume_up_command: "mphelper volume_up >/dev/null 2>&1 || true".to_string(),
+            volume_down_command: "mphelper volume_down >/dev/null 2>&1 || true".to_string(),
+            volume_set_command: "mphelper volume_set {level} >/dev/null 2>&1 || true".to_string(),
+            volume_mute_command: "mphelper volume_set 0 >/dev/null 2>&1 || true".to_string(),
             led_enabled: true,
             led_listening: 3,
             led_user_speaking: 4,
@@ -135,6 +281,11 @@ pub struct CaptureConfig {
     pub max_utterance_s: f64,
     pub cooldown_s: f64,
     pub print_levels: bool,
+    pub adaptive_noise_floor: bool,
+    pub noise_floor_multiplier: f64,
+    pub dynamic_silence: bool,
+    pub short_utterance_silence_ms: u64,
+    pub long_utterance_silence_ms: u64,
 }
 
 impl Default for CaptureConfig {
@@ -150,6 +301,11 @@ impl Default for CaptureConfig {
             max_utterance_s: 15.0,
             cooldown_s: 0.7,
             print_levels: false,
+            adaptive_noise_floor: true,
+            noise_floor_multiplier: 2.5,
+            dynamic_silence: true,
+            short_utterance_silence_ms: 600,
+            long_utterance_silence_ms: 1050,
         }
     }
 }
@@ -202,7 +358,7 @@ impl Default for OpenAiAsrConfig {
             model: "whisper-1".to_string(),
             language: "zh".to_string(),
             prompt: String::new(),
-            timeout_s: 5.0,
+            timeout_s: 10.0,
             retries: 1,
         }
     }
@@ -276,7 +432,7 @@ impl Default for LlmConfig {
             base_url: "https://api.openai.com/v1".to_string(),
             api_key: "EMPTY".to_string(),
             model: "gpt-5.4-mini".to_string(),
-            timeout_s: 5.0,
+            timeout_s: 20.0,
             max_tokens: 300,
             temperature: 0.5,
             thinking: LlmThinkingConfig::default(),
@@ -832,6 +988,9 @@ pub fn classify_config_change(old: &AppConfig, new: &AppConfig) -> ConfigChanges
     if section_changed(&old.runtime.speech_socket, &new.runtime.speech_socket) {
         changes.rejected.push("runtime.speech_socket");
     }
+    if section_changed(&old.runtime.mode, &new.runtime.mode) {
+        changes.needs_restart.push("runtime.mode");
+    }
     if section_changed(
         &old.runtime.session_idle_timeout_s,
         &new.runtime.session_idle_timeout_s,
@@ -861,6 +1020,15 @@ pub fn classify_config_change(old: &AppConfig, new: &AppConfig) -> ConfigChanges
     }
     if section_changed(&old.mcp, &new.mcp) {
         changes.applied.push("mcp");
+    }
+    if section_changed(&old.dual.kws, &new.dual.kws) {
+        changes.needs_restart.push("dual.kws");
+    }
+    if section_changed(&old.dual.capture, &new.dual.capture) {
+        changes.needs_restart.push("dual.capture");
+    }
+    if section_changed(&old.dual.hot_view(), &new.dual.hot_view()) {
+        changes.applied.push("dual");
     }
     // device: Device 启动时把 DeviceConfig 克隆走了（TTS 模板、命令超时、LED id），
     // 只换配置会让「模板还是旧命令、ID 是新的」，所以整段按需重启处理。
@@ -907,11 +1075,75 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
     }
 }
 
+/// 启动前自检：只给出警告，**绝不阻止启动**（配置错误不该让音箱变哑）。
+pub fn collect_startup_warnings(config: &AppConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let is_placeholder = |key: &str| {
+        let key = key.trim();
+        key.is_empty() || key.eq_ignore_ascii_case("EMPTY")
+    };
+    if is_placeholder(&config.asr.open_ai.api_key) {
+        warnings.push(
+            "asr.open_ai.api_key 为空或仍是 EMPTY：云端 ASR 会鉴权失败（自建无鉴权服务可忽略）"
+                .to_string(),
+        );
+    }
+    if is_placeholder(&config.llm.api_key) {
+        warnings.push(
+            "llm.api_key 为空或仍是 EMPTY：LLM 请求会鉴权失败（自建无鉴权服务可忽略）".to_string(),
+        );
+    }
+    if config.tts.provider == TtsProvider::OpenAi && config.tts.openai.api_key.trim().is_empty() {
+        warnings.push(
+            "tts.provider=openai 但 tts.openai.api_key 为空：合成会失败并回退系统 TTS".to_string(),
+        );
+    }
+    if config.llm.timeout_s < 10.0 {
+        warnings.push(format!(
+            "llm.timeout_s={} 过短（<10s）：慢模型首包会被误判超时，建议 20",
+            config.llm.timeout_s
+        ));
+    }
+    if config.device.tts_command.contains("'{text}'") {
+        warnings.push(
+            "device.tts_command 给 {text} 额外加了单引号：占位符已自动 shell 转义，会造成双重引号（LX06 已知陷阱）".to_string(),
+        );
+    }
+    if config.runtime.mode == "dual" {
+        if !has_valid_host_port(&config.dual.kws.endpoint) {
+            warnings.push(
+                "runtime.mode=dual 但 dual.kws.endpoint 为空或格式无效：请设置 host:port（如 192.168.31.1:5005）"
+                    .to_string(),
+            );
+        }
+        let cap = &config.dual.capture;
+        if cap.sample_rate < 16_000 || cap.sample_rate % 16_000 != 0 {
+            warnings.push(format!(
+                "dual.capture.sample_rate={} 无效：必须为 16000 的正整数倍（如 16000/32000/48000）",
+                cap.sample_rate
+            ));
+        }
+        if cap.channels == 0 || cap.mic_channel >= cap.channels {
+            warnings.push(format!(
+                "dual.capture.mic_channel={} 越界（channels={}）",
+                cap.mic_channel, cap.channels
+            ));
+        }
+        if cap.ref_channel.is_some_and(|r| r >= cap.channels) {
+            warnings.push(format!(
+                "dual.capture.ref_channel={:?} 越界（channels={}）",
+                cap.ref_channel, cap.channels
+            ));
+        }
+    }
+    warnings
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::{
-        classify_config_change, openai_base_url, openai_realtime_base_url, timeout_duration,
+        classify_config_change, collect_startup_warnings, openai_base_url, openai_realtime_base_url, timeout_duration,
         AppConfig, AsrConfig, AsrProvider, ConfigChanges, ConfigHandle, LlmConfig, LlmProtocol,
         LlmThinkingMode, McpConfig, TtsProvider,
     };
@@ -1165,5 +1397,144 @@ mod tests {
 
         assert_eq!(previous.llm.model, "first", "replace 必须把旧配置交出来");
         assert_eq!(handle.get().await.llm.model, "second");
+    }
+
+    #[test]
+    fn old_yaml_without_new_fields_uses_backward_compatible_defaults() {
+        let legacy_yaml = r#"
+device:
+  led_enabled: false
+capture:
+  threshold: 0.01
+  silence_ms: 1200
+asr:
+  open_ai:
+    model: whisper-1
+llm:
+  model: gpt-4o-mini
+"#;
+        let cfg: AppConfig = serde_yaml::from_str(legacy_yaml).unwrap();
+
+        assert!(!cfg.device.led_enabled);
+        assert_eq!(
+            cfg.device.volume_up_command,
+            "mphelper volume_up >/dev/null 2>&1 || true"
+        );
+        assert_eq!(
+            cfg.device.volume_down_command,
+            "mphelper volume_down >/dev/null 2>&1 || true"
+        );
+        assert_eq!(
+            cfg.device.volume_set_command,
+            "mphelper volume_set {level} >/dev/null 2>&1 || true"
+        );
+        assert_eq!(
+            cfg.device.volume_mute_command,
+            "mphelper volume_set 0 >/dev/null 2>&1 || true"
+        );
+
+        assert_eq!(cfg.capture.threshold, 0.01);
+        assert_eq!(cfg.capture.silence_ms, 1200);
+        assert!(cfg.capture.adaptive_noise_floor);
+        assert_eq!(cfg.capture.noise_floor_multiplier, 2.5);
+        assert!(cfg.capture.dynamic_silence);
+        assert_eq!(cfg.capture.short_utterance_silence_ms, 600);
+        assert_eq!(cfg.capture.long_utterance_silence_ms, 1050);
+
+        assert_eq!(cfg.asr.open_ai.timeout_s, 10.0);
+        assert_eq!(cfg.llm.timeout_s, 20.0);
+    }
+
+    #[test]
+    fn startup_warnings_flag_placeholder_keys_and_quote_trap() {
+        let mut cfg = AppConfig::default();
+        let w = collect_startup_warnings(&cfg);
+        assert!(w.iter().any(|m| m.contains("asr.open_ai.api_key")), "{w:?}");
+        assert!(w.iter().any(|m| m.contains("llm.api_key")), "{w:?}");
+        assert!(!w.iter().any(|m| m.contains("timeout_s")), "{w:?}");
+        assert!(!w.iter().any(|m| m.contains("tts_command")), "{w:?}");
+
+        cfg.asr.open_ai.api_key = "sk-a".into();
+        cfg.llm.api_key = "sk-b".into();
+        assert!(collect_startup_warnings(&cfg).is_empty());
+
+        cfg.llm.api_key = "  ".into();
+        cfg.llm.timeout_s = 5.0;
+        cfg.tts.provider = TtsProvider::OpenAi;
+        cfg.tts.openai.api_key = String::new();
+        cfg.device.tts_command = "tts_play.sh '{text}'".into();
+        let w = collect_startup_warnings(&cfg);
+        assert_eq!(w.len(), 4, "{w:?}");
+        assert!(w.iter().any(|m| m.contains("tts.openai.api_key")));
+        assert!(w.iter().any(|m| m.contains("llm.timeout_s=5")));
+        assert!(w.iter().any(|m| m.contains("tts_command")));
+    }
+
+    #[test]
+    fn dual_config_parses_defaults_and_custom_capture_and_resolves_earcon_paths() {
+        let def = AppConfig::default();
+        assert_eq!(def.dual.kws.endpoint, "");
+        assert_eq!(def.dual.kws.ping_interval_s, 30);
+        assert_eq!(def.dual.capture.device, "noop");
+        assert_eq!(def.dual.capture.sample_rate, 48_000);
+        assert_eq!(def.dual.capture.channels, 8);
+        assert_eq!(def.dual.capture.mic_channel, 0);
+        assert_eq!(def.dual.capture.ref_channel, Some(6));
+        assert_eq!(def.dual.capture.shift_bits, 9);
+
+        let custom: AppConfig = serde_yaml::from_str(
+            r#"
+runtime:
+  mode: dual
+dual:
+  kws:
+    endpoint: "192.168.1.50:5005"
+    ping_interval_s: 15
+  capture:
+    device: plughw:0,0
+    sample_rate: 16000
+    channels: 1
+    format: S16_LE
+    mic_channel: 0
+    ref_channel: null
+  enter_earcon: null
+"#,
+        )
+        .unwrap();
+        assert_eq!(custom.dual.kws.endpoint, "192.168.1.50:5005");
+        assert_eq!(custom.dual.kws.ping_interval_s, 15);
+        assert_eq!(custom.dual.capture.sample_rate, 16_000);
+        assert_eq!(custom.dual.capture.channels, 1);
+        assert_eq!(
+            custom.dual.capture.format,
+            super::DualCaptureFormat::S16Le
+        );
+        assert_eq!(custom.dual.capture.ref_channel, None);
+        assert!(custom.dual.enter_earcon.is_none());
+    }
+
+    #[test]
+    fn dual_config_classify_and_startup_warnings_enforce_restart_vs_hot_boundaries() {
+        let mut old = AppConfig::default();
+        old.asr.open_ai.api_key = "sk-a".into();
+        old.llm.api_key = "sk-b".into();
+        old.runtime.mode = "dual".into();
+        let w_bad = collect_startup_warnings(&old);
+        assert!(
+            w_bad.iter().any(|m| m.contains("dual.kws.endpoint")),
+            "{w_bad:?}"
+        );
+
+        old.dual.kws.endpoint = "192.168.31.1:5005".into();
+        assert!(collect_startup_warnings(&old).is_empty());
+
+        let mut new = old.clone();
+        new.dual.kws.endpoint = "192.168.31.2:5005".into();
+        new.dual.capture.sample_rate = 16_000;
+        new.dual.enter_prompt = "你好".into();
+        let changes = classify_config_change(&old, &new);
+        assert!(changes.needs_restart.contains(&"dual.kws"));
+        assert!(changes.needs_restart.contains(&"dual.capture"));
+        assert!(changes.applied.contains(&"dual"));
     }
 }

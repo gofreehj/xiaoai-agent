@@ -7,6 +7,22 @@ use tracing::{debug, warn};
 use crate::config::DeviceConfig;
 use crate::shell::{CommandResult, ShellRunner, SystemShell};
 
+pub const STOP_ACTIVE_TTS_SCRIPT: &str = "for p in /proc/[0-9]*; do \
+   [ -r \"$p/cmdline\" ] || continue; \
+   cmd=$(tr '\\0' ' ' <\"$p/cmdline\" 2>/dev/null); \
+   case \"$cmd\" in \
+     *tts_play.sh*) kill -9 \"${p#/proc/}\" 2>/dev/null || true ;; \
+     *miplayer*) \
+       case \"$cmd\" in \
+         *http://*|*https://*) ;; \
+         *) kill -9 \"${p#/proc/}\" 2>/dev/null || true ;; \
+       esac \
+       ;; \
+   esac; \
+ done; \
+ killall -q -9 qplayer 2>/dev/null || true; \
+ mphelper pause >/dev/null 2>&1 || true";
+
 #[derive(Clone)]
 pub struct Device {
     config: DeviceConfig,
@@ -58,9 +74,42 @@ impl Device {
         self.run_script(&self.config.unduck_audio_command).await
     }
 
+    #[allow(dead_code)]
+    pub async fn volume_up(&self) -> anyhow::Result<()> {
+        self.run_script(&self.config.volume_up_command).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn volume_down(&self) -> anyhow::Result<()> {
+        self.run_script(&self.config.volume_down_command).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn volume_set(&self, level: u8) -> anyhow::Result<()> {
+        let clamped = level.min(100).to_string();
+        self.run_template(&self.config.volume_set_command, &[("level", &clamped)])
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn volume_mute(&self) -> anyhow::Result<()> {
+        self.run_script(&self.config.volume_mute_command).await
+    }
+
     pub async fn abort_current_output(&self) {
         if let Err(err) = self.run_script(&self.config.abort_command).await {
             warn!("failed to abort current device output: {err:?}");
+        }
+    }
+
+    /// 精准掐掉 TTS 播放进程（`tts_play.sh` / `qplayer` / 本地文件 `miplayer`），
+    /// 保留暂停中的 `http(s)://` 音乐流 `miplayer` 进程。
+    pub async fn abort_tts_preserving_music(&self) {
+        if let Err(err) = self
+            .run_raw(STOP_ACTIVE_TTS_SCRIPT, Duration::from_secs(5))
+            .await
+        {
+            warn!(error = %err, "唤醒打断时没能掐掉 TTS 播放进程");
         }
     }
 
@@ -212,6 +261,69 @@ mod tests {
         device.shut_led(5).await;
         assert_eq!(shell.count_matching("/bin/show_led 4"), 1);
         assert_eq!(shell.count_matching("/bin/shut_led 5"), 1);
+    }
+
+    #[tokio::test]
+    async fn abort_tts_preserving_music_filters_http_streams() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let device = device_with(shell.clone());
+        device.abort_tts_preserving_music().await;
+        let script = shell.last_script().expect("must run stop script");
+        assert!(script.contains("*http://*|*https://*"), "{script}");
+        assert!(!script.contains("killall miplayer"), "{script}");
+    }
+
+    #[tokio::test]
+    async fn volume_methods_render_commands_and_clamp_level() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let device = device_with(shell.clone());
+
+        device.volume_up().await.unwrap();
+        assert!(
+            shell.last_script().unwrap().contains("mphelper volume_up"),
+            "{:?}",
+            shell.last_script()
+        );
+
+        device.volume_down().await.unwrap();
+        assert!(
+            shell
+                .last_script()
+                .unwrap()
+                .contains("mphelper volume_down"),
+            "{:?}",
+            shell.last_script()
+        );
+
+        device.volume_set(42).await.unwrap();
+        assert!(
+            shell
+                .last_script()
+                .unwrap()
+                .contains("mphelper volume_set 42"),
+            "{:?}",
+            shell.last_script()
+        );
+
+        device.volume_set(150).await.unwrap();
+        assert!(
+            shell
+                .last_script()
+                .unwrap()
+                .contains("mphelper volume_set 100"),
+            "超过 100 的音量必须被钳制到 100: {:?}",
+            shell.last_script()
+        );
+
+        device.volume_mute().await.unwrap();
+        assert!(
+            shell
+                .last_script()
+                .unwrap()
+                .contains("mphelper volume_set 0"),
+            "{:?}",
+            shell.last_script()
+        );
     }
 }
 

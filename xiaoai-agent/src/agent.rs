@@ -1,12 +1,18 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use futures::StreamExt;
+use rig_core::agent::{Agent, MultiTurnStreamItem, StreamingPromptRequest};
 use rig_core::client::CompletionClient;
-use rig_core::completion::{Message, Prompt};
+use rig_core::completion::{CompletionModel, Message};
+use rig_core::message::Text;
 use rig_core::providers::{anthropic, openai};
+use rig_core::streaming::StreamedAssistantContent;
 use rig_core::tool::server::{ToolServer, ToolServerHandle};
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::config::{timeout_duration, AppConfig, ConfigHandle, LlmProtocol, LlmThinkingMode};
@@ -74,10 +80,18 @@ pub struct AgentTurnResult {
     pub end_reason: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolFailureInfo {
+    pub tool: &'static str,
+    pub message: String,
+    pub is_timeout: bool,
+}
+
 #[derive(Default)]
 pub struct AgentControl {
     pub should_end: bool,
     pub end_reason: String,
+    pub last_tool_error: Option<ToolFailureInfo>,
 }
 
 /// 一轮对话需要的「配置快照 + 工具服务器」视图。
@@ -92,6 +106,18 @@ pub struct AgentControl {
 struct AgentView {
     config: Arc<AppConfig>,
     tool_server: ToolServerHandle,
+    http_client: reqwest::Client,
+}
+
+fn build_llm_http_client(timeout_s: f64) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .pool_idle_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(15))
+        .read_timeout(timeout_duration(timeout_s.max(15.0)))
+        .timeout(timeout_duration((timeout_s * 4.0).clamp(60.0, 180.0)))
+        .build()
+        .context("failed to create LLM HTTP client")
 }
 
 pub struct AgentRuntime {
@@ -104,6 +130,7 @@ pub struct AgentRuntime {
     mcp: RwLock<McpConnections>,
     history: Mutex<Vec<HistoryTurn>>,
     control: Arc<Mutex<AgentControl>>,
+    last_prewarm_ms: AtomicU64,
 }
 
 /// 按一份配置快照构建内置工具服务器。
@@ -121,22 +148,25 @@ fn build_tool_server(
         // 那边是按这份列表手工抄的，数量断言靠它兜住。
         tool_server = tool_server
             .tool(GetCurrentTime::new(config.clone()))
-            .tool(GetWeather::new(config.clone()))
-            .tool(WebSearch::new(config.clone()))
-            .tool(EndConversation::new(control))
-            .tool(SearchMusic::new(music.clone()))
-            .tool(RequestMusicLoginCode::new(music.clone()))
-            .tool(SubmitMusicLoginCode::new(music.clone()))
-            .tool(PlayMusicQuery::new(music.clone()))
-            .tool(AddMusicToQueue::new(music.clone()))
-            .tool(AddRandomMusicToQueue::new(music.clone()))
-            .tool(PlayRandomMusic::new(music.clone()))
-            .tool(StopMusicPlayback::new(music.clone()))
-            .tool(PauseMusicPlayback::new(music.clone()))
-            .tool(ResumeMusicPlayback::new(music.clone()))
-            .tool(PlayNextMusic::new(music.clone()))
-            .tool(PlayPreviousMusic::new(music.clone()))
-            .tool(GetMusicStatus::new(music));
+            .tool(GetWeather::new(config.clone(), control.clone()))
+            .tool(WebSearch::new(config.clone(), control.clone()))
+            .tool(EndConversation::new(control));
+        if config.music.enabled {
+            tool_server = tool_server
+                .tool(SearchMusic::new(music.clone()))
+                .tool(RequestMusicLoginCode::new(music.clone()))
+                .tool(SubmitMusicLoginCode::new(music.clone()))
+                .tool(PlayMusicQuery::new(music.clone()))
+                .tool(AddMusicToQueue::new(music.clone()))
+                .tool(AddRandomMusicToQueue::new(music.clone()))
+                .tool(PlayRandomMusic::new(music.clone()))
+                .tool(StopMusicPlayback::new(music.clone()))
+                .tool(PauseMusicPlayback::new(music.clone()))
+                .tool(ResumeMusicPlayback::new(music.clone()))
+                .tool(PlayNextMusic::new(music.clone()))
+                .tool(PlayPreviousMusic::new(music.clone()))
+                .tool(GetMusicStatus::new(music));
+        }
     }
     tool_server.run()
 }
@@ -150,6 +180,7 @@ fn build_tool_server(
 struct HistoryTurn {
     user: String,
     assistant: String,
+    created_at: std::time::Instant,
 }
 
 impl HistoryTurn {
@@ -162,6 +193,22 @@ impl HistoryTurn {
 /// 两者取先到者，超出的从最旧的一轮开始丢。
 const HISTORY_MAX_TURNS: usize = 10;
 const HISTORY_MAX_CHARS: usize = 4000;
+/// 跨唤醒/空闲超时的上下文保留有效期（5 分钟）：
+/// 用户在 20 秒空闲超时后再次唤醒追问（「小爱同学，那明天呢？」），或唤醒打断纠错
+/// （「小爱同学，不对，我是问上海的」）时，不应因 `reset_session` 瞬间失忆；
+/// 仅当超过 TTL 或用户主动结束对话（`end_conversation` / 退出指令）时才清空。
+const HISTORY_TTL: Duration = Duration::from_secs(300);
+
+fn prune_expired_history(turns: &mut Vec<HistoryTurn>, now: std::time::Instant, ttl: Duration) {
+    turns.retain(|turn| now.saturating_duration_since(turn.created_at) <= ttl);
+}
+
+fn should_clear_history_for_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "agent ended conversation" | "user exit command" | "clear history"
+    )
+}
 
 /// 按「轮数 + 字符数」双上限裁剪历史。
 ///
@@ -197,9 +244,11 @@ impl AgentRuntime {
         let control = Arc::new(Mutex::new(AgentControl::default()));
         let snapshot = config.get().await;
         let tool_server = build_tool_server(snapshot.clone(), music.clone(), control.clone());
+        let http_client = build_llm_http_client(snapshot.llm.timeout_s)?;
         let view = AgentView {
             config: snapshot.clone(),
             tool_server,
+            http_client,
         };
 
         let mcp = if snapshot.agent.tools_enabled {
@@ -224,7 +273,37 @@ impl AgentRuntime {
             mcp: RwLock::new(mcp),
             history: Mutex::new(Vec::new()),
             control,
+            last_prewarm_ms: AtomicU64::new(0),
         })
+    }
+
+    /// 唤醒期间在后台预热 LLM HTTP/TLS 连接池（仅执行轻量 HEAD 建连，不产生 token 消耗）。
+    pub async fn prewarm(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev = self.last_prewarm_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) < 8_000 {
+            return;
+        }
+        if self
+            .last_prewarm_ms
+            .compare_exchange(prev, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let view = self.view.read().await.clone();
+        let base = view.config.llm.base_url.trim();
+        if base.is_empty() {
+            return;
+        }
+        let url = base.trim_end_matches('/').to_string();
+        let client = view.http_client;
+        tokio::spawn(async move {
+            let _ = client.head(url).timeout(Duration::from_secs(2)).send().await;
+        });
     }
 
     /// 配置热加载：换配置快照，并重建工具服务器与 MCP 连接。
@@ -239,9 +318,12 @@ impl AgentRuntime {
         let snapshot = self.config.get().await;
         let tool_server =
             build_tool_server(snapshot.clone(), self.music.clone(), self.control.clone());
+        let http_client = build_llm_http_client(snapshot.llm.timeout_s)
+            .unwrap_or_else(|_| reqwest::Client::new());
         let next_view = AgentView {
             config: snapshot.clone(),
             tool_server,
+            http_client,
         };
         // 慢的那几步（MCP 重连）全在换之前做完，换的时候只剩一次写锁。
         let mcp = if snapshot.agent.tools_enabled {
@@ -263,7 +345,20 @@ impl AgentRuntime {
         );
     }
 
-    pub async fn run_turn(&self, message: &str) -> anyhow::Result<AgentTurnResult> {
+    /// 流式执行一轮对话：保留多轮工具调用与会话历史记录，同时把增量文本实时送给 `text_tx`。
+    pub async fn run_turn_stream(
+        &self,
+        message: &str,
+        text_tx: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<AgentTurnResult> {
+        let (view, message_with_time, history) = self.prepare_turn(message).await;
+        let text = self
+            .prompt_stream_once(view, message_with_time, history, text_tx)
+            .await?;
+        self.finish_turn(message, text).await
+    }
+
+    async fn prepare_turn(&self, message: &str) -> (AgentView, String, Vec<Message>) {
         // 一轮对话只读一次视图：中途发生 SIGHUP 也不会「前半句旧模型、后半句新模型」，
         // 而且配置与工具服务器同源，preamble 与实际注册的工具永远对得上。
         let view = self.view.read().await.clone();
@@ -272,6 +367,7 @@ impl AgentRuntime {
             let mut control = self.control.lock().await;
             control.should_end = false;
             control.end_reason.clear();
+            control.last_tool_error = None;
         }
 
         // 关闭工具时（例如后端代理不支持 tools API），模型拿不到当前时间，
@@ -286,8 +382,10 @@ impl AgentRuntime {
 
         // 历史按结构化消息传给模型，不再拼成「最近对话历史：…」那一段文字。
         let history = self.history_snapshot().await;
-        let text = self.prompt_once(view, message_with_time, history).await?;
+        (view, message_with_time, history)
+    }
 
+    async fn finish_turn(&self, message: &str, text: String) -> anyhow::Result<AgentTurnResult> {
         let control = self.control.lock().await;
         self.push_history(message, &text).await;
         Ok(AgentTurnResult {
@@ -330,133 +428,60 @@ impl AgentRuntime {
         )
     }
 
-    async fn prompt_once(
+    async fn prompt_stream_once(
         &self,
         view: AgentView,
         prompt: String,
         history: Vec<Message>,
+        text_tx: mpsc::UnboundedSender<String>,
     ) -> anyhow::Result<String> {
         let config = view.config.clone();
-        let http_client = reqwest::Client::builder()
-            .timeout(timeout_duration(config.llm.timeout_s))
-            .build()
-            .context("failed to create LLM HTTP client")?;
+        let http_client = view.http_client.clone();
 
         match config.llm.protocol {
             LlmProtocol::OpenAiChat => {
-                self.prompt_openai(view.clone(), http_client, prompt, history)
-                    .await
+                let agent = build_openai_agent(&view, http_client)?;
+                run_agent_stream(&agent, prompt, history, text_tx).await
             }
             LlmProtocol::Anthropic => {
-                self.prompt_anthropic(view, http_client, prompt, history)
-                    .await
+                let agent = build_anthropic_agent(&view, http_client)?;
+                run_agent_stream(&agent, prompt, history, text_tx).await
             }
         }
-    }
-
-    async fn prompt_openai(
-        &self,
-        view: AgentView,
-        http_client: reqwest::Client,
-        prompt: String,
-        history: Vec<Message>,
-    ) -> anyhow::Result<String> {
-        let config = view.config.clone();
-        let tool_server = view.tool_server.clone();
-        let client = openai::Client::builder()
-            .api_key(config.llm.api_key.as_str())
-            .base_url(config.llm.base_url.as_str())
-            .http_client(http_client)
-            .build()
-            .context("failed to create OpenAI-compatible Rig client")?
-            .completions_api();
-
-        let agent = client
-            .agent(config.llm.model.as_str())
-            .preamble(Self::preamble(config.agent.tools_enabled))
-            .temperature(config.llm.temperature)
-            .max_tokens(config.llm.max_tokens)
-            .default_max_turns(3)
-            .additional_params(openai_thinking_params(&config.llm.thinking.mode))
-            .tool_server_handle(tool_server.clone())
-            .build();
-
-        // 历史以结构化消息挂到请求上；空历史不必多挂一层。
-        let mut request = agent.prompt(prompt);
-        if !history.is_empty() {
-            request = request.with_history(history);
-        }
-        Ok(request.await?.trim().to_string())
-    }
-
-    async fn prompt_anthropic(
-        &self,
-        view: AgentView,
-        http_client: reqwest::Client,
-        prompt: String,
-        history: Vec<Message>,
-    ) -> anyhow::Result<String> {
-        let config = view.config.clone();
-        let tool_server = view.tool_server.clone();
-        // 老版 Claude 要求 1024 <= budget_tokens < max_tokens；默认配置是
-        // budget 1024 / max_tokens 300，直接开 thinking 会每轮失败并播"大模型服务遇到问题"。
-        // 这里改成自动收敛并告警，不让纯配置陷阱把音箱弄哑。
-        let mut thinking_params =
-            anthropic_thinking_params(&config.llm.thinking.mode, config.llm.thinking.budget_tokens);
-        if config.llm.thinking.mode == LlmThinkingMode::Enabled {
-            const MIN_BUDGET: u64 = 1024;
-            let max = config.llm.max_tokens;
-            let wanted = config.llm.thinking.budget_tokens;
-            if wanted < MIN_BUDGET || wanted >= max {
-                // 合法区间是 [1024, max_tokens)。区间为空说明 max_tokens 太小，
-                // 静默给一个非法值只会换来 400，这里直接报出人话错误。
-                anyhow::ensure!(
-                    max > MIN_BUDGET,
-                    "llm.thinking.mode=enabled 需要 llm.thinking.budget_tokens 落在                      [1024, llm.max_tokens) 区间，但 llm.max_tokens={max} 太小；                     请把 llm.max_tokens 调到 2048 以上（或把 thinking.mode 设回 auto）"
-                );
-                let clamped = wanted.clamp(MIN_BUDGET, max - 1);
-                warn!(
-                    wanted,
-                    max_tokens = max,
-                    clamped,
-                    "llm.thinking.budget_tokens out of range, clamped into [1024, max_tokens)"
-                );
-                thinking_params = anthropic_thinking_params(&LlmThinkingMode::Enabled, clamped);
-            }
-        }
-
-        let client = anthropic::Client::builder()
-            .api_key(config.llm.api_key.as_str())
-            .base_url(config.llm.base_url.as_str())
-            .http_client(http_client)
-            .anthropic_version("2023-06-01")
-            .build()
-            .context("failed to create Anthropic-compatible Rig client")?;
-
-        let mut builder = client
-            .agent(config.llm.model.as_str())
-            .preamble(Self::preamble(config.agent.tools_enabled))
-            .max_tokens(config.llm.max_tokens)
-            .default_max_turns(3)
-            .additional_params(thinking_params);
-        if config.llm.thinking.mode != LlmThinkingMode::Enabled {
-            builder = builder.temperature(config.llm.temperature);
-        }
-        let agent = builder.tool_server_handle(tool_server.clone()).build();
-
-        // 历史以结构化消息挂到请求上；空历史不必多挂一层。
-        let mut request = agent.prompt(prompt);
-        if !history.is_empty() {
-            request = request.with_history(history);
-        }
-        Ok(request.await?.trim().to_string())
     }
 
     pub async fn reset_session(&self, reason: &str) {
-        self.history.lock().await.clear();
+        {
+            let mut history = self.history.lock().await;
+            if should_clear_history_for_reason(reason) {
+                history.clear();
+            } else {
+                prune_expired_history(&mut history, std::time::Instant::now(), HISTORY_TTL);
+            }
+        }
         let mut control = self.control.lock().await;
         control.should_end = false;
         control.end_reason = reason.to_string();
+        control.last_tool_error = None;
+    }
+
+    /// 当用户在播报/生成中途用唤醒词打断（Barge-in）时，把当前已收到的提问与已播出的半截回复记入历史，
+    /// 使下一轮纠错（「不对，我是问上海的」）拥有上下文。
+    pub async fn record_partial_turn(&self, user: &str, partial_assistant: &str) {
+        let user_trimmed = user.trim();
+        if user_trimmed.is_empty() {
+            return;
+        }
+        let assistant_record = if partial_assistant.trim().is_empty() {
+            "（回答被用户唤醒打断）".to_string()
+        } else {
+            format!("{}（被用户打断）", partial_assistant.trim())
+        };
+        self.push_history(user_trimmed, &assistant_record).await;
+    }
+
+    pub async fn take_last_tool_error(&self) -> Option<ToolFailureInfo> {
+        self.control.lock().await.last_tool_error.take()
     }
 
     /// 测试用：读回上一次 `reset_session` 写入的理由。
@@ -468,22 +493,192 @@ impl AgentRuntime {
         self.control.lock().await.end_reason.clone()
     }
 
+    #[cfg(test)]
+    pub async fn history_len_for_test(&self) -> usize {
+        self.history.lock().await.len()
+    }
+
     /// 取一份历史快照，转成 rig 的消息序列。
     ///
     /// 拿的是克隆而不是锁本身：请求期间不能一直占着 `history`，否则同一轮里
     /// 的 `push_history` 会等到请求结束才写进去。
     async fn history_snapshot(&self) -> Vec<Message> {
-        let turns = self.history.lock().await;
+        let mut turns = self.history.lock().await;
+        prune_expired_history(&mut turns, std::time::Instant::now(), HISTORY_TTL);
         history_to_messages(&turns)
     }
 
     async fn push_history(&self, user: &str, assistant: &str) {
         let mut history = self.history.lock().await;
+        let now = std::time::Instant::now();
+        prune_expired_history(&mut history, now, HISTORY_TTL);
         history.push(HistoryTurn {
             user: user.to_string(),
             assistant: assistant.to_string(),
+            created_at: now,
         });
         trim_history(&mut history);
+    }
+}
+
+fn build_openai_agent(
+    view: &AgentView,
+    http_client: reqwest::Client,
+) -> anyhow::Result<Agent<openai::completion::CompletionModel>> {
+    let config = &view.config;
+    let client = openai::Client::builder()
+        .api_key(config.llm.api_key.as_str())
+        .base_url(config.llm.base_url.as_str())
+        .http_client(http_client)
+        .build()
+        .context("failed to create OpenAI-compatible Rig client")?
+        .completions_api();
+
+    Ok(client
+        .agent(config.llm.model.as_str())
+        .preamble(AgentRuntime::preamble(config.agent.tools_enabled))
+        .temperature(config.llm.temperature)
+        .max_tokens(config.llm.max_tokens)
+        .default_max_turns(3)
+        .additional_params(openai_thinking_params(&config.llm.thinking.mode))
+        .tool_server_handle(view.tool_server.clone())
+        .build())
+}
+
+fn build_anthropic_agent(
+    view: &AgentView,
+    http_client: reqwest::Client,
+) -> anyhow::Result<Agent<anthropic::completion::CompletionModel>> {
+    let config = &view.config;
+    // 老版 Claude 要求 1024 <= budget_tokens < max_tokens；默认配置是
+    // budget 1024 / max_tokens 300，直接开 thinking 会每轮失败并播"大模型服务遇到问题"。
+    // 这里改成自动收敛并告警，不让纯配置陷阱把音箱弄哑。
+    let mut thinking_params =
+        anthropic_thinking_params(&config.llm.thinking.mode, config.llm.thinking.budget_tokens);
+    if config.llm.thinking.mode == LlmThinkingMode::Enabled {
+        const MIN_BUDGET: u64 = 1024;
+        let max = config.llm.max_tokens;
+        let wanted = config.llm.thinking.budget_tokens;
+        if wanted < MIN_BUDGET || wanted >= max {
+            // 合法区间是 [1024, max_tokens)。区间为空说明 max_tokens 太小，
+            // 静默给一个非法值只会换来 400，这里直接报出人话错误。
+            anyhow::ensure!(
+                max > MIN_BUDGET,
+                "llm.thinking.mode=enabled 需要 llm.thinking.budget_tokens 落在 \
+                 [1024, llm.max_tokens) 区间，但 llm.max_tokens={max} 太小；\
+                 请把 llm.max_tokens 调到 2048 以上（或把 thinking.mode 设回 auto）"
+            );
+            let clamped = wanted.clamp(MIN_BUDGET, max - 1);
+            warn!(
+                wanted,
+                max_tokens = max,
+                clamped,
+                "llm.thinking.budget_tokens out of range, clamped into [1024, max_tokens)"
+            );
+            thinking_params = anthropic_thinking_params(&LlmThinkingMode::Enabled, clamped);
+        }
+    }
+
+    let client = anthropic::Client::builder()
+        .api_key(config.llm.api_key.as_str())
+        .base_url(config.llm.base_url.as_str())
+        .http_client(http_client)
+        .anthropic_version("2023-06-01")
+        .build()
+        .context("failed to create Anthropic-compatible Rig client")?;
+
+    let mut builder = client
+        .agent(config.llm.model.as_str())
+        .preamble(AgentRuntime::preamble(config.agent.tools_enabled))
+        .max_tokens(config.llm.max_tokens)
+        .default_max_turns(3)
+        .additional_params(thinking_params);
+    if config.llm.thinking.mode != LlmThinkingMode::Enabled {
+        builder = builder.temperature(config.llm.temperature);
+    }
+    Ok(builder.tool_server_handle(view.tool_server.clone()).build())
+}
+
+async fn run_agent_stream<M>(
+    agent: &Agent<M>,
+    prompt: String,
+    history: Vec<Message>,
+    text_tx: mpsc::UnboundedSender<String>,
+) -> anyhow::Result<String>
+where
+    M: CompletionModel + 'static,
+    M::StreamingResponse: Clone + Unpin + Send + Sync + rig_core::completion::GetTokenUsage,
+{
+    let mut request = StreamingPromptRequest::<M, ()>::from_agent(agent, prompt);
+    if !history.is_empty() {
+        request = request.with_history(history);
+    }
+    let mut stream = request.await;
+    let mut full_text = String::new();
+    let mut emitted_delta = false;
+    let mut pending_unflushed_text = false;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(
+                Text { text, .. },
+            ))) => {
+                if !text.is_empty() {
+                    emitted_delta = true;
+                    pending_unflushed_text = true;
+                    full_text.push_str(&text);
+                    let _ = text_tx.send(text);
+                }
+            }
+            Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                let final_resp = res.response();
+                if !emitted_delta && !final_resp.trim().is_empty() {
+                    full_text = final_resp.to_string();
+                    let _ = text_tx.send(full_text.clone());
+                }
+                break;
+            }
+            Ok(_) => {
+                // 模型在输出工具调用前若已吐出半截过渡文本（如「我帮您查一下」无句末标点），
+                // 切入 ToolCall / ToolResult 时主动补一个换行，让下游 StreamingSentenceSplitter
+                // 立即切出过渡句起播，且避免与工具返回后的正式回答粘连成同一句。
+                if pending_unflushed_text {
+                    pending_unflushed_text = false;
+                    full_text.push('\n');
+                    let _ = text_tx.send("\n".to_string());
+                }
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context("streaming LLM turn failed"));
+            }
+        }
+    }
+
+    Ok(full_text.trim().to_string())
+}
+
+pub fn classify_turn_failure_prompt(
+    tool_err: Option<&ToolFailureInfo>,
+    llm_err: &anyhow::Error,
+) -> &'static str {
+    if let Some(te) = tool_err {
+        return match (te.tool, te.is_timeout) {
+            ("web_search", true) => "抱歉，联网搜索响应超时，请稍后再试",
+            ("web_search", false) => "抱歉，联网搜索工具暂时不可用",
+            ("get_weather", true) => "抱歉，天气查询响应超时，请稍后再试",
+            ("get_weather", false) => "抱歉，天气服务暂时不可用",
+            (_, true) => "抱歉，外部工具响应超时，请稍后再试",
+            (_, false) => "抱歉，外部工具调用失败，请稍后再试",
+        };
+    }
+    let detail = format!("{llm_err:#}").to_ascii_lowercase();
+    if detail.contains("timedout")
+        || detail.contains("timed out")
+        || llm_err.to_string().contains("超时")
+    {
+        "抱歉，大模型响应超时，请稍后重试"
+    } else {
+        "抱歉，大模型回答遇到问题，请稍后重试"
     }
 }
 
@@ -522,6 +717,7 @@ mod tests {
         HistoryTurn {
             user: user.to_string(),
             assistant: assistant.to_string(),
+            created_at: std::time::Instant::now(),
         }
     }
 
@@ -619,5 +815,147 @@ mod tests {
             openai_thinking_params(&LlmThinkingMode::Enabled),
             json!({"enable_thinking": true})
         );
+    }
+
+    #[tokio::test]
+    async fn build_tool_server_omits_music_tools_when_music_disabled() {
+        use super::{build_tool_server, AgentControl};
+        use crate::config::{AppConfig, ConfigHandle};
+        use crate::device::Device;
+        use crate::music::MusicService;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let mut cfg = AppConfig::default();
+        cfg.agent.tools_enabled = true;
+        cfg.music.enabled = false;
+        let arc_cfg = Arc::new(cfg.clone());
+        let music = Arc::new(
+            MusicService::new(
+                ConfigHandle::new(arc_cfg.clone()),
+                Device::new(arc_cfg.device.clone()),
+            )
+            .unwrap(),
+        );
+        let server_no_music = build_tool_server(
+            arc_cfg,
+            music.clone(),
+            Arc::new(Mutex::new(AgentControl::default())),
+        );
+        let defs_no_music = server_no_music.get_tool_defs(None).await.unwrap();
+        assert_eq!(defs_no_music.len(), 4);
+
+        cfg.music.enabled = true;
+        let server_with_music = build_tool_server(
+            Arc::new(cfg),
+            music,
+            Arc::new(Mutex::new(AgentControl::default())),
+        );
+        let defs_with_music = server_with_music.get_tool_defs(None).await.unwrap();
+        assert_eq!(defs_with_music.len(), 17);
+    }
+
+    #[tokio::test]
+    async fn reset_session_preserves_recent_history_across_wake_and_idle_timeout_but_clears_on_exit() {
+        use super::{prune_expired_history, AgentRuntime, HistoryTurn};
+        use crate::config::{AppConfig, ConfigHandle};
+        use crate::device::Device;
+        use crate::music::MusicService;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let mut cfg = AppConfig::default();
+        cfg.agent.tools_enabled = false;
+        let handle = ConfigHandle::new(Arc::new(cfg.clone()));
+        let device = Device::new(cfg.device.clone());
+        let music = Arc::new(MusicService::new(handle.clone(), device.clone()).unwrap());
+        let agent = AgentRuntime::new(handle, device, music).await.unwrap();
+
+        agent.record_partial_turn("北京今天天气怎么样", "今天北京晴").await;
+        assert_eq!(agent.history_len_for_test().await, 1);
+
+        // 唤醒打断与 20 秒空闲超时不应抹掉 5 分钟内的近期对话上下文
+        agent.reset_session("wake keyword").await;
+        assert_eq!(
+            agent.history_len_for_test().await,
+            1,
+            "唤醒打断不得清空近期历史，否则用户纠错「不对，我是问上海的」会彻底失忆"
+        );
+        agent.reset_session("session idle timeout").await;
+        assert_eq!(
+            agent.history_len_for_test().await,
+            1,
+            "会话空闲超时后重新唤醒追问不得清空 5 分钟内的上下文"
+        );
+
+        // 用户主动结束会话或 end_conversation 必须立即清空历史
+        agent.reset_session("user exit command").await;
+        assert_eq!(
+            agent.history_len_for_test().await,
+            0,
+            "用户主动退出对话时应立即清空历史"
+        );
+
+        // 超过 TTL 的旧历史会被自动淘汰
+        let now = Instant::now();
+        let mut turns = vec![
+            HistoryTurn {
+                user: "过期问题".into(),
+                assistant: "过期回答".into(),
+                created_at: now - Duration::from_secs(301),
+            },
+            HistoryTurn {
+                user: "近期问题".into(),
+                assistant: "近期回答".into(),
+                created_at: now - Duration::from_secs(10),
+            },
+        ];
+        prune_expired_history(&mut turns, now, Duration::from_secs(300));
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "近期问题");
+    }
+
+    #[tokio::test]
+    async fn build_llm_http_client_allows_slow_chunked_sse_exceeding_timeout_s() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use super::build_llm_http_client;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            sock.write_all(headers.as_bytes()).await.unwrap();
+            for chunk in ["data: one\n\n", "data: two\n\n", "data: three\n\n"] {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let frame = format!("{:x}\r\n{}\r\n", chunk.len(), chunk);
+                sock.write_all(frame.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            sock.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        // timeout_s=0.5 is shorter than the ~900ms total SSE stream duration,
+        // but each inter-chunk gap (300ms) is well below read_timeout (>=15s).
+        let client = build_llm_http_client(0.5).unwrap();
+        let body = client
+            .get(format!("http://{addr}/sse"))
+            .send()
+            .await
+            .expect("SSE headers should arrive")
+            .text()
+            .await
+            .expect("slow chunked SSE stream should complete without hitting timeout_s");
+        server.await.unwrap();
+
+        assert!(body.contains("data: one"));
+        assert!(body.contains("data: two"));
+        assert!(body.contains("data: three"));
     }
 }

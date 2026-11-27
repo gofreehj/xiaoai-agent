@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use anyhow::Context;
 use base64::Engine;
 use bytes::Bytes;
@@ -53,20 +57,62 @@ impl AsrClient {
             _ => Ok(None),
         }
     }
+
+    /// 唤醒期间在后台预热 HTTP/TLS 连接池（用户说话的 2~3 秒内完成握手，消除 ASR 请求冷启动延迟）。
+    pub fn prewarm(&self) {
+        if let Self::OpenAi(asr) = self {
+            asr.prewarm();
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct OpenAiAsr {
     config: OpenAiAsrConfig,
     client: Client,
+    last_prewarm_ms: Arc<AtomicU64>,
 }
 
 impl OpenAiAsr {
     pub fn new(config: OpenAiAsrConfig) -> Self {
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .pool_idle_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             config,
-            client: Client::new(),
+            client,
+            last_prewarm_ms: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn prewarm(&self) {
+        let base = self.config.base_url.trim();
+        if base.is_empty() {
+            return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev = self.last_prewarm_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) < 8_000 {
+            return;
+        }
+        if self
+            .last_prewarm_ms
+            .compare_exchange(prev, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let client = self.client.clone();
+        let url = base.trim_end_matches('/').to_string();
+        tokio::spawn(async move {
+            let _ = client.head(url).timeout(Duration::from_secs(2)).send().await;
+        });
     }
 
     pub async fn transcribe_pcm(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {
@@ -76,7 +122,10 @@ impl OpenAiAsr {
         for attempt in 1..=attempts {
             match self.transcribe_pcm_once(pcm, sample_rate).await {
                 Ok(text) => return Ok(text),
-                Err(err) => {
+                Err((retryable, err)) => {
+                    if !retryable {
+                        return Err(err);
+                    }
                     if attempt < attempts {
                         warn!("ASR attempt {attempt}/{attempts} failed: {err:?}");
                     }
@@ -88,10 +137,15 @@ impl OpenAiAsr {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("ASR request failed without attempts")))
     }
 
-    async fn transcribe_pcm_once(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {
+    async fn transcribe_pcm_once(
+        &self,
+        pcm: &[u8],
+        sample_rate: u32,
+    ) -> Result<String, (bool, anyhow::Error)> {
         let file = Part::bytes(wav_bytes(pcm, sample_rate))
             .file_name("speech.wav")
-            .mime_str("audio/wav")?;
+            .mime_str("audio/wav")
+            .map_err(|err| (false, anyhow::Error::new(err)))?;
         let mut form = Form::new()
             .text("model", self.config.model.clone())
             .part("file", file);
@@ -111,16 +165,27 @@ impl OpenAiAsr {
             request = request.bearer_auth(&self.config.api_key);
         }
 
-        let response = timeout(timeout_duration(self.config.timeout_s), request.send())
-            .await
-            .context("ASR request timed out")??;
-        let status = response.status();
-        let text = response.text().await?;
+        let (status, text) = timeout(timeout_duration(self.config.timeout_s), async {
+            let response = request.send().await?;
+            let status = response.status();
+            let text = response.text().await?;
+            Ok::<_, reqwest::Error>((status, text))
+        })
+        .await
+        .map_err(|_| (true, anyhow::anyhow!("ASR request timed out")))?
+        .map_err(|err| (true, anyhow::Error::new(err)))?;
+
         if !status.is_success() {
-            anyhow::bail!("ASR request failed status={status} body={text}");
+            let retryable =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            return Err((
+                retryable,
+                anyhow::anyhow!("ASR request failed status={status} body={text}"),
+            ));
         }
-        let parsed: TranscriptionResponse =
-            serde_json::from_str(&text).with_context(|| format!("invalid ASR response: {text}"))?;
+        let parsed: TranscriptionResponse = serde_json::from_str(&text)
+            .with_context(|| format!("invalid ASR response: {text}"))
+            .map_err(|err| (false, err))?;
         Ok(parsed.text.trim().to_string())
     }
 }
@@ -183,12 +248,32 @@ impl OpenAiRealtimeAsr {
         &self,
         sample_rate: u32,
     ) -> anyhow::Result<RealtimeAsrSession> {
-        timeout(
-            timeout_duration(self.config.timeout_s),
-            self.start_streaming_session_inner(sample_rate),
-        )
-        .await
-        .context("Realtime ASR connection timed out")?
+        let attempts = self.config.retries.saturating_add(1);
+        let mut last_error = None;
+
+        for attempt in 1..=attempts {
+            match timeout(
+                timeout_duration(self.config.timeout_s),
+                self.start_streaming_session_inner(sample_rate),
+            )
+            .await
+            .context("Realtime ASR connection timed out")
+            .and_then(|res| res)
+            {
+                Ok(session) => return Ok(session),
+                Err(err) => {
+                    if attempt < attempts {
+                        warn!(
+                            "Realtime ASR connect attempt {attempt}/{attempts} failed: {err:?}"
+                        );
+                    }
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("Realtime ASR connection failed without attempts")))
     }
 
     async fn start_streaming_session_inner(
@@ -665,6 +750,114 @@ mod tests {
                 "audio_end_ms": 980,
             })),
             Some(RealtimeAsrEvent::SpeechStopped { audio_end_ms: 980 })
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_asr_401_fails_fast_without_retrying() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use super::OpenAiAsr;
+        use crate::config::OpenAiAsrConfig;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_server.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"error":"invalid api key"}"#;
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let asr = OpenAiAsr::new(OpenAiAsrConfig {
+            base_url: format!("http://{addr}"),
+            api_key: "bad-key".to_string(),
+            model: "whisper-1".to_string(),
+            language: "zh".to_string(),
+            prompt: String::new(),
+            timeout_s: 2.0,
+            retries: 2,
+        });
+
+        let err = asr
+            .transcribe_pcm(&[0u8; 320], 16_000)
+            .await
+            .expect_err("401 should fail");
+        server.abort();
+
+        assert!(
+            err.to_string().contains("401"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "401 Unauthorized must fail fast on attempt 1 without retrying"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_asr_times_out_on_stalled_body_after_200() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use super::OpenAiAsr;
+        use crate::config::OpenAiAsrConfig;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                // Send 200 OK headers with Content-Length: 100, then stall forever.
+                let partial = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"text\":\"hi";
+                let _ = sock.write_all(partial.as_bytes()).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let asr = OpenAiAsr::new(OpenAiAsrConfig {
+            base_url: format!("http://{addr}"),
+            api_key: "EMPTY".to_string(),
+            model: "whisper-1".to_string(),
+            language: "zh".to_string(),
+            prompt: String::new(),
+            timeout_s: 0.4,
+            retries: 0,
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            asr.transcribe_pcm(&[0u8; 320], 16_000),
+        )
+        .await
+        .expect("transcribe_pcm hung past outer guard on stalled response body");
+        server.abort();
+
+        let err = result.expect_err("stalled body should time out");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected timeout error, got: {err:#}"
         );
     }
 }

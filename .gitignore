@@ -30,3 +30,16 @@ xiaoai_asr_probe/libaivs_sdk.so
 
 experiments/
 backup/
+
+# LX06 local build/backup artifacts (firmware images, dumps, parts.env).
+deploy/lx06/work/
+deploy/lx06/analysis/**/extracted/
+deploy/lx06/analysis/**/rootfs/
+deploy/lx06/analysis/**/*.img
+deploy/lx06/analysis/**/*.squashfs
+
+.idea/
+.xcodemap/
+*.bak
+*.tar.gz
+*.tar.bz2

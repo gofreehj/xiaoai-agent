@@ -1,6 +1,29 @@
 runtime:
+  # 运行模式：exclusive（独占接管原生小爱）| dual（保留原生小爱，通过外部 KWS 服务共存）
+  mode: exclusive
   speech_socket: /tmp/mico_aivs_lab/usock/speech.usock
   session_idle_timeout_s: 20
+
+# 仅 runtime.mode: dual 时生效；修改 kws 或 capture 后需重启生效
+# dual:
+#   kws:
+#     endpoint: "192.168.31.1:5005" # 外部 UDP XPCM KWS 服务地址（见 docs/external-kws-protocol.md）
+#     ping_interval_s: 30
+#   capture:
+#     device: "noop"       # LX06 默认：48kHz 8ch S32_LE；通用 16kHz 单麦设 sample_rate: 16000, channels: 1, format: S16_LE, ref_channel: null
+#     sample_rate: 48000
+#     channels: 8
+#     format: S32_LE
+#     mic_channel: 0
+#     ref_channel: 6       # 硬件 DAC 回采通道（null 表示禁用）
+#     shift_bits: 9
+#   enter_prompt: "我在，请讲"
+#   exit_prompt: "已退出对话模式，再见"
+#   # 可选提示音文件（相对 agent.yaml 目录或绝对路径；不存在时自动回退 TTS）
+#   enter_earcon: "enter_prompt.wav"
+#   exit_earcon: "exit_prompt.wav"
+#   thinking_earcon: "thinking_prompt.wav"
+#   session_timeout_s: 60
 
 device:
   # 单条设备命令（tts_play.sh / miplayer / ubus）的最长执行时间，秒
@@ -13,6 +36,11 @@ device:
   duck_audio_command: "amixer sget mysoftvol | awk -F'[][]' '/%/ {print $2; exit}' | tr -d '%' >/tmp/xiaoai-mysoftvol.before; amixer sset mysoftvol 25% >/dev/null 2>&1 || true"
   unduck_audio_command: "v=$(cat /tmp/xiaoai-mysoftvol.before 2>/dev/null); if [ -n \"$v\" ]; then amixer sset mysoftvol \"${v}%\" >/dev/null 2>&1 || true; fi; rm -f /tmp/xiaoai-mysoftvol.before"
   abort_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause 2>/dev/null || true; ubus call mediaplayer media_control '{\"player\":\"mediaplayer\",\"action\":\"pause\",\"volume\":0}' 2>/dev/null || true; ubus call mediaplayer player_play_operation '{\"media\":\"app_ios\",\"action\":\"stop\"}' 2>/dev/null || true"
+  # 音量控制命令（/volume 与语音「大声点」使用；以下为 LX06/OH2P 默认值，{level} 为 0-100）：
+  # volume_up_command: "mphelper volume_up >/dev/null 2>&1 || true"
+  # volume_down_command: "mphelper volume_down >/dev/null 2>&1 || true"
+  # volume_set_command: "mphelper volume_set {level} >/dev/null 2>&1 || true"
+  # volume_mute_command: "mphelper volume_set 0 >/dev/null 2>&1 || true"
   led_enabled: true
   led_listening: 3
   led_user_speaking: 4
@@ -30,6 +58,12 @@ capture:
   min_speech_ms: 300
   max_utterance_s: 15.0
   cooldown_s: 0.7
+  # 自适应 VAD / 动态静音（均为默认值，可省略）：
+  # adaptive_noise_floor: true        # 按环境底噪自动抬高阈值
+  # noise_floor_multiplier: 2.5       # 阈值 = 底噪 × 倍数（不低于 threshold）
+  # dynamic_silence: true             # 短句更快收尾，长句容忍更长停顿
+  # short_utterance_silence_ms: 600
+  # long_utterance_silence_ms: 1050
 
 asr:
   # open_ai or openai_realtime
@@ -43,7 +77,7 @@ asr:
     model: whisper-1
     language: zh
     prompt: ""
-    timeout_s: 5
+    timeout_s: 10   # 默认 10（原 5 易在弱网下误超时）
     retries: 1
     # 蚂蚁百灵（实测 2026-10-25）：接口与 OpenAI audio/transcriptions 兼容。
     #   base_url: https://api.ant-ling.com/v1
@@ -77,7 +111,7 @@ llm:
   base_url: https://api.openai.com/v1
   api_key: EMPTY
   model: gpt-5.4-mini
-  timeout_s: 10
+  timeout_s: 20   # 默认 20；低于 10 会在启动时给出警告
   max_tokens: 300
   temperature: 0.5
   thinking:

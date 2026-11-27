@@ -281,9 +281,8 @@ impl SocketOwnership {
         matches!((self.inode, read_inode(&self.path)), (Some(mine), Some(now)) if now != mine)
     }
 
-    /// 测试用：`inode: None` = 当初 stat 失败，此时 `still_owned()` 与
-    /// `taken_over()` 都是 false（不能断言归属）。
-    #[cfg(test)]
+    /// `inode: None` = 没有自己 bind 的 socket（dual 模式）或当初 stat 失败，
+    /// 此时 `still_owned()` 与 `taken_over()` 都是 false（不能断言归属）。
     pub fn unattributed(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
@@ -546,6 +545,41 @@ async fn supervise_service(
     }
 }
 
+/// 判断 `speech.usock` 的 I/O 错误是否属于瞬时可恢复错误。
+///
+/// `Interrupted` / `WouldBlock` / `ConnectionRefused`（例如 mipns 重启中）以及
+/// `ENOBUFS` / `EAGAIN` 不应当撕毁收包循环或消耗 `MAX_SERVICE_RESTARTS`；
+/// 而 `EBADF` / `ENOTSOCK` / `EINVAL` 等表示底层 socket 不可用的错误必须继续向上传播。
+fn is_recoverable_socket_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        err.kind(),
+        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::ConnectionRefused
+    ) {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const RAW_RECOVERABLE: &[i32] = &[11 /* EAGAIN */, 105 /* ENOBUFS */];
+    #[cfg(target_os = "macos")]
+    const RAW_RECOVERABLE: &[i32] = &[35 /* EAGAIN */, 55 /* ENOBUFS */];
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    const RAW_RECOVERABLE: &[i32] = &[];
+
+    err.raw_os_error()
+        .is_some_and(|code| RAW_RECOVERABLE.contains(&code))
+}
+
+fn should_log_rate_limited(last_warn_ms: &AtomicU64, interval_ms: u64) -> bool {
+    let now = now_ms();
+    let prev = last_warn_ms.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) >= interval_ms {
+        last_warn_ms.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 async fn run_service(
     socket: &UnixDatagram,
     event_tx: &mpsc::Sender<SpeechServiceEvent>,
@@ -559,7 +593,17 @@ async fn run_service(
     loop {
         tokio::select! {
             packet = socket.recv_from(&mut buffer) => {
-                let (size, peer) = packet.context("receive speech.usock datagram")?;
+                let (size, peer) = match packet {
+                    Ok(v) => v,
+                    Err(err) if is_recoverable_socket_error(&err) => {
+                        static LAST_RECV_WARN_MS: AtomicU64 = AtomicU64::new(0);
+                        if should_log_rate_limited(&LAST_RECV_WARN_MS, 5_000) {
+                            warn!(error = %err, "transient speech.usock recv error, continuing");
+                        }
+                        continue;
+                    }
+                    Err(err) => return Err(err).context("receive speech.usock datagram"),
+                };
                 // 打点放在 `?` 之后：recv 失败不是「收到过包」。放在前面会让持续
                 // 出错的几秒里 last_packet_age 一直显示「刚刚」，把故障藏起来。
                 liveness.last_packet_ms.store(now_ms(), Ordering::Relaxed);
@@ -828,10 +872,24 @@ async fn send_downward(
         varint_field(1, SPEECH_TYPE_DOWNWARD),
         bytes_field(3, &message(downward)),
     ]);
-    let written = socket
-        .send_to(&speech, peer)
-        .await
-        .with_context(|| format!("send speech response to {}", peer.display()))?;
+    let written = match socket.send_to(&speech, peer).await {
+        Ok(written) => written,
+        Err(err) if is_recoverable_socket_error(&err) => {
+            static LAST_SEND_WARN_MS: AtomicU64 = AtomicU64::new(0);
+            if should_log_rate_limited(&LAST_SEND_WARN_MS, 5_000) {
+                warn!(
+                    peer = %peer.display(),
+                    down_type,
+                    error = %err,
+                    "transient speech.usock send error, dropping downward response"
+                );
+            }
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("send speech response to {}", peer.display()));
+        }
+    };
     if written != speech.len() {
         bail!(
             "short speech datagram write: wrote {written}, wanted {}",
@@ -1446,6 +1504,106 @@ mod tests {
 
         drop(service);
         drop(client);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn socket_error_grading_distinguishes_transient_from_fatal() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(is_recoverable_socket_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
+        assert!(is_recoverable_socket_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        assert!(is_recoverable_socket_error(&Error::from(
+            ErrorKind::ConnectionRefused
+        )));
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert!(is_recoverable_socket_error(&Error::from_raw_os_error(105)));
+            assert!(is_recoverable_socket_error(&Error::from_raw_os_error(11)));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_recoverable_socket_error(&Error::from_raw_os_error(55)));
+            assert!(is_recoverable_socket_error(&Error::from_raw_os_error(35)));
+        }
+
+        assert!(!is_recoverable_socket_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
+        assert!(!is_recoverable_socket_error(&Error::from(
+            ErrorKind::BrokenPipe
+        )));
+        // EBADF is 9 on both Linux and macOS.
+        assert!(!is_recoverable_socket_error(&Error::from_raw_os_error(9)));
+    }
+
+    #[tokio::test]
+    async fn recoverable_send_error_to_missing_peer_does_not_kill_service_loop() {
+        let temp = std::env::temp_dir().join(format!("xa-rec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir(&temp).unwrap();
+        let server_path = temp.join("srv.sock");
+        let dead_client_path = temp.join("dead.sock");
+        let live_client_path = temp.join("live.sock");
+
+        let server_socket = UnixDatagram::bind(&server_path).unwrap();
+        let dead_client = UnixDatagram::bind(&dead_client_path).unwrap();
+        // Queue a register datagram while dead_client is bound, then drop dead_client
+        // before the service loop starts so replying hits a real ECONNREFUSED.
+        dead_client
+            .send_to(&register(None), &server_path)
+            .await
+            .unwrap();
+        drop(dead_client);
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let handle = SpeechHandle { command_tx };
+        let liveness = SpeechLiveness::default();
+        let task = tokio::spawn(supervise_service(
+            server_socket,
+            event_tx,
+            command_rx,
+            handle.clone(),
+            liveness.clone(),
+        ));
+
+        let ev = timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("service loop should stay alive and emit Registered despite ECONNREFUSED")
+            .expect("event channel should stay open");
+        assert!(matches!(ev, SpeechServiceEvent::Registered { .. }));
+        assert_eq!(
+            liveness.restarts(),
+            0,
+            "recoverable ConnectionRefused on send_to must not restart the service loop"
+        );
+
+        let live_client = UnixDatagram::bind(&live_client_path).unwrap();
+        live_client
+            .send_to(&register(None), &server_path)
+            .await
+            .unwrap();
+        assert_eq!(recv_downward(&live_client).await.0, DOWN_REGISTER_RESPONSE);
+        assert_eq!(
+            recv_downward(&live_client).await.0,
+            DOWN_ENABLE_VOICE_WAKEUP
+        );
+        assert!(matches!(
+            timeout(Duration::from_secs(1), event_rx.recv()).await,
+            Ok(Some(SpeechServiceEvent::Registered { .. }))
+        ));
+        assert_eq!(liveness.restarts(), 0);
+
+        drop(handle);
+        task.abort();
+        let _ = task.await;
+        drop(live_client);
         fs::remove_dir_all(temp).unwrap();
     }
 }

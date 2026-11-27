@@ -8,8 +8,18 @@
 ![](https://forthebadge.com/images/badges/makes-people-smile.svg)
 
 An independent voice Agent that runs directly on XiaoAI speakers. With external ASR and LLM service API configuration, the speaker can handle wake word detection, ASR, LLM conversation, tool calls, and TTS replies on device.
-Unlike Open-XiaoAI and [MiGPT](https://github.com/idootop/mi-gpt), XiaoAI Agent does not require a dedicated server for running the Agent, does not compete with the native XiaoAI assistant for microphone input or answers, and does not trigger Xiaomi cloud-side device control.
-At the moment, it has only been successfully tested on Xiaomi Smart Speaker Pro (OH2P) firmware `1.62.2`. Other models and firmware versions require your own adaptation and are used at your own risk.
+Unlike Open-XiaoAI and [MiGPT](https://github.com/idootop/mi-gpt), XiaoAI Agent does not require a dedicated server for running the Agent, and natively supports both **`exclusive`** mode (full takeover without competing with native XiaoAI) and **`dual`** mode (coexisting with native XiaoAI via a router KWS relay).
+
+Tested models & firmware:
+- **XiaoAI Speaker Pro (LX06)** official firmware `1.94.13` (`exclusive` & `dual` modes via built-in [UDP XPCM external KWS](docs/external-kws-protocol.md)) — see [deploy/lx06/README.md](deploy/lx06/README.md), [Python/Docker KWS server](deploy/kws-server/python/README.md), and [Redmi AX5 KWS server](deploy/kws-server/ax5/README.md)
+- **Xiaomi Smart Speaker Pro (OH2P)** official firmware `1.62.2` (`exclusive` mode) — see [deploy/OH2P_1.62.2_BUILD_NOTES.md](deploy/OH2P_1.62.2_BUILD_NOTES.md)
+
+Other models and firmware versions require your own adaptation (check [docs/models.md](docs/models.md) first) and are used at your own risk.
+
+> **Documentation Index (Single Source of Truth)**:
+> [Architecture & Interaction Design](docs/architecture.md) · [External KWS Protocol](docs/external-kws-protocol.md) · [Supported Models](docs/models.md) · [Control Plane API](docs/control-api.md) · [Engineering Invariants](AGENTS.md)
+
+> Tip: Run `/data/open-xiaoai/xiaoai-agent doctor -c /data/open-xiaoai/agent.yaml` on the speaker to check config warnings, socket/PID status, `/tmp` free space, and upstream ASR/LLM/MCP connectivity before starting.
 
 https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 

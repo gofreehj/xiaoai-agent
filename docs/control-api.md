@@ -22,7 +22,17 @@ server:
 | 端点 | 说明 |
 |---|---|
 | `GET /health` | 活体判据：`speech.usock` 是否仍归本进程所有 |
-| `GET /status` | 同上 + `pid` + 配置路径 |
+| `GET /status` | 同上 + `pid` + 配置路径 + 阶段/最近一轮时延 |
+| `GET /music/status` | 当前音乐播放状态（音乐服务不可用时 503） |
+| `POST /stop` | 打断当前会话并停止全部输出（TTS + 音乐），幂等 |
+| `POST /speak` | body `{"text":"..."}`：让音箱朗读这段文字（排队执行） |
+| `POST /chat` | body `{"text":"..."}`：把文字当作用户提问，走完整 LLM → TTS 管线（排队执行，返回 `{"ok":true,"queued":true}`） |
+| `POST /reload` | 等价 `SIGHUP`，热加载 `agent.yaml` |
+| `POST /volume` | body `{"action":"up"\|"down"\|"mute"\|"set","value":0-100}`；`set` 必须带 `value`，否则 400 |
+| `POST /music/pause` `resume` `next` `previous` `stop` | 音乐控制 |
+| `POST /history/clear` | 清空对话历史 |
+
+所有写操作**只接受 POST**（GET 返回 405），且和读接口一样受 Bearer 鉴权。`exclusive` 与 `dual` 两种模式都已接线。未接线的端点返回 `503`（`/stop` 除外）。
 
 鉴权：`Authorization: Bearer <token>`（`token` 为空时不校验）。
 
@@ -30,6 +40,10 @@ server:
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8765/health
 # {"status":"ok","uptime_s":128,"socket":{"path":"/tmp/.../speech.usock","owned":true},
 #  "speech":{"last_packet_age_s":3,"service_restarts":0}}
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"text":"今天天气怎么样"}' http://127.0.0.1:8765/chat
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"action":"set","value":40}' http://127.0.0.1:8765/volume
 ```
 
 `/health` 判的是 **inode 归属**，不是「进程还在」：让位、被原生抢回、socket 被删掉重建，三种「管线已死但进程活着」都会让它返回 **503**（`status: socket_not_owned`）。
@@ -50,4 +64,8 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8765/health
 
 ## 未实现
 
-`/play/*`、`/wakeup`、`/stop` 还没做：它们需要 `playback_token` 的打断语义（issue #6 第一步已落地），属于 #9 的后续步骤。
+`/play/*`、`/wakeup` 还没做。
+
+## 自检
+
+`xiaoai-agent doctor -c agent.yaml` 离线检查配置警告、socket/PID、`/tmp` 剩余空间，并探测 ASR/LLM/天气/MCP 的连通性与 RTT。

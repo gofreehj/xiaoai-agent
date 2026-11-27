@@ -122,10 +122,38 @@ Rules:
   `sh` that is halfway through `restore_native_frontend`, leaving the takeover
   half-dismantled. Never route TTS/playback through the detached path: those must
   die with the turn.
-- Known gap, tracked in issue #13: a single `speech.usock` send/recv error still
-  escalates to `SpeechServiceEvent::Fatal`. Grading those errors (warn and
-  continue for recoverable `errno`s, fatal only for an unusable socket) needs
-  its own bounded-retry design and is not implemented yet.
+- `speech.usock` send/recv error grading (issue #13): transient `errno`s
+  (`EAGAIN`, `EWOULDBLOCK`, `EINTR`, `ENOBUFS`, `ENOMEM`) are logged and retried
+  with bounded counts inside `speech.rs` rather than immediately escalating to
+  `SpeechServiceEvent::Fatal`; unrecoverable socket errors still escalate cleanly.
+
+## Modular Architecture & Dual-Mode Invariants
+
+Full architecture overview lives in [docs/architecture.md](docs/architecture.md) and
+[docs/external-kws-protocol.md](docs/external-kws-protocol.md). Both `exclusive`
+(`speech.usock` + `mipns`) and `dual` (built-in `ExternalKwsEngine` talking UDP XPCM to any
+external KWS endpoint; Redmi AX5 and Python/Docker in `deploy/kws-server/` are reference
+implementations) run as a single speaker binary (`xiaoai-agent`) and share the same core runtime:
+
+- `frontend/{mod,mipns,external_kws}.rs` encapsulates transport differences behind
+  `VoiceFrontend` / `FrontendEvent` / `ExternalKwsHandle`. `capture_dual_utterance` must
+  respect `AudioChunk::sys_active` (gate onset when native XiaoAI / hardware loopback plays).
+- `audio/{mod,text_prep}.rs` owns LED state, `PlaybackGate`, earcon playback,
+  quiet-window settlement, and Markdown/URL/Emoji-free sentence splitting.
+- `session/{mod,pipeline,intent}.rs` owns the unified `SessionOrchestrator`,
+  `TurnPipeline` (1.2 s optional `dual.thinking_earcon` when present, streaming idle/hard
+  deadlines, mid-stream error wrap-up), and zero-latency `LocalIntentRouter`
+  (volume, media, exit — do not re-implement native XiaoAI timers/alarms).
+- `control/mod.rs` + `server.rs`: both `exclusive` and `dual` wire
+  `server::spawn_with_hooks` + `ControlRunner`; every route except `/` stays
+  behind router-level `require_token`, and mutating routes stay `POST`-only.
+- `runtime/reload.rs`: `runtime.mode`, `server`, `dual.kws`, and `dual.capture` are restart-only
+  sections rolled back on `SIGHUP` alongside `device`, `asr`, and `airplay`.
+- **LX06 flashing hard rules** (consolidated from former `deploy/lx06/AGENTS.md`):
+  only write inactive `boot0/1` or `system0/1`; never write `bootloader`, `tpl`,
+  or `data`; always back up all 6 partitions using real `/proc/mtd` sizes (never
+  OH2P sizes) and byte-verify readback before switching `boot_part`; never apply
+  `patches/core/` with `--fuzz > 0`.
 
 ## Testing Rules
 

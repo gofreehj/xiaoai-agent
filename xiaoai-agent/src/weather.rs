@@ -1,23 +1,45 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use reqwest::Client;
 use serde_json::{json, Value};
+use tokio::time::sleep;
+use tracing::warn;
 use url::Url;
 
-use crate::config::{timeout_duration, AppConfig, WeatherConfig};
+use crate::config::{AppConfig, WeatherConfig};
+
+const WEATHER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const WEATHER_MAX_RETRIES: usize = 2;
+const IP_LOCATION_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+struct CachedIpLocation {
+    url: String,
+    fetched_at: std::time::Instant,
+    location: String,
+    label: String,
+}
 
 #[derive(Clone)]
 pub struct WeatherService {
     config: Arc<AppConfig>,
     client: Client,
+    ip_location_cache: Arc<tokio::sync::Mutex<Option<CachedIpLocation>>>,
 }
 
 impl WeatherService {
     pub fn new(config: Arc<AppConfig>) -> Self {
+        let client = Client::builder()
+            .connect_timeout(WEATHER_CONNECT_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             config,
-            client: Client::new(),
+            client,
+            ip_location_cache: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -35,25 +57,26 @@ impl WeatherService {
             "agent.weather.qweather_url is empty"
         );
 
-        let (location, label) = if requested_location.is_empty() {
+        let effective_location = effective_requested_location(requested_location, &settings.default_location);
+        let (location, label) = if effective_location.is_empty() {
             self.auto_ip_location(settings).await.unwrap_or_else(|err| {
                 (
                     settings.default_location.clone(),
                     format!("default location {} ({err})", settings.default_location),
                 )
             })
-        } else if looks_like_qweather_location(requested_location) {
+        } else if looks_like_qweather_location(effective_location) {
             (
-                requested_location.to_string(),
-                requested_location.to_string(),
+                effective_location.to_string(),
+                effective_location.to_string(),
             )
         } else {
-            self.lookup_city(settings, requested_location)
+            self.lookup_city(settings, effective_location)
                 .await
                 .unwrap_or_else(|err| {
                     (
-                        requested_location.to_string(),
-                        format!("{requested_location} ({err})"),
+                        effective_location.to_string(),
+                        format!("{effective_location} ({err})"),
                     )
                 })
         };
@@ -65,10 +88,21 @@ impl WeatherService {
     }
 
     async fn auto_ip_location(&self, settings: &WeatherConfig) -> anyhow::Result<(String, String)> {
+        {
+            let cache = self.ip_location_cache.lock().await;
+            if let Some(entry) = cache.as_ref() {
+                if entry.url == settings.ip_lookup_url
+                    && entry.fetched_at.elapsed() < IP_LOCATION_CACHE_TTL
+                {
+                    return Ok((entry.location.clone(), entry.label.clone()));
+                }
+            }
+        }
+        let attempt_timeout = Duration::from_secs_f64(settings.timeout_s.clamp(0.4, 10.0));
         let data = self
             .client
             .get(&settings.ip_lookup_url)
-            .timeout(timeout_duration(settings.timeout_s))
+            .timeout(attempt_timeout)
             .send()
             .await?
             .error_for_status()?
@@ -98,7 +132,17 @@ impl WeatherService {
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
-        Ok((format!("{lon:.4},{lat:.4}"), label))
+        let location = format!("{lon:.4},{lat:.4}");
+        {
+            let mut cache = self.ip_location_cache.lock().await;
+            *cache = Some(CachedIpLocation {
+                url: settings.ip_lookup_url.clone(),
+                fetched_at: std::time::Instant::now(),
+                location: location.clone(),
+                label: label.clone(),
+            });
+        }
+        Ok((location, label))
     }
 
     async fn lookup_city(
@@ -134,21 +178,66 @@ impl WeatherService {
     }
 
     async fn fetch_json(&self, url: Url, settings: &WeatherConfig) -> anyhow::Result<Value> {
+        let attempt_timeout = Duration::from_secs_f64(settings.timeout_s.clamp(0.4, 10.0));
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for attempt in 0..=WEATHER_MAX_RETRIES {
+            match self.fetch_json_once(&url, attempt_timeout).await {
+                Ok(val) => return Ok(val),
+                Err((retryable, err)) => {
+                    warn!(
+                        attempt = attempt + 1,
+                        max_attempts = WEATHER_MAX_RETRIES + 1,
+                        retryable,
+                        error = %err,
+                        "QWeather 请求失败"
+                    );
+                    last_err = Some(err);
+                    if !retryable || attempt == WEATHER_MAX_RETRIES {
+                        break;
+                    }
+                    sleep(Duration::from_millis(80)).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("QWeather 请求失败")))
+    }
+
+    async fn fetch_json_once(
+        &self,
+        url: &Url,
+        attempt_timeout: Duration,
+    ) -> Result<Value, (bool, anyhow::Error)> {
         let response = self
             .client
-            .get(url)
-            .timeout(timeout_duration(settings.timeout_s))
+            .get(url.as_str())
+            .timeout(attempt_timeout)
             .send()
-            .await?;
+            .await
+            .map_err(|err| (true, anyhow::Error::new(err).context("QWeather request failed")))?;
         let status = response.status();
-        let text = response.text().await?;
-        anyhow::ensure!(
-            status.is_success(),
-            "QWeather HTTP {status}: {}",
-            preview(&text)
-        );
+        let text = response
+            .text()
+            .await
+            .map_err(|err| (true, anyhow::Error::new(err).context("QWeather body read failed")))?;
+        if !status.is_success() {
+            let retryable = status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            return Err((
+                retryable,
+                anyhow::anyhow!("QWeather HTTP {status}: {}", preview(&text)),
+            ));
+        }
         serde_json::from_str(&text)
-            .with_context(|| format!("QWeather returned non-JSON body: {}", preview(&text)))
+            .map_err(|err| (false, anyhow::Error::new(err).context(format!("QWeather returned non-JSON body: {}", preview(&text)))))
+    }
+}
+
+fn effective_requested_location<'a>(requested_location: &'a str, default_location: &'a str) -> &'a str {
+    let requested = requested_location.trim();
+    if !requested.is_empty() {
+        requested
+    } else {
+        default_location.trim()
     }
 }
 
@@ -298,5 +387,66 @@ mod tests {
         assert_eq!(summary["location"], "郑州");
         assert_eq!(summary["raw"]["error"], "no daily field");
         assert!(summary.get("forecast").is_none());
+    }
+
+    #[test]
+    fn effective_requested_location_prefers_explicit_then_default() {
+        assert_eq!(
+            effective_requested_location("北京", "117.199,39.0851"),
+            "北京"
+        );
+        assert_eq!(
+            effective_requested_location("  ", "117.199,39.0851"),
+            "117.199,39.0851"
+        );
+        assert_eq!(effective_requested_location("", ""), "");
+    }
+
+    #[tokio::test]
+    async fn auto_ip_location_caches_result_across_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_server = hits.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_server.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"latitude":39.9042,"longitude":116.4074,"city":"Beijing","country_name":"China"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let mut cfg = AppConfig::default();
+        cfg.agent.weather.ip_lookup_url = format!("http://{addr}/ip");
+        cfg.agent.weather.timeout_s = 2.0;
+        let settings = cfg.agent.weather.clone();
+        let service = WeatherService::new(Arc::new(cfg));
+
+        let first = service.auto_ip_location(&settings).await.unwrap();
+        let second = service.auto_ip_location(&settings).await.unwrap();
+        server.abort();
+
+        assert_eq!(first, ("116.4074,39.9042".to_string(), "Beijing China".to_string()));
+        assert_eq!(second, first);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second auto_ip_location call should be served from in-memory cache"
+        );
     }
 }

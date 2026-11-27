@@ -1,0 +1,30 @@
+# 来源与许可证记录
+
+本目录（`deploy/lx06/`）是 LX06 端侧语音闭环的规格、脚本与证据。仓库整体授权见根目录
+`LICENSE`（LGPL-3.0）。下面列出复用了外部代码或许可约束的部分。
+
+## 上游项目
+
+| 项目 | 许可证 | 本仓库用到的内容 |
+|---|---|---|
+| [stevenjoezhang/xiaoai-agent](https://github.com/stevenjoezhang/xiaoai-agent) | LGPL-3.0 | A 方案基线：Rust Agent、原生 PNS 语音前端、`speech.usock` 协议、启动器编排；`deploy/client-patch/` 的通用补丁与 `mico_all` 解包格式 |
+| [coderzc/open-xiaoai](https://github.com/coderzc/open-xiaoai) | MIT | 仅作 LX06 音频链路与 OTA 查询接口的历史参考。 |
+| [Liu-zhongxian/zongzhu-bot](https://github.com/Liu-zhongxian/zongzhu-bot) | MIT | `scripts/lib/mico_extract.py`、`sqfs_list_diff.py`、`tree_diff.py`（原样取用）；只读备份 → 只写非活动槽 → 读回比对的流程编排思路 |
+| [kslr/xiaoai-plus](https://github.com/kslr/xiaoai-plus) | MIT | 仅作音频前端参考（AEC/降噪、4 通道视图、唤醒词表），未复制代码 |
+
+## 本目录新增的代码
+
+`scripts/build-image.sh`、`scripts/ota-query.py`、`scripts/discover-parts.sh`、
+`scripts/backup_readonly.sh`、`scripts/flash_slot.sh`、`scripts/p0-check.sh`、
+`scripts/build-agent.sh`、`scripts/package-runtime.sh`、`scripts/expected-changes-lx06.txt`、
+`scripts/lib/verify_build.py` 为本项目新写，按根目录 `LICENSE`（LGPL-3.0）授权。
+
+## LGPL 合规说明
+
+如果对外分发修改过的 LGPL 代码（包括链接 `xiaoai-agent` 的二进制），需要同时提供对应源码
+与修改说明。仓库内部使用不触发该义务；对外分发前先复核根目录 `LICENSE` 与本文件。
+
+## 固件包
+
+`deploy/client-patch/assets/mico_all_*.bin` 是小米官方固件，仅本地解包构建使用，
+不随仓库提交（见根目录 `.gitignore`）。固件版权归小米所有。

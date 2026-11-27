@@ -1,5 +1,10 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
 use anyhow::Context;
 use rand::RngCore;
+use reqwest::header::RANGE;
+use reqwest::redirect::Policy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -33,6 +38,10 @@ struct MusicState {
     history: Vec<QueueItem>,
     paused: bool,
     interruption: Option<InterruptionAction>,
+    /// 标记本轮语音交互期间是否新启动了曲目播放（用于外部 TTS 播完回复后补拉起音乐流）。
+    started_in_turn: bool,
+    /// 单调递增的播放代际号：每次切歌/新播/停止时 +1，供结束守望任务过滤过期的 `EndReached`。
+    play_gen: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,19 +57,33 @@ pub struct MusicService {
     config: ConfigHandle,
     device: Device,
     client: Client,
+    no_redirect_client: Client,
     state: Mutex<MusicState>,
     netease_cookie: Mutex<Option<String>>,
 }
 
 impl MusicService {
     pub fn new(config: ConfigHandle, device: Device) -> anyhow::Result<Self> {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()?;
+        let no_redirect_client = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(Policy::none())
+            .build()?;
         Ok(Self {
             config,
             device,
-            client: Client::new(),
+            client,
+            no_redirect_client,
             state: Mutex::new(MusicState::default()),
             netease_cookie: Mutex::new(None),
         })
+    }
+
+    pub async fn is_actively_playing(&self) -> bool {
+        let state = self.state.lock().await;
+        state.current.is_some() && !state.paused
     }
 
     pub async fn search(&self, query: &str, limit: usize) -> Value {
@@ -118,10 +141,13 @@ impl MusicService {
                 match play {
                     Ok(()) => {
                         let mut state = self.state.lock().await;
+                        state.play_gen = state.play_gen.wrapping_add(1);
                         state.current = Some(item.clone());
                         state.queue.clear();
                         state.history.clear();
                         state.paused = false;
+                        state.interruption = None;
+                        state.started_in_turn = true;
                         json!({"playing": true, "song": item.song, "queue_size": state.queue.len()})
                     }
                     Err(err) => json!({"error": err.to_string(), "song": item.song}),
@@ -187,6 +213,7 @@ impl MusicService {
                     state.history.clear();
                     state.queue = items;
                     state.paused = false;
+                    state.interruption = None;
                 }
 
                 match self.play_next_from_queue().await {
@@ -226,7 +253,11 @@ impl MusicService {
         let paused = self.device.pause_audio().await;
         match paused {
             Ok(()) => {
-                self.state.lock().await.paused = true;
+                let mut state = self.state.lock().await;
+                state.paused = true;
+                // 用户明确要求暂停，退出唤醒会话时不得再被 restore_after_interruption() 拉起。
+                state.interruption = None;
+                state.started_in_turn = false;
                 json!({"paused": true})
             }
             Err(err) => json!({"paused": false, "error": err.to_string()}),
@@ -240,7 +271,10 @@ impl MusicService {
         let resumed = self.device.resume_audio().await;
         match resumed {
             Ok(()) => {
-                self.state.lock().await.paused = false;
+                let mut state = self.state.lock().await;
+                state.paused = false;
+                state.interruption = None;
+                state.started_in_turn = false;
                 json!({"playing": true})
             }
             Err(err) => json!({"playing": false, "error": err.to_string()}),
@@ -248,14 +282,22 @@ impl MusicService {
     }
 
     pub async fn stop(&self) -> Value {
-        self.restore_after_interruption().await;
+        let was_ducked = {
+            let mut state = self.state.lock().await;
+            state.interruption.take() == Some(InterruptionAction::Duck)
+        };
+        if was_ducked {
+            let _ = self.device.unduck_audio().await;
+        }
         let stopped = self.device.stop_audio().await;
         let mut state = self.state.lock().await;
+        state.play_gen = state.play_gen.wrapping_add(1);
         state.current = None;
         state.queue.clear();
         state.history.clear();
         state.paused = false;
         state.interruption = None;
+        state.started_in_turn = false;
         match stopped {
             Ok(()) => json!({"stopped": true}),
             Err(err) => json!({"stopped": false, "error": err.to_string()}),
@@ -299,12 +341,126 @@ impl MusicService {
             state.paused = true;
         }
         state.interruption = Some(mode);
+        state.started_in_turn = false;
         true
+    }
+
+    /// 当外部 TTS (`DEFAULT_PLAYBACK_COMMAND`) 在工具调用 `play_query` 之后执行了 `killall miplayer` 时，
+    /// 在 TTS 回答播报完毕后补拉起本轮刚点播的歌曲。
+    pub async fn ensure_playing_after_external_tts(&self) {
+        let url_to_replay = {
+            let mut state = self.state.lock().await;
+            let should_replay =
+                state.started_in_turn && state.current.is_some() && !state.paused;
+            state.started_in_turn = false;
+            if should_replay {
+                state.current.as_ref().map(|item| item.url.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(url) = url_to_replay {
+            if let Err(err) = self.device.play_url(&url).await {
+                warn!("failed to restart music after external TTS: {err:?}");
+            } else {
+                let mut state = self.state.lock().await;
+                state.play_gen = state.play_gen.wrapping_add(1);
+            }
+        }
+    }
+
+    /// 启动后台曲目结束守望任务：轮询 `/tmp/xiaoai-miplayer.log` 的 `EndReached`，
+    /// 在曲目自然播完时自动切下一首或清空 `current`（避免僵尸状态导致后续误拉起 `mphelper play`）。
+    #[allow(dead_code)]
+    pub fn start_playback_watcher(self: &std::sync::Arc<Self>) {
+        if cfg!(test) {
+            return;
+        }
+        let weak = std::sync::Arc::downgrade(self);
+        tokio::spawn(async move {
+            const MUSIC_LOG_PATH: &str = "/tmp/xiaoai-miplayer.log";
+            let mut last_seen_gen: u64 = 0;
+            let mut gen_observed_at: Option<tokio::time::Instant> = None;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                let active_gen = {
+                    let state = service.state.lock().await;
+                    if state.current.is_some()
+                        && !state.paused
+                        && state.interruption.is_none()
+                    {
+                        Some(state.play_gen)
+                    } else {
+                        None
+                    }
+                };
+                let Some(play_gen) = active_gen else {
+                    continue;
+                };
+                if play_gen != last_seen_gen {
+                    last_seen_gen = play_gen;
+                    gen_observed_at = Some(tokio::time::Instant::now());
+                    // 给 miplayer 至少 1 个周期重新打开并截断日志，避免读到上一首残留的 EndReached。
+                    continue;
+                }
+                if gen_observed_at
+                    .map(|t| t.elapsed() < Duration::from_secs(2))
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                if let Ok(log) = tokio::fs::read_to_string(MUSIC_LOG_PATH).await {
+                    if log.contains("EndReached") {
+                        let _ = service.on_track_finished(play_gen).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// 当当前曲目自然播完时调用：
+    /// - 仅当 `play_gen == expected_gen` 且曲目处于活跃播放（非暂停、非唤醒打断）时生效；
+    /// - 队列非空则自动切下一首；
+    /// - 队列为空则清空 `current` 与 `started_in_turn`，避免僵尸曲目触发后续误拉起。
+    pub async fn on_track_finished(&self, expected_gen: u64) -> bool {
+        let should_advance = {
+            let mut state = self.state.lock().await;
+            if state.play_gen != expected_gen
+                || state.current.is_none()
+                || state.paused
+                || state.interruption.is_some()
+            {
+                return false;
+            }
+            if state.queue.is_empty() {
+                state.current = None;
+                state.started_in_turn = false;
+                return true;
+            }
+            true
+        };
+        if should_advance {
+            match self.play_next_from_queue().await {
+                Ok(_) => {
+                    let mut state = self.state.lock().await;
+                    state.started_in_turn = false;
+                    return true;
+                }
+                Err(err) => {
+                    warn!("auto-advance to next track failed: {err:?}");
+                }
+            }
+        }
+        false
     }
 
     pub async fn restore_after_interruption(&self) {
         let action = {
             let mut state = self.state.lock().await;
+            state.started_in_turn = false;
             state.interruption.take()
         };
         match action {
@@ -340,27 +496,39 @@ impl MusicService {
     }
 
     async fn resolve_one(&self, query: &str, song_id: &str) -> anyhow::Result<QueueItem> {
-        let song = if !song_id.trim().is_empty() {
-            self.song_detail(song_id.trim()).await?
-        } else {
-            self.search_inner(query, 1)
-                .await?
-                .into_iter()
-                .next()
-                .context("no songs found")?
-        };
-        let url = self.song_url(&song.id).await?;
-        Ok(QueueItem { song, url })
+        if !song_id.trim().is_empty() {
+            let song = self.song_detail(song_id.trim()).await?;
+            let url = self.song_url(&song.id).await?;
+            return Ok(QueueItem { song, url });
+        }
+        let snapshot = self.config.get().await;
+        let limit = if snapshot.music.provider == "navidrome" { 10 } else { 1 };
+        let candidates = rank_song_candidates(query, self.search_inner(query, limit).await?);
+        if candidates.is_empty() {
+            anyhow::bail!("no songs found");
+        }
+        let mut last_err: Option<anyhow::Error> = None;
+        for song in candidates {
+            match self.song_url(&song.id).await {
+                Ok(url) => return Ok(QueueItem { song, url }),
+                Err(err) => {
+                    warn!(song_id = %song.id, title = %song.name, error = %err, "candidate stream url unreachable, trying next candidate");
+                    last_err = Some(err);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no playable songs found")))
     }
 
     async fn search_inner(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Song>> {
         let snapshot = self.config.get().await;
         require_music_enabled(&snapshot)?;
-        match snapshot.music.provider.as_str() {
-            "netease" => self.search_netease(query, limit).await,
-            "navidrome" => self.search_navidrome(query, limit).await,
+        let songs = match snapshot.music.provider.as_str() {
+            "netease" => self.search_netease(query, limit).await?,
+            "navidrome" => self.search_navidrome(query, limit).await?,
             other => anyhow::bail!("Unsupported music provider: {other}"),
-        }
+        };
+        Ok(rank_song_candidates(query, songs))
     }
 
     async fn random_songs(&self, limit: usize) -> anyhow::Result<Vec<Song>> {
@@ -377,7 +545,12 @@ impl MusicService {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                Ok(songs.iter().map(parse_navidrome_song).collect())
+                if !songs.is_empty() {
+                    return Ok(songs.iter().map(parse_navidrome_song).collect());
+                }
+                // 部分 OpenSubsonic 后端（如 lxserver）的 getRandomSongs 返回空数组，
+                // 降级从随机专辑列表中拉取真实曲目。
+                self.random_songs_from_albums(limit).await
             }
             _ => self.search_netease("", limit).await,
         }
@@ -421,7 +594,14 @@ impl MusicService {
     async fn song_url(&self, song_id: &str) -> anyhow::Result<String> {
         let snapshot = self.config.get().await;
         match snapshot.music.provider.as_str() {
-            "navidrome" => Self::navidrome_stream_url(&snapshot, song_id),
+            "navidrome" => {
+                let raw_url = Self::navidrome_stream_url(&snapshot, song_id)?;
+                self.probe_navidrome_stream_url(
+                    &raw_url,
+                    timeout_duration(snapshot.music.navidrome.timeout_s),
+                )
+                .await
+            }
             _ => {
                 let data = self
                     .netease_request(
@@ -451,16 +631,39 @@ impl MusicService {
             if let Some(current) = state.current.take() {
                 state.history.push(current);
             }
+            state.play_gen = state.play_gen.wrapping_add(1);
             state.current = Some(item.clone());
             state.paused = false;
+            state.interruption = None;
+            state.started_in_turn = true;
             item
         };
         self.device.play_url(&item.url).await?;
         Ok(item)
     }
 
-    async fn has_current(&self) -> bool {
+    pub async fn has_current(&self) -> bool {
         self.state.lock().await.current.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_current_for_test(&self, song_id: &str, name: &str, url: &str) {
+        let mut state = self.state.lock().await;
+        state.play_gen = state.play_gen.wrapping_add(1);
+        state.current = Some(QueueItem {
+            song: Song {
+                id: song_id.to_string(),
+                name: name.to_string(),
+                artists: vec!["周杰伦".to_string()],
+                album: String::new(),
+                duration_ms: None,
+                fee: None,
+            },
+            url: url.to_string(),
+        });
+        state.paused = false;
+        state.interruption = None;
+        state.started_in_turn = false;
     }
 
     async fn play_previous_from_history(&self) -> anyhow::Result<QueueItem> {
@@ -470,8 +673,11 @@ impl MusicService {
             if let Some(current) = state.current.take() {
                 state.queue.insert(0, current);
             }
+            state.play_gen = state.play_gen.wrapping_add(1);
             state.current = Some(item.clone());
             state.paused = false;
+            state.interruption = None;
+            state.started_in_turn = true;
             item
         };
         self.device.play_url(&item.url).await?;
@@ -558,50 +764,203 @@ impl MusicService {
             .await?)
     }
 
+    async fn random_songs_from_albums(&self, limit: usize) -> anyhow::Result<Vec<Song>> {
+        let data = self
+            .navidrome_request(
+                "/rest/getAlbumList2.view",
+                &[("type", "random".to_string()), ("size", "5".to_string())],
+            )
+            .await?;
+        let albums = data
+            .get("albumList2")
+            .and_then(|v| v.get("album"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut collected = Vec::new();
+        for album in albums {
+            if collected.len() >= limit {
+                break;
+            }
+            let album_id = value_string(&album["id"]);
+            if album_id.is_empty() || album_id == "null" {
+                continue;
+            }
+            let Ok(album_data) = self
+                .navidrome_request("/rest/getAlbum.view", &[("id", album_id)])
+                .await
+            else {
+                continue;
+            };
+            let songs = album_data
+                .get("album")
+                .and_then(|a| a.get("song"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for item in songs {
+                collected.push(parse_navidrome_song(&item));
+                if collected.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(collected)
+    }
+
+    async fn probe_navidrome_stream_url(
+        &self,
+        raw_url: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<String> {
+        let mut current = Url::parse(raw_url)?;
+        for _hop in 0..5 {
+            let resp = self.send_stream_hop(&current, timeout).await?;
+            let status = resp.status();
+            if status.is_redirection() {
+                let loc = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .context("stream redirect missing Location header")?;
+                current = current.join(loc)?;
+                continue;
+            }
+            if !status.is_success() {
+                anyhow::bail!("stream url returned HTTP {status}");
+            }
+            if let Some(ct) = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+            {
+                let lower = ct.to_ascii_lowercase();
+                if lower.contains("application/json") || lower.contains("xml") {
+                    anyhow::bail!("stream url returned API error payload ({lower})");
+                }
+            }
+            return Ok(current.to_string());
+        }
+        anyhow::bail!("too many redirects resolving stream url")
+    }
+
+    async fn send_stream_hop(
+        &self,
+        url: &Url,
+        timeout: Duration,
+    ) -> anyhow::Result<reqwest::Response> {
+        match self
+            .no_redirect_client
+            .get(url.as_str())
+            .header(RANGE, "bytes=0-1")
+            .timeout(timeout)
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(resp),
+            Err(err) => {
+                // 部分运营/路由 DNS 会把音源跳转域名污染到 0.0.0.0（导致 Connection refused）。
+                // 对公网域名通过 AliDNS DoH 二次解析并在单跳 Client 内覆盖解析，避免修改系统 hosts/DNS。
+                if let Some(url::Host::Domain(domain)) = url.host() {
+                    if !domain.eq_ignore_ascii_case("localhost") && !domain.ends_with(".local") {
+                        if let Some(ip) = self.resolve_domain_via_alidns(domain).await {
+                            let port = url.port_or_known_default().unwrap_or(443);
+                            let override_client = Client::builder()
+                                .connect_timeout(Duration::from_secs(5))
+                                .redirect(Policy::none())
+                                .resolve(domain, SocketAddr::new(IpAddr::V4(ip), port))
+                                .build()?;
+                            return override_client
+                                .get(url.as_str())
+                                .header(RANGE, "bytes=0-1")
+                                .timeout(timeout)
+                                .send()
+                                .await
+                                .with_context(|| "stream url connection failed after DoH fallback");
+                        }
+                    }
+                }
+                Err(err).context("stream url connection failed")
+            }
+        }
+    }
+
+    async fn resolve_domain_via_alidns(&self, domain: &str) -> Option<Ipv4Addr> {
+        let mut doh = Url::parse("https://223.5.5.5/resolve").ok()?;
+        doh.query_pairs_mut()
+            .append_pair("name", domain)
+            .append_pair("type", "A");
+        let resp = self
+            .client
+            .get(doh)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .ok()?;
+        let data = resp.json::<Value>().await.ok()?;
+        for ans in data.get("Answer")?.as_array()? {
+            if let Some(ip_str) = ans.get("data").and_then(Value::as_str) {
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    if !ip.is_unspecified() && !ip.is_loopback() {
+                        return Some(ip);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     async fn navidrome_request(
         &self,
         path: &str,
         params: &[(&str, String)],
     ) -> anyhow::Result<Value> {
         let snapshot = self.config.get().await;
-        let mut url = Url::parse(&snapshot.music.navidrome.base_url)?;
-        url.set_path(path);
-        let (salt, token) = subsonic_token(&snapshot.music.navidrome.password);
-        {
-            let mut pairs = url.query_pairs_mut();
-            pairs
-                .append_pair("u", &snapshot.music.navidrome.username)
-                .append_pair("t", &token)
-                .append_pair("s", &salt)
-                .append_pair("v", &snapshot.music.navidrome.api_version)
-                .append_pair("c", "xiaoai-agent")
-                .append_pair("f", "json");
-            for (key, value) in params {
-                pairs.append_pair(key, value);
+        let timeout = timeout_duration(snapshot.music.navidrome.timeout_s);
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..=1 {
+            let mut url = Url::parse(&snapshot.music.navidrome.base_url)?;
+            url.set_path(path);
+            let (salt, token) = subsonic_token(&snapshot.music.navidrome.password);
+            {
+                let mut pairs = url.query_pairs_mut();
+                pairs
+                    .append_pair("u", &snapshot.music.navidrome.username)
+                    .append_pair("t", &token)
+                    .append_pair("s", &salt)
+                    .append_pair("v", &snapshot.music.navidrome.api_version)
+                    .append_pair("c", "xiaoai-agent")
+                    .append_pair("f", "json");
+                for (key, value) in params {
+                    pairs.append_pair(key, value);
+                }
+            }
+            match self.client.get(url).timeout(timeout).send().await {
+                Ok(resp) => {
+                    let data = resp.json::<Value>().await?;
+                    let response = data
+                        .get("subsonic-response")
+                        .context("Invalid Navidrome response")?;
+                    if response.get("status").and_then(Value::as_str) != Some("ok") {
+                        anyhow::bail!(
+                            "{}",
+                            response
+                                .get("error")
+                                .and_then(|err| err.get("message"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("Navidrome request failed")
+                        );
+                    }
+                    return Ok(response.clone());
+                }
+                Err(err) if attempt == 0 && (err.is_timeout() || err.is_connect()) => {
+                    warn!(path = %path, error = %err, "Navidrome request transient failure, retrying once");
+                    last_err = Some(err.into());
+                }
+                Err(err) => return Err(err.into()),
             }
         }
-        let data = self
-            .client
-            .get(url)
-            .timeout(timeout_duration(snapshot.music.navidrome.timeout_s))
-            .send()
-            .await?
-            .json::<Value>()
-            .await?;
-        let response = data
-            .get("subsonic-response")
-            .context("Invalid Navidrome response")?;
-        if response.get("status").and_then(Value::as_str) != Some("ok") {
-            anyhow::bail!(
-                "{}",
-                response
-                    .get("error")
-                    .and_then(|err| err.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("Navidrome request failed")
-            );
-        }
-        Ok(response.clone())
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Navidrome request failed")))
     }
 
     fn navidrome_stream_url(config: &AppConfig, song_id: &str) -> anyhow::Result<String> {
@@ -681,6 +1040,82 @@ fn split_many(text: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn rank_song_candidates(query: &str, mut songs: Vec<Song>) -> Vec<Song> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || songs.len() <= 1 {
+        return songs;
+    }
+    let query_lower = trimmed.to_ascii_lowercase();
+    let mut terms: Vec<String> = Vec::new();
+    for part in query_lower.split(|c: char| c.is_whitespace() || matches!(c, '、' | ',' | '，' | '-' | '—')) {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if !terms.iter().any(|t| t == p) {
+            terms.push(p.to_string());
+        }
+        if let Some((a, b)) = p.split_once('的') {
+            let (a, b) = (a.trim(), b.trim());
+            if !a.is_empty() && !b.is_empty() {
+                if !terms.iter().any(|t| t == a) {
+                    terms.push(a.to_string());
+                }
+                if !terms.iter().any(|t| t == b) {
+                    terms.push(b.to_string());
+                }
+            }
+        }
+    }
+
+    const COVER_MARKERS: &[&str] = &[
+        "原唱", "翻唱", "cover", "女声", "男声", "钢琴", "吉他", "伴奏", "纯音乐", "dj", "remix",
+    ];
+    const LIVE_MARKERS: &[&str] = &["live", "演唱会", "现场"];
+
+    let wants_cover = COVER_MARKERS.iter().any(|m| query_lower.contains(m));
+    let wants_live = LIVE_MARKERS.iter().any(|m| query_lower.contains(m));
+
+    let score_song = |song: &Song| -> i32 {
+        let title_lower = song.name.trim().to_ascii_lowercase();
+        let base_title = title_lower
+            .split(['(', '（', '['])
+            .next()
+            .unwrap_or(&title_lower)
+            .trim();
+        let artists_lower: Vec<String> = song
+            .artists
+            .iter()
+            .map(|a| a.trim().to_ascii_lowercase())
+            .collect();
+        let artists_joined = artists_lower.join(" ");
+
+        let mut score: i32 = 0;
+        for term in &terms {
+            if artists_lower.iter().any(|a| a == term) {
+                score += 60;
+            } else if term.chars().count() >= 2 && artists_joined.contains(term.as_str()) {
+                score += 35;
+            }
+            if base_title == term.as_str() {
+                score += 45;
+            } else if term.chars().count() >= 2 && base_title.contains(term.as_str()) {
+                score += 25;
+            }
+        }
+        if !wants_cover && COVER_MARKERS.iter().any(|m| title_lower.contains(m)) {
+            score -= 80;
+        }
+        if !wants_live && LIVE_MARKERS.iter().any(|m| title_lower.contains(m)) {
+            score -= 20;
+        }
+        score
+    };
+
+    songs.sort_by(|a, b| score_song(b).cmp(&score_song(a)));
+    songs
 }
 
 fn parse_netease_song(item: &Value) -> Song {
@@ -872,5 +1307,334 @@ mod tests {
         assert_eq!(song.album, "魔杰座");
         assert_eq!(song.duration_ms, Some(223000));
         assert!(song.fee.is_none());
+    }
+
+    async fn spawn_mock_subsonic<F, Fut>(handler: F) -> String
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = (u16, String, Vec<(String, String)>)> + Send,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = std::sync::Arc::new(handler);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let h = handler.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let (code, body, headers) = h(path).await;
+                    let reason = match code {
+                        200 => "OK",
+                        206 => "Partial Content",
+                        302 => "Found",
+                        _ => "Error",
+                    };
+                    let mut resp = format!(
+                        "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        body.len()
+                    );
+                    for (k, v) in headers {
+                        resp.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    resp.push_str("\r\n");
+                    resp.push_str(&body);
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn navidrome_test_service(
+        base_url: String,
+        timeout_s: f64,
+    ) -> (MusicService, std::sync::Arc<crate::shell::RecordingShell>) {
+        let mut cfg = AppConfig::default();
+        cfg.music.enabled = true;
+        cfg.music.provider = "navidrome".to_string();
+        cfg.music.navidrome.base_url = base_url;
+        cfg.music.navidrome.username = "u".to_string();
+        cfg.music.navidrome.password = "p".to_string();
+        cfg.music.navidrome.timeout_s = timeout_s;
+        let shell = std::sync::Arc::new(crate::shell::RecordingShell::always_ok());
+        let device = Device::with_runner(cfg.device.clone(), shell.clone());
+        let handle = ConfigHandle::new(std::sync::Arc::new(cfg));
+        (MusicService::new(handle, device).unwrap(), shell)
+    }
+
+    #[tokio::test]
+    async fn pause_clears_wake_interruption_so_restore_does_not_resume() {
+        let (music, shell) = navidrome_test_service("http://127.0.0.1:9".into(), 2.0);
+        {
+            let mut st = music.state.lock().await;
+            st.current = Some(QueueItem {
+                song: Song {
+                    id: "wy_1".into(),
+                    name: "晴天".into(),
+                    artists: vec!["周杰伦".into()],
+                    album: "".into(),
+                    duration_ms: None,
+                    fee: None,
+                },
+                url: "http://example.com/1.mp3".into(),
+            });
+            st.paused = false;
+        }
+        assert!(music.is_actively_playing().await);
+        assert!(music.interrupt_for_wake().await);
+        assert!(!music.is_actively_playing().await);
+
+        let paused = music.pause().await;
+        assert_eq!(paused["paused"], json!(true));
+        let before = shell.count_matching("mphelper play");
+
+        music.restore_after_interruption().await;
+        assert_eq!(
+            shell.count_matching("mphelper play"),
+            before,
+            "pause() 后退出会话不应由 restore_after_interruption 重新拉起播放"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_after_wake_interruption_never_resumes_audio_before_stopping() {
+        let (music, shell) = navidrome_test_service("http://127.0.0.1:9".into(), 2.0);
+        music
+            .set_current_for_test("wy_1", "晴天", "http://example.com/1.mp3")
+            .await;
+        assert!(music.interrupt_for_wake().await);
+
+        let before_resume = shell.count_matching("mphelper play");
+        let stopped = music.stop().await;
+        assert_eq!(stopped["stopped"], json!(true));
+        assert_eq!(
+            shell.count_matching("mphelper play"),
+            before_resume,
+            "stop() 前不得先调用 resume_audio，否则已被唤醒暂停的音乐会在被杀前突然爆响一下"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_query_skips_unreachable_candidate_and_falls_back_to_next_playable_song() {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead_listener.local_addr().unwrap().port();
+        drop(dead_listener);
+
+        let base = spawn_mock_subsonic(move |path| async move {
+            if path.starts_with("/rest/search3.view") {
+                let body = json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "searchResult3": {
+                            "song": [
+                                {"id": "kw_bad", "title": "晴天(坏源)", "artist": "周杰伦", "duration": 269},
+                                {"id": "wy_good", "title": "晴天", "artist": "周杰伦", "duration": 269}
+                            ]
+                        }
+                    }
+                })
+                .to_string();
+                return (200, body, vec![("Content-Type".into(), "application/json".into())]);
+            }
+            if path.starts_with("/rest/stream.view") && path.contains("id=kw_bad") {
+                return (
+                    302,
+                    String::new(),
+                    vec![("Location".into(), format!("http://127.0.0.1:{dead_port}/dead.flac"))],
+                );
+            }
+            if path.starts_with("/rest/stream.view") && path.contains("id=wy_good") {
+                return (200, "FAKEAUDIO".into(), vec![("Content-Type".into(), "audio/mpeg".into())]);
+            }
+            (404, "not found".into(), vec![])
+        })
+        .await;
+
+        let (music, _shell) = navidrome_test_service(base, 3.0);
+        let res = music.play_query("晴天", "").await;
+        assert_eq!(res["playing"], json!(true), "res={res}");
+        assert_eq!(res["song"]["id"], json!("wy_good"));
+        assert!(music.is_actively_playing().await);
+    }
+
+    #[tokio::test]
+    async fn play_random_falls_back_to_random_albums_when_get_random_songs_is_empty() {
+        let base = spawn_mock_subsonic(|path| async move {
+            if path.starts_with("/rest/getRandomSongs.view") {
+                let body = json!({"subsonic-response": {"status": "ok", "randomSongs": {"song": []}}})
+                    .to_string();
+                return (200, body, vec![("Content-Type".into(), "application/json".into())]);
+            }
+            if path.starts_with("/rest/getAlbumList2.view") {
+                let body = json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "albumList2": {"album": [{"id": "alb_1", "name": "Album 1"}]}
+                    }
+                })
+                .to_string();
+                return (200, body, vec![("Content-Type".into(), "application/json".into())]);
+            }
+            if path.starts_with("/rest/getAlbum.view") {
+                let body = json!({
+                    "subsonic-response": {
+                        "status": "ok",
+                        "album": {"song": [{"id": "tx_1", "title": "Random Hit", "artist": "Artist"}]}
+                    }
+                })
+                .to_string();
+                return (200, body, vec![("Content-Type".into(), "application/json".into())]);
+            }
+            if path.starts_with("/rest/stream.view") {
+                return (200, "AUDIO".into(), vec![("Content-Type".into(), "audio/mpeg".into())]);
+            }
+            (404, "not found".into(), vec![])
+        })
+        .await;
+
+        let (music, _) = navidrome_test_service(base, 3.0);
+        let res = music.play_random(3).await;
+        assert_eq!(res["playing"], json!(true), "res={res}");
+        assert_eq!(res["song"]["id"], json!("tx_1"));
+    }
+
+    #[tokio::test]
+    async fn navidrome_request_retries_once_on_timeout_then_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let attempts_srv = attempts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let n = attempts_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    if n == 0 {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        return;
+                    }
+                    let body = json!({
+                        "subsonic-response": {
+                            "status": "ok",
+                            "searchResult3": {"song": []}
+                        }
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let (music, _) = navidrome_test_service(format!("http://{addr}"), 0.25);
+        let res = music.search("晴天", 3).await;
+        assert_eq!(res, json!([]));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rank_song_candidates_prefers_original_artist_over_cover() {
+        let songs = vec![
+            Song {
+                id: "wy_2668397359".into(),
+                name: "晴天 (原唱 周杰伦)".into(),
+                artists: vec!["RyaVocal".into()],
+                album: "晴天".into(),
+                duration_ms: Some(270_000),
+                fee: None,
+            },
+            Song {
+                id: "wy_3440441479".into(),
+                name: "晴天".into(),
+                artists: vec!["Jay".into()],
+                album: "晴天".into(),
+                duration_ms: Some(112_000),
+                fee: None,
+            },
+            Song {
+                id: "kw_80456317".into(),
+                name: "晴天 (Live)".into(),
+                artists: vec!["周杰伦".into()],
+                album: "演唱会".into(),
+                duration_ms: Some(249_000),
+                fee: None,
+            },
+            Song {
+                id: "kw_228908".into(),
+                name: "晴天".into(),
+                artists: vec!["周杰伦".into()],
+                album: "叶惠美".into(),
+                duration_ms: Some(269_000),
+                fee: None,
+            },
+        ];
+        let ranked = rank_song_candidates("周杰伦的晴天", songs);
+        assert_eq!(ranked[0].id, "kw_228908", "录音室原唱周杰伦《晴天》必须排第一");
+        assert_eq!(ranked[1].id, "kw_80456317", "周杰伦 Live 应排在同名翻唱/封面前面");
+        assert_eq!(ranked.last().unwrap().id, "wy_2668397359", "带原唱字样的翻唱应垫底");
+    }
+
+    #[tokio::test]
+    async fn on_track_finished_auto_advances_queue_clears_when_empty_and_ignores_stale_gen() {
+        let (music, shell) = navidrome_test_service("http://127.0.0.1:9".into(), 2.0);
+        music
+            .set_current_for_test("s1", "第一首", "http://example.com/1.mp3")
+            .await;
+        let gen1 = {
+            let mut st = music.state.lock().await;
+            st.queue.push(QueueItem {
+                song: Song {
+                    id: "s2".into(),
+                    name: "第二首".into(),
+                    artists: vec!["周杰伦".into()],
+                    album: String::new(),
+                    duration_ms: None,
+                    fee: None,
+                },
+                url: "http://example.com/2.mp3".into(),
+            });
+            st.play_gen
+        };
+
+        // Stale play_gen must be ignored.
+        assert!(
+            !music.on_track_finished(gen1.wrapping_sub(1)).await,
+            "过期 play_gen 必须被忽略"
+        );
+        assert_eq!(music.status().await["current"]["id"], json!("s1"));
+
+        // Matching play_gen with non-empty queue auto-advances to s2.
+        assert!(music.on_track_finished(gen1).await);
+        assert_eq!(music.status().await["current"]["id"], json!("s2"));
+        assert_eq!(shell.count_matching("http://example.com/2.mp3"), 1);
+
+        let gen2 = music.state.lock().await.play_gen;
+        assert!(gen2 > gen1, "切歌后 play_gen 必须递增");
+
+        // Matching play_gen with empty queue clears current and started_in_turn.
+        assert!(music.on_track_finished(gen2).await);
+        assert!(!music.has_current().await);
+        assert!(!music.is_actively_playing().await);
+        assert!(!music.state.lock().await.started_in_turn);
     }
 }

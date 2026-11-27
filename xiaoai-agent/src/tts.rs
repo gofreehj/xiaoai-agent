@@ -5,8 +5,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::json;
+use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::audio::FinishMode;
+#[allow(unused_imports)]
+pub use crate::audio::text_prep::{
+    clean_tts_char, has_speakable_char, split_tts_sentences, StreamingSentenceSplitter,
+};
 use crate::config::{OpenAiTtsConfig, TtsConfig, TtsProvider};
 use crate::device::Device;
 
@@ -14,16 +21,13 @@ use crate::device::Device;
 ///
 /// 三条都是真机实测的结论（OH2P 1.62.2，见 `docs/device-scripts.md`）：
 /// - `miplayer -f <本地文件>` 可用（日志 `event(Playing)` → `EndReached`）；
-/// - `miplayer` **播完不会自己退出**，所以下次播放前必须 `killall`；
+/// - `miplayer` **播完不会自己退出**，所以下次播放前必须停掉旧的本地 TTS `miplayer`；
 /// - 后台起播（`&`），否则一条命令就吃掉整个超时预算。
 ///
-/// 已知副作用：这句 `killall miplayer` 也会杀掉 `device.play_url_command` 放音乐
-/// 用的那个 `miplayer`——换到外部 TTS 之后「放歌时说话，歌没了」。native 路径
-/// （`tts_play.sh`）不碰 `miplayer`，所以两条路径行为不同。统一的正确做法是
-/// 「duck → 播 → unduck」（`device.duck_audio_command` / `unduck_audio_command`），
-/// 但那需要先确认压音量对 TTS 播放通道也生效，留待后续。
+/// 通过 `/proc/[0-9]*/cmdline` 精准过滤只杀非 `http(s)://` 的本地文件 `miplayer`，
+/// 避免 `killall miplayer` 误杀暂停中的音乐流进程。
 pub const DEFAULT_PLAYBACK_COMMAND: &str =
-    "killall miplayer 2>/dev/null; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &";
+    "for p in /proc/[0-9]*; do [ -r \"$p/cmdline\" ] || continue; cmd=$(tr '\\0' ' ' <\"$p/cmdline\" 2>/dev/null); case \"$cmd\" in *miplayer*) case \"$cmd\" in *http://*|*https://*) ;; *) kill -9 \"${p#/proc/}\" 2>/dev/null || true ;; esac ;; esac; done; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &";
 
 /// 外部播放器的日志。`DEFAULT_PLAYBACK_COMMAND` 每播一次用 `>` 截断重写，所以
 /// 「里面出现 `EndReached`」就等于「这一句确实放完了」——比按时长估算可靠。
@@ -56,6 +60,7 @@ const FALLBACK_PLAY_DURATION: Duration = Duration::from_secs(30);
 pub struct PlaybackGate {
     token: AtomicU64,
     quiet: Mutex<QuietWindow>,
+    changed: Notify,
 }
 
 /// 采集静音窗：外部播放期间话筒仍在送 PCM，但这段音频里混着答案本身。
@@ -82,7 +87,20 @@ impl PlaybackGate {
     /// `killall` 掉播放器），继续静音会让用户喊完唤醒词后说的话被丢掉。
     pub fn begin(&self) -> u64 {
         self.clear_quiet();
-        self.token.fetch_add(1, Ordering::Relaxed) + 1
+        let next = self.token.fetch_add(1, Ordering::Relaxed) + 1;
+        self.changed.notify_waiters();
+        next
+    }
+
+    /// 等待当前令牌失效（被唤醒/`/stop` 打断）。先注册通知再判状态，避免竞态丢失唤醒。
+    pub async fn wait_until_inactive(&self, token: u64) {
+        loop {
+            let notified = self.changed.notified();
+            if !self.is_active(token) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// 抓到的令牌还是当前的吗。
@@ -379,14 +397,71 @@ impl TtsHealth {
 /// 空文本短路、同样的非零退出码变 Err。外部 provider 走「拿音频字节 → 落
 /// `/tmp` → 播放器命令」这条链路，任何一步失败都按 `fallback_to_native` 决定
 /// 是回退系统 TTS 还是报错。
+#[derive(Clone)]
 pub struct TtsRouter {
     device: Device,
     gate: Arc<PlaybackGate>,
+    client: reqwest::Client,
+}
+
+struct AbortOnDrop<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn detach(mut self) {
+        self.0.take();
+    }
+
+    async fn wait_or_cancel(mut self, gate: &PlaybackGate, token: u64) -> bool {
+        let Some(mut handle) = self.0.take() else {
+            return gate.is_active(token);
+        };
+        tokio::select! {
+            _ = &mut handle => gate.is_active(token),
+            _ = gate.wait_until_inactive(token) => {
+                handle.abort();
+                false
+            }
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+enum PlaybackWait {
+    Task(JoinHandle<()>),
+    Duration(Duration),
+    Skipped,
+}
+
+enum PreparedChunk {
+    Audio { text: String, bytes: Vec<u8> },
+    FallbackNative(String),
+    Error(anyhow::Error),
 }
 
 impl TtsRouter {
     pub fn new(device: Device, gate: Arc<PlaybackGate>) -> Self {
-        Self { device, gate }
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .pool_idle_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            device,
+            gate,
+            client,
+        }
     }
 
     /// 念一句话。
@@ -394,6 +469,7 @@ impl TtsRouter {
     /// 注意错误提示（`speak_service_error`）不走这里，是有意为之：那条路径要念的
     /// 是「服务出问题了」，此时外部 TTS 大概率同样不可用，只有设备自带的
     /// `tts_play.sh` 还靠得住。
+    #[cfg(test)]
     pub async fn speak(&self, config: &TtsConfig, text: &str) -> anyhow::Result<()> {
         if text.trim().is_empty() {
             return Ok(());
@@ -414,6 +490,190 @@ impl TtsRouter {
         }
     }
 
+    /// 流式分句播报流水线（默认 `FinishMode::DetachForQuietWindow` 保持既有静音窗行为）。
+    #[allow(dead_code)] // 仅测试直接调用；运行时走 spawn_with_hooks / speak_stream_with_mode
+    pub async fn speak_stream<F>(
+        &self,
+        config: &TtsConfig,
+        chunks: mpsc::Receiver<String>,
+        health: &TtsHealth,
+        on_first_speak: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut() + Send,
+    {
+        self.speak_stream_with_mode(
+            config,
+            chunks,
+            health,
+            FinishMode::DetachForQuietWindow,
+            on_first_speak,
+        )
+        .await
+    }
+
+    /// 流式分句播报流水线：
+    /// - `Native`：边切句边同步顺序调用 `tts_play.sh`；
+    /// - `OpenAi`：双缓冲预合成（当前句播放时后台并发抓取下一句音频），句间等待
+    ///   `EndReached` 避免误掐前一句；末句按 `finish_mode` 决定是后台守望静音窗
+    ///   （`DetachForQuietWindow`）还是等播完再返回（`WaitForEnd`）。
+    /// - 任一阶段令牌失效（唤醒/`/stop` 打断）立即停播并安全退出。
+    pub async fn speak_stream_with_mode<F>(
+        &self,
+        config: &TtsConfig,
+        mut chunks: mpsc::Receiver<String>,
+        health: &TtsHealth,
+        finish_mode: FinishMode,
+        mut on_first_speak: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut() + Send,
+    {
+        let token = self.gate.current();
+        let mut first_spoken = false;
+        if config.provider == TtsProvider::Native {
+            while let Some(chunk) = chunks.recv().await {
+                if chunk.trim().is_empty() {
+                    continue;
+                }
+                if !self.may_play(token) {
+                    return Ok(());
+                }
+                if !first_spoken {
+                    first_spoken = true;
+                    on_first_speak();
+                }
+                match self.device.speak(&chunk).await {
+                    Ok(()) => health.on_success(),
+                    Err(err) => {
+                        health.on_failure(&err);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let (prepared_tx, mut prepared_rx) = mpsc::channel::<PreparedChunk>(2);
+        let router = self.clone();
+        let cfg = config.clone();
+        let prefetch_guard = AbortOnDrop::new(tokio::spawn(async move {
+            while let Some(chunk) = chunks.recv().await {
+                if chunk.trim().is_empty() {
+                    continue;
+                }
+                if !router.gate.is_active(token) {
+                    break;
+                }
+                let prepared = match cfg.provider {
+                    TtsProvider::OpenAi => {
+                        if cfg.openai.api_key.trim().is_empty() {
+                            if cfg.fallback_to_native {
+                                warn!("tts.openai.api_key 为空，回退系统 TTS");
+                                PreparedChunk::FallbackNative(chunk)
+                            } else {
+                                PreparedChunk::Error(anyhow!("tts.openai.api_key 为空"))
+                            }
+                        } else {
+                            match router.fetch_openai_speech(&cfg.openai, &chunk).await {
+                                Ok(bytes) => PreparedChunk::Audio { text: chunk, bytes },
+                                Err(err) if cfg.fallback_to_native => {
+                                    warn!(error = %err, "外部 TTS 预合成失败，回退系统 TTS");
+                                    PreparedChunk::FallbackNative(chunk)
+                                }
+                                Err(err) => PreparedChunk::Error(err),
+                            }
+                        }
+                    }
+                    other => {
+                        let err = anyhow!("tts provider {other:?} 尚未接入");
+                        if cfg.fallback_to_native {
+                            warn!(?other, error = %err, "外部 TTS 不可用，回退系统 TTS");
+                            PreparedChunk::FallbackNative(chunk)
+                        } else {
+                            PreparedChunk::Error(err)
+                        }
+                    }
+                };
+                if prepared_tx.send(prepared).await.is_err() {
+                    break;
+                }
+            }
+        }));
+
+        let mut prev_wait: Option<AbortOnDrop<()>> = None;
+        while let Some(item) = prepared_rx.recv().await {
+            if let Some(wait) = prev_wait.take() {
+                if !wait.wait_or_cancel(&self.gate, token).await {
+                    return Ok(());
+                }
+            }
+            if !self.may_play(token) {
+                return Ok(());
+            }
+            match item {
+                PreparedChunk::Audio { text, bytes } => {
+                    if !first_spoken {
+                        first_spoken = true;
+                        on_first_speak();
+                    }
+                    match self.play_openai_bytes(config, &bytes, token).await {
+                        Ok(PlaybackWait::Task(handle)) => {
+                            health.on_success();
+                            prev_wait = Some(AbortOnDrop::new(handle));
+                        }
+                        Ok(PlaybackWait::Duration(dur)) => {
+                            health.on_success();
+                            prev_wait = Some(AbortOnDrop::new(tokio::spawn(tokio::time::sleep(dur))));
+                        }
+                        Ok(PlaybackWait::Skipped) => return Ok(()),
+                        Err(err) => {
+                            if config.fallback_to_native {
+                                warn!(error = %err, "外部 TTS 播放失败，回退系统 TTS");
+                                if !self.may_play(token) {
+                                    return Ok(());
+                                }
+                                match self.device.speak(&text).await {
+                                    Ok(()) => health.on_success(),
+                                    Err(fb_err) => {
+                                        health.on_failure(&fb_err);
+                                    }
+                                }
+                            } else {
+                                health.on_failure(&err);
+                            }
+                        }
+                    }
+                }
+                PreparedChunk::FallbackNative(text) => {
+                    if !first_spoken {
+                        first_spoken = true;
+                        on_first_speak();
+                    }
+                    match self.device.speak(&text).await {
+                        Ok(()) => health.on_success(),
+                        Err(err) => {
+                            health.on_failure(&err);
+                        }
+                    }
+                }
+                PreparedChunk::Error(err) => {
+                    health.on_failure(&err);
+                }
+            }
+        }
+
+        if let Some(last_wait) = prev_wait.take() {
+            match finish_mode {
+                FinishMode::DetachForQuietWindow => last_wait.detach(),
+                FinishMode::WaitForEnd => {
+                    let _ = last_wait.wait_or_cancel(&self.gate, token).await;
+                }
+            }
+        }
+        drop(prefetch_guard);
+        Ok(())
+    }
+
     /// 起播前的最后一道闸：令牌过期就闭嘴。返回 `true` = 可以出声。
     ///
     /// 注意语义是「该不该播」，不是「有没有失败」——被打断不是失败，调用方返回
@@ -428,6 +688,7 @@ impl TtsRouter {
         false
     }
 
+    #[cfg(test)]
     async fn speak_remote(
         &self,
         config: &TtsConfig,
@@ -458,17 +719,28 @@ impl TtsRouter {
         }
     }
 
+    #[cfg(test)]
     async fn speak_openai(&self, config: &TtsConfig, text: &str, token: u64) -> anyhow::Result<()> {
         let tts = &config.openai;
         if tts.api_key.trim().is_empty() {
             bail!("tts.openai.api_key 为空");
         }
+        let bytes = self.fetch_openai_speech(tts, text).await?;
+        let _ = self.play_openai_bytes(config, &bytes, token).await?;
+        Ok(())
+    }
 
+    async fn play_openai_bytes(
+        &self,
+        config: &TtsConfig,
+        bytes: &[u8],
+        token: u64,
+    ) -> anyhow::Result<PlaybackWait> {
+        let tts = &config.openai;
         prune_old_speech_files(&tts.dir());
         let path = speech_output_path(&tts.dir(), &tts.response_format);
-        let bytes = self.fetch_openai_speech(tts, text).await?;
 
-        tokio::fs::write(&path, &bytes)
+        tokio::fs::write(&path, bytes)
             .await
             .with_context(|| format!("写音频文件失败: {}", path.display()))?;
         debug!(bytes = bytes.len(), path = %path.display(), "TTS 音频已落盘");
@@ -477,7 +749,7 @@ impl TtsRouter {
         // 唤醒词。放在 fetch 之后、write 之前也挡得住，但那样会白写一次几十到几百 KB；
         // 放在这里，检查到起播之间只剩同步的模板渲染（TOCTOU 从毫秒级压到微秒级）。
         if !self.may_play(token) {
-            return Ok(());
+            return Ok(PlaybackWait::Skipped);
         }
 
         let template = config
@@ -485,7 +757,7 @@ impl TtsRouter {
             .as_deref()
             .unwrap_or(DEFAULT_PLAYBACK_COMMAND);
         let script = render_playback_command(template, &path)?;
-        let plan = quiet_plan(config, &bytes, config.playback_command.is_none());
+        let plan = quiet_plan(config, bytes, config.playback_command.is_none());
         // 开窗必须排在起播**之前**：出声和开麦在两条独立的任务线上，先起播再
         // 静音的那条缝隙里，回声已经能进 VAD 了。
         let generation = plan
@@ -516,7 +788,7 @@ impl TtsRouter {
         }
         if let (Some(plan), Some(generation)) = (plan, generation) {
             if let Some(wait_script) = plan.wait_script {
-                tokio::spawn(watch_playback_end(
+                let handle = tokio::spawn(watch_playback_end(
                     self.device.clone(),
                     self.gate.clone(),
                     generation,
@@ -524,9 +796,12 @@ impl TtsRouter {
                     plan.wait_timeout,
                     plan.tail,
                 ));
+                return Ok(PlaybackWait::Task(handle));
             }
+            return Ok(PlaybackWait::Duration(plan.window));
         }
-        Ok(())
+        let fallback = wav_play_duration(bytes).unwrap_or(FALLBACK_PLAY_DURATION);
+        Ok(PlaybackWait::Duration(fallback))
     }
 
     async fn fetch_openai_speech(
@@ -552,7 +827,8 @@ impl TtsRouter {
             }
         }
 
-        let request = reqwest::Client::new()
+        let request = self
+            .client
             .post(tts.endpoint())
             .bearer_auth(&tts.api_key)
             .json(&body);
@@ -582,6 +858,178 @@ impl TtsRouter {
         }
         Ok(bytes.to_vec())
     }
+}
+
+pub fn strip_punctuation_and_space(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    '。' | '，' | '！' | '？' | '；' | '：' | '、' | '.' | ',' | '!' | '?' | ';' | ':' | '…'
+                )
+        })
+        .collect()
+}
+
+pub fn is_noise_or_filler(text: &str) -> bool {
+    let cleaned = strip_punctuation_and_space(text);
+    if cleaned.is_empty() {
+        return true;
+    }
+    let count = cleaned.chars().count();
+    if count == 1 {
+        let ch = cleaned.chars().next().unwrap_or_default();
+        return matches!(
+            ch,
+            '嗯' | '啊' | '哦' | '呃' | '唔' | '哎' | '哼' | '哈' | '喂' | '呐' | '呀' | '呵'
+        );
+    }
+    matches!(
+        cleaned.as_str(),
+        "嗯嗯" | "啊啊" | "哦哦" | "呃呃" | "哈哈" | "哈哈哈" | "呵呵" | "哎呀" | "那个" | "就是"
+    )
+}
+
+/// 识别用户是否只说了唤醒词或单纯确认在不在（没有附带实际问题）。
+pub fn is_wake_word_only(text: &str) -> bool {
+    let cleaned = strip_punctuation_and_space(text);
+    matches!(
+        cleaned.as_str(),
+        "小爱同学" | "小爱" | "豆包豆包" | "豆包" | "在吗" | "你在吗" | "小爱在吗" | "豆包在吗"
+    )
+}
+
+/// 剥离一句话开头的唤醒词前缀（支持「小爱同学 / 小爱 / 豆包豆包 / 豆包」连说）。
+pub fn strip_wake_prefix(text: &str) -> String {
+    let mut s = text.trim();
+    loop {
+        let trimmed = s.trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '。' | '，' | '！' | '？' | '；' | '：' | '、' | '.' | ',' | '!' | '?' | ';' | ':' | '…'
+                )
+        });
+        if let Some(rest) = trimmed.strip_prefix("小爱同学") {
+            s = rest;
+        } else if let Some(rest) = trimmed.strip_prefix("豆包豆包") {
+            s = rest;
+        } else if let Some(rest) = trimmed.strip_prefix("小爱") {
+            s = rest;
+        } else if let Some(rest) = trimmed.strip_prefix("豆包") {
+            s = rest;
+        } else {
+            return trimmed.to_string();
+        }
+    }
+}
+
+/// 用户主动退出会话的动作类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitAction {
+    /// 「闭嘴 / 算了 / 不用了 / 退下」：用户希望音箱立刻安静，不再啰嗦播报告别语。
+    Silent,
+    /// 「再见 / 拜拜 / 退出对话」：礼貌告别后退出会话。
+    Farewell,
+}
+
+/// 识别用户退出对话指令（仅精确匹配完整退出意图，绝不子串误伤「把客厅灯关闭 / 取消明天日程」）。
+pub fn classify_exit_command(text: &str, custom_keywords: &[String]) -> Option<ExitAction> {
+    let cleaned = strip_punctuation_and_space(text);
+    let core = cleaned
+        .trim_end_matches(|c| matches!(c, '吧' | '了' | '啊' | '呀' | '哦' | '呢'))
+        .trim();
+    if core.is_empty() {
+        return None;
+    }
+    if matches!(
+        core,
+        "闭嘴" | "别说" | "安静" | "不用" | "算" | "没事" | "退下" | "别讲"
+    ) || matches!(
+        cleaned.as_str(),
+        "算了" | "不用了" | "没事了" | "别说了" | "别讲了"
+    ) {
+        return Some(ExitAction::Silent);
+    }
+    if matches!(
+        core,
+        "再见" | "拜拜" | "退出" | "退出对话" | "结束对话" | "先这样" | "休息"
+    ) {
+        return Some(ExitAction::Farewell);
+    }
+    if custom_keywords.iter().any(|kw| {
+        let kw_clean = strip_punctuation_and_space(kw);
+        !kw_clean.is_empty() && (cleaned == kw_clean || core == kw_clean)
+    }) {
+        return Some(ExitAction::Farewell);
+    }
+    None
+}
+
+/// 音乐播放期间的本地快捷语音控制动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MusicVoiceControl {
+    Stop,
+    Pause,
+    Resume,
+    Next,
+    Previous,
+}
+
+/// 识别音乐快捷控制指令（仅在 `music.has_current()` 为真时由上层拦截生效）。
+pub fn classify_music_voice_control(text: &str) -> Option<MusicVoiceControl> {
+    let cleaned = strip_punctuation_and_space(text);
+    let core = cleaned
+        .trim_end_matches(|c| matches!(c, '吧' | '了' | '啊' | '呀' | '哦' | '呢'))
+        .trim();
+    if core.is_empty() {
+        return None;
+    }
+    if matches!(
+        core,
+        "停止"
+            | "停"
+            | "停下"
+            | "别放"
+            | "别唱"
+            | "不要放"
+            | "不听"
+            | "停止播放"
+            | "停止音乐"
+            | "停止播放音乐"
+            | "停止放歌"
+            | "关掉音乐"
+            | "关闭音乐"
+            | "退出音乐"
+    ) {
+        return Some(MusicVoiceControl::Stop);
+    }
+    if (core.contains("停止")
+        || core.contains("停下")
+        || core.contains("关闭")
+        || core.contains("关掉")
+        || core.contains("别放"))
+        && (core.contains("音乐") || core.contains("播放") || core.contains("歌"))
+    {
+        return Some(MusicVoiceControl::Stop);
+    }
+    if matches!(core, "暂停" | "暂停播放" | "暂停音乐" | "先暂停") {
+        return Some(MusicVoiceControl::Pause);
+    }
+    if matches!(
+        core,
+        "继续" | "继续播放" | "继续放" | "继续放歌" | "恢复播放" | "接着放"
+    ) {
+        return Some(MusicVoiceControl::Resume);
+    }
+    if matches!(core, "下一首" | "下一曲" | "切歌" | "换一首" | "换首歌") {
+        return Some(MusicVoiceControl::Next);
+    }
+    if matches!(core, "上一首" | "上一曲") {
+        return Some(MusicVoiceControl::Previous);
+    }
+    None
 }
 
 /// 把 `{path}` 渲染成被 shell 引号化的路径。
@@ -624,29 +1072,39 @@ fn speech_output_path(dir: &Path, response_format: &str) -> PathBuf {
     ))
 }
 
-/// 清掉一小时前的落盘音频。
+/// 清掉过旧（> 600s）或超过数量上限（最多保留 5 个最新）的落盘音频。
 ///
-/// `/tmp` 是 tmpfs（不写 NAND），但它是内存：agent 跑几周、每轮都留一个音频文件
-/// 的话，最终会把设备内存吃光。只删自己写的那种文件名，不碰别人的东西。
+/// `/tmp` 是 tmpfs（不写 NAND），但它是内存：LX06 内存有限，只按时间清理在高频对话时
+/// 仍可能堆积大量音频，因此同时施加时间与文件数双上限。只删自己写的那种文件名，不碰别人的东西。
 fn prune_old_speech_files(dir: &Path) {
-    const MAX_AGE: Duration = Duration::from_secs(3600);
+    const MAX_AGE: Duration = Duration::from_secs(600);
+    const MAX_FILES: usize = 5;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let mut kept: Vec<(SystemTime, String, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("xiaoai-tts-")
-        {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if !file_name.starts_with("xiaoai-tts-") {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
         let Ok(modified) = meta.modified() else {
             continue;
         };
         if modified.elapsed().map(|age| age > MAX_AGE).unwrap_or(false) {
             let _ = std::fs::remove_file(entry.path());
+        } else {
+            kept.push((modified, file_name, entry.path()));
+        }
+    }
+    if kept.len() > MAX_FILES {
+        kept.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        for (_, _, path) in kept.into_iter().skip(MAX_FILES) {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -1302,8 +1760,12 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("killall miplayer"),
-            "必须先停旧的: {rendered}"
+            rendered.contains("/proc/[0-9]*") && rendered.contains("*http://*|*https://*"),
+            "必须精准过滤本地 TTS miplayer 并保留音乐流: {rendered}"
+        );
+        assert!(
+            !rendered.contains("killall miplayer"),
+            "不能再使用 blanket killall miplayer: {rendered}"
         );
 
         let err = render_playback_command("miplayer -f", Path::new("/tmp/x.wav"))
@@ -1325,5 +1787,343 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("xiaoai-tts-"));
         }
+    }
+
+    #[tokio::test]
+    async fn speak_stream_native_plays_chunks_sequentially_and_stops_on_interrupt() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let gate = Arc::new(PlaybackGate::default());
+        let router = router_with_gate(shell.clone(), gate.clone());
+        let health = TtsHealth::default();
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send("第一句。".to_string()).await.unwrap();
+        tx.send("第二句。".to_string()).await.unwrap();
+        drop(tx);
+
+        let mut first_count = 0usize;
+        router
+            .speak_stream(&TtsConfig::default(), rx, &health, || {
+                first_count += 1;
+            })
+            .await
+            .unwrap();
+        assert_eq!(shell.command_count(), 2);
+        assert_eq!(first_count, 1);
+
+        // 令牌失效后不再起播后续片段
+        let (tx2, _rx2) = mpsc::channel::<String>(4);
+        tx2.send("不该播".to_string()).await.unwrap();
+        drop(tx2);
+        gate.begin();
+        // 注意：speak_stream 每次进入取当前令牌；在接收途中被 begin() 才会中断
+        let (tx3, rx3) = mpsc::channel(4);
+        let gate_clone = gate.clone();
+        let router_clone = router.clone();
+        let handle = tokio::spawn(async move {
+            router_clone
+                .speak_stream(&TtsConfig::default(), rx3, &TtsHealth::default(), || {})
+                .await
+        });
+        tokio::task::yield_now().await;
+        gate_clone.begin();
+        let _ = tx3.send("被打断的句子".to_string()).await;
+        drop(tx3);
+        handle.await.unwrap().unwrap();
+        assert_eq!(shell.command_count(), 2, "被打断后不能再起播");
+    }
+
+    #[tokio::test]
+    async fn speak_stream_openai_prefetches_and_waits_between_chunks() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let req_count = requests.clone();
+        let mut wav = wav_header(32_000, 3_200);
+        wav.extend(std::iter::repeat_n(0_u8, 3_200));
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                req_count.fetch_add(1, Ordering::Relaxed);
+                let wav = wav.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let nl = crlf();
+                    let head = format!(
+                        "HTTP/1.1 200 OK{nl}Content-Type: audio/wav{nl}Content-Length: {}{nl}{nl}",
+                        wav.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(&wav).await;
+                });
+            }
+        });
+
+        let shell = Arc::new(RecordingShell::always_ok());
+        let gate = Arc::new(PlaybackGate::default());
+        let router = router_with_gate(shell.clone(), gate);
+        let config = TtsConfig {
+            provider: TtsProvider::OpenAi,
+            openai: OpenAiTtsConfig {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                api_key: "sk-test".to_string(),
+                timeout_s: 5.0,
+                output_dir: Some(std::env::temp_dir()),
+                ..OpenAiTtsConfig::default()
+            },
+            ..TtsConfig::default()
+        };
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send("第一段。".to_string()).await.unwrap();
+        tx.send("第二段。".to_string()).await.unwrap();
+        drop(tx);
+
+        router
+            .speak_stream(&config, rx, &TtsHealth::default(), || {})
+            .await
+            .unwrap();
+
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert_eq!(shell.count_matching("miplayer -f"), 2);
+        assert!(
+            shell.count_matching("EndReached") >= 1,
+            "多段播报之间必须等上一句结束，否则第二句 killall 会把第一句掐掉"
+        );
+    }
+
+    #[test]
+    fn strip_wake_prefix_and_wake_word_only_support_xiaoai_and_doubao() {
+        assert!(is_wake_word_only("小爱同学。"));
+        assert!(is_wake_word_only("小爱！"));
+        assert!(is_wake_word_only("豆包豆包"));
+        assert!(is_wake_word_only("你在吗？"));
+        assert!(!is_wake_word_only("小爱同学，今天天气怎么样"));
+
+        assert_eq!(
+            strip_wake_prefix("小爱同学，今天天气怎么样？"),
+            "今天天气怎么样？"
+        );
+        assert_eq!(strip_wake_prefix("小爱 几点了"), "几点了");
+        assert_eq!(strip_wake_prefix("豆包豆包，讲个笑话"), "讲个笑话");
+        assert_eq!(strip_wake_prefix("小爱同学。"), "");
+    }
+
+    #[test]
+    fn classify_exit_command_distinguishes_silent_and_farewell_without_false_positives() {
+        assert_eq!(
+            classify_exit_command("闭嘴！", &[]),
+            Some(ExitAction::Silent)
+        );
+        assert_eq!(
+            classify_exit_command("算了吧。", &[]),
+            Some(ExitAction::Silent)
+        );
+        assert_eq!(
+            classify_exit_command("不用了", &[]),
+            Some(ExitAction::Silent)
+        );
+        assert_eq!(
+            classify_exit_command("退下吧", &[]),
+            Some(ExitAction::Silent)
+        );
+        assert_eq!(
+            classify_exit_command("再见。", &[]),
+            Some(ExitAction::Farewell)
+        );
+        assert_eq!(
+            classify_exit_command("结束对话", &[]),
+            Some(ExitAction::Farewell)
+        );
+        assert_eq!(classify_exit_command("把客厅灯关闭", &[]), None);
+        assert_eq!(classify_exit_command("取消明天的闹钟", &[]), None);
+        assert_eq!(classify_exit_command("停止播放音乐", &[]), None);
+    }
+
+    #[test]
+    fn classify_music_voice_control_covers_stop_pause_resume_next_previous() {
+        assert_eq!(
+            classify_music_voice_control("停止播放音乐。"),
+            Some(MusicVoiceControl::Stop)
+        );
+        assert_eq!(
+            classify_music_voice_control("别唱了"),
+            Some(MusicVoiceControl::Stop)
+        );
+        assert_eq!(
+            classify_music_voice_control("暂停播放"),
+            Some(MusicVoiceControl::Pause)
+        );
+        assert_eq!(
+            classify_music_voice_control("继续播放吧"),
+            Some(MusicVoiceControl::Resume)
+        );
+        assert_eq!(
+            classify_music_voice_control("下一首"),
+            Some(MusicVoiceControl::Next)
+        );
+        assert_eq!(
+            classify_music_voice_control("上一首"),
+            Some(MusicVoiceControl::Previous)
+        );
+        assert_eq!(classify_music_voice_control("播放周杰伦的晴天"), None);
+    }
+
+    #[tokio::test]
+    async fn speak_stream_wait_for_end_blocks_until_final_end_reached() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::shell::{CommandResult, ShellFuture, ShellRunner};
+
+        struct BlockingEndShell {
+            wait_started: Arc<Notify>,
+            release_wait: Arc<Notify>,
+            wait_finished: Arc<AtomicBool>,
+        }
+
+        impl ShellRunner for BlockingEndShell {
+            fn run<'a>(&'a self, script: &'a str, _limit: Duration) -> ShellFuture<'a> {
+                Box::pin(async move {
+                    if script.contains("EndReached") {
+                        self.wait_started.notify_one();
+                        self.release_wait.notified().await;
+                        self.wait_finished.store(true, Ordering::SeqCst);
+                    }
+                    Ok(CommandResult {
+                        exit_code: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
+                })
+            }
+
+            fn run_detached<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a> {
+                self.run(script, limit)
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut wav = wav_header(32_000, 3_200);
+        wav.extend(std::iter::repeat_n(0_u8, 3_200));
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let nl = crlf();
+                let head = format!(
+                    "HTTP/1.1 200 OK{nl}Content-Type: audio/wav{nl}Content-Length: {}{nl}{nl}",
+                    wav.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&wav).await;
+            }
+        });
+
+        let wait_started = Arc::new(Notify::new());
+        let release_wait = Arc::new(Notify::new());
+        let wait_finished = Arc::new(AtomicBool::new(false));
+        let shell = Arc::new(BlockingEndShell {
+            wait_started: wait_started.clone(),
+            release_wait: release_wait.clone(),
+            wait_finished: wait_finished.clone(),
+        });
+        let gate = Arc::new(PlaybackGate::default());
+        let router = TtsRouter::new(Device::with_runner(DeviceConfig::default(), shell), gate);
+        let config = TtsConfig {
+            provider: TtsProvider::OpenAi,
+            openai: OpenAiTtsConfig {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                api_key: "sk-test".to_string(),
+                timeout_s: 5.0,
+                output_dir: Some(std::env::temp_dir()),
+                ..OpenAiTtsConfig::default()
+            },
+            ..TtsConfig::default()
+        };
+
+        let (tx, rx) = mpsc::channel(2);
+        tx.send("最后一句告别。".to_string()).await.unwrap();
+        drop(tx);
+
+        let task = tokio::spawn(async move {
+            router
+                .speak_stream_with_mode(
+                    &config,
+                    rx,
+                    &TtsHealth::default(),
+                    FinishMode::WaitForEnd,
+                    || {},
+                )
+                .await
+        });
+
+        // Wait until the EndReached watcher has started, then verify speak_stream_with_mode
+        // has NOT returned prematurely.
+        wait_started.notified().await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !task.is_finished(),
+            "FinishMode::WaitForEnd 必须等末句 EndReached 完成才返回"
+        );
+        assert!(!wait_finished.load(Ordering::SeqCst));
+
+        release_wait.notify_one();
+        task.await.unwrap().unwrap();
+        assert!(
+            wait_finished.load(Ordering::SeqCst),
+            "返回时末句 EndReached 必须已完成"
+        );
+    }
+
+    #[test]
+    fn prune_old_speech_files_caps_file_count_to_five_newest() {
+        let unique = format!(
+            "xiaoai-prune-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for i in 1..=8 {
+            let p = dir.join(format!("xiaoai-tts-000{i}.wav"));
+            std::fs::write(&p, b"audio").unwrap();
+        }
+        let unrelated = dir.join("other-file.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        prune_old_speech_files(&dir);
+
+        let mut remaining: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("xiaoai-tts-"))
+            .collect();
+        remaining.sort();
+
+        assert_eq!(
+            remaining,
+            vec![
+                "xiaoai-tts-0004.wav",
+                "xiaoai-tts-0005.wav",
+                "xiaoai-tts-0006.wav",
+                "xiaoai-tts-0007.wav",
+                "xiaoai-tts-0008.wav",
+            ],
+            "必须最多保留 5 个最新的 xiaoai-tts-* 文件"
+        );
+        assert!(unrelated.exists(), "不该误删非 xiaoai-tts-* 文件");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

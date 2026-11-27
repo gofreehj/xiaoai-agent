@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::future::Future;
 use std::time::Duration;
 
@@ -6,6 +6,7 @@ use tokio::time::{interval, sleep, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::asr::{RealtimeAsrEvent, RealtimeAsrSession};
+use crate::audio::CaptureOutcome;
 use crate::config::CaptureConfig;
 use crate::speech::{SpeechInput, SpeechTurn};
 use crate::tts::PlaybackGate;
@@ -63,11 +64,32 @@ where
     F: Fn() -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send,
 {
+    match record_utterance_outcome(config, idle_timeout, playback, turn, on_speech_start).await? {
+        CaptureOutcome::Utterance(pcm) => Ok(pcm),
+        CaptureOutcome::IdleEnd => {
+            anyhow::bail!("mipns ended the stream before an utterance was captured")
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn record_utterance_outcome<F, Fut>(
+    config: CaptureConfig,
+    idle_timeout: Duration,
+    playback: &PlaybackGate,
+    turn: &mut SpeechTurn,
+    on_speech_start: F,
+) -> anyhow::Result<CaptureOutcome>
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = ()> + Send,
+{
     let idle_timeout = idle_timeout.max(Duration::from_secs(1));
     let idle_timer = sleep(idle_timeout);
     tokio::pin!(idle_timer);
     let mut collector = SpeechCollector::new(&config);
     let mut speech_started = false;
+    let mut speech_prefix: Option<Bytes> = None;
     let mut muted = false;
     let mut dropped_bytes = 0_usize;
     let mut quiet_tick = interval(QUIET_POLL);
@@ -82,6 +104,11 @@ where
             _ = quiet_tick.tick() => {
                 let was_muted = muted;
                 let now_muted = poll_quiet(playback, &mut muted, &mut dropped_bytes, turn.id());
+                if now_muted && speech_started {
+                    collector = SpeechCollector::new(&config);
+                    speech_started = false;
+                    speech_prefix = None;
+                }
                 // 进窗要按住空闲超时；出窗要重新起算，否则「已在静音里超时」的
                 // 定时器会在解除的瞬间把会话判掉。
                 if now_muted || was_muted {
@@ -103,29 +130,47 @@ where
                 match input {
                     Some(SpeechInput::Pcm(bytes)) => {
                         if playback.mic_muted() {
+                            if speech_started {
+                                collector = SpeechCollector::new(&config);
+                                speech_started = false;
+                                speech_prefix = None;
+                            }
                             dropped_bytes += bytes.len();
                             continue;
                         }
                         for event in collector.push(&bytes) {
                             match event {
-                                SpeechEvent::SpeechStart(_) => {
+                                SpeechEvent::SpeechStart(prefix) => {
                                     speech_started = true;
+                                    speech_prefix = Some(prefix);
                                     on_speech_start().await;
                                 }
                                 SpeechEvent::SpeechChunk(_) => {}
                                 SpeechEvent::SpeechRejected => {
                                     speech_started = false;
+                                    speech_prefix = None;
                                     idle_timer.as_mut().reset(Instant::now() + idle_timeout);
                                 }
-                                SpeechEvent::Utterance(pcm) => {
+                                SpeechEvent::Utterance(tail) => {
                                     turn.stop_capture().await?;
-                                    return Ok(pcm);
+                                    return Ok(CaptureOutcome::Utterance(assemble_utterance(
+                                        speech_prefix.take(),
+                                        tail,
+                                    )));
                                 }
                             }
                         }
                     }
                     Some(SpeechInput::End) => {
-                        anyhow::bail!("mipns ended the stream before an utterance was captured");
+                        if speech_started {
+                            if let Some(tail) = collector.flush() {
+                                return Ok(CaptureOutcome::Utterance(assemble_utterance(
+                                    speech_prefix.take(),
+                                    tail,
+                                )));
+                            }
+                        }
+                        return Ok(CaptureOutcome::IdleEnd);
                     }
                     Some(SpeechInput::Cancelled) => {
                         anyhow::bail!("mipns cancelled the speech stream");
@@ -154,11 +199,48 @@ where
     R: Fn() -> RFut + Send + Sync,
     RFut: Future<Output = anyhow::Result<()>> + Send,
 {
+    match record_utterance_streaming_outcome(
+        config,
+        idle_timeout,
+        playback,
+        turn,
+        on_speech_start,
+        on_audio_chunk,
+        on_speech_rejected,
+    )
+    .await?
+    {
+        CaptureOutcome::Utterance(pcm) => Ok(pcm),
+        CaptureOutcome::IdleEnd => {
+            anyhow::bail!("mipns ended the stream before an utterance was captured")
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub async fn record_utterance_streaming_outcome<F, Fut, C, CFut, R, RFut>(
+    config: CaptureConfig,
+    idle_timeout: Duration,
+    playback: &PlaybackGate,
+    turn: &mut SpeechTurn,
+    on_speech_start: F,
+    on_audio_chunk: C,
+    on_speech_rejected: R,
+) -> anyhow::Result<CaptureOutcome>
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = ()> + Send,
+    C: Fn(Bytes) -> CFut + Send + Sync,
+    CFut: Future<Output = anyhow::Result<()>> + Send,
+    R: Fn() -> RFut + Send + Sync,
+    RFut: Future<Output = anyhow::Result<()>> + Send,
+{
     let idle_timeout = idle_timeout.max(Duration::from_secs(1));
     let idle_timer = sleep(idle_timeout);
     tokio::pin!(idle_timer);
     let mut collector = SpeechCollector::new(&config);
     let mut speech_started = false;
+    let mut speech_prefix: Option<Bytes> = None;
     let mut muted = false;
     let mut dropped_bytes = 0_usize;
     let mut quiet_tick = interval(QUIET_POLL);
@@ -173,6 +255,12 @@ where
             _ = quiet_tick.tick() => {
                 let was_muted = muted;
                 let now_muted = poll_quiet(playback, &mut muted, &mut dropped_bytes, turn.id());
+                if now_muted && speech_started {
+                    collector = SpeechCollector::new(&config);
+                    speech_started = false;
+                    speech_prefix = None;
+                    on_speech_rejected().await?;
+                }
                 // 进窗要按住空闲超时；出窗要重新起算，否则「已在静音里超时」的
                 // 定时器会在解除的瞬间把会话判掉。
                 if now_muted || was_muted {
@@ -194,6 +282,12 @@ where
                 match input {
                     Some(SpeechInput::Pcm(bytes)) => {
                         if playback.mic_muted() {
+                            if speech_started {
+                                collector = SpeechCollector::new(&config);
+                                speech_started = false;
+                                speech_prefix = None;
+                                on_speech_rejected().await?;
+                            }
                             dropped_bytes += bytes.len();
                             continue;
                         }
@@ -201,6 +295,7 @@ where
                             match event {
                                 SpeechEvent::SpeechStart(prefix) => {
                                     speech_started = true;
+                                    speech_prefix = Some(prefix.clone());
                                     on_speech_start().await;
                                     on_audio_chunk(prefix).await?;
                                 }
@@ -209,18 +304,31 @@ where
                                 }
                                 SpeechEvent::SpeechRejected => {
                                     speech_started = false;
+                                    speech_prefix = None;
                                     on_speech_rejected().await?;
                                     idle_timer.as_mut().reset(Instant::now() + idle_timeout);
                                 }
-                                SpeechEvent::Utterance(pcm) => {
+                                SpeechEvent::Utterance(tail) => {
                                     turn.stop_capture().await?;
-                                    return Ok(pcm);
+                                    return Ok(CaptureOutcome::Utterance(assemble_utterance(
+                                        speech_prefix.take(),
+                                        tail,
+                                    )));
                                 }
                             }
                         }
                     }
                     Some(SpeechInput::End) => {
-                        anyhow::bail!("mipns ended the stream before an utterance was captured");
+                        if speech_started {
+                            if let Some(tail) = collector.flush() {
+                                return Ok(CaptureOutcome::Utterance(assemble_utterance(
+                                    speech_prefix.take(),
+                                    tail,
+                                )));
+                            }
+                            on_speech_rejected().await?;
+                        }
+                        return Ok(CaptureOutcome::IdleEnd);
                     }
                     Some(SpeechInput::Cancelled) => {
                         anyhow::bail!("mipns cancelled the speech stream");
@@ -243,6 +351,38 @@ pub async fn record_utterance_server_vad_streaming<F, Fut, E, EFut>(
     on_speech_start: F,
     on_speech_stop: E,
 ) -> anyhow::Result<String>
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: Future<Output = ()> + Send,
+    E: Fn() -> EFut + Send + Sync,
+    EFut: Future<Output = ()> + Send,
+{
+    match record_utterance_server_vad_streaming_outcome(
+        config,
+        idle_timeout,
+        playback,
+        turn,
+        session,
+        on_speech_start,
+        on_speech_stop,
+    )
+    .await?
+    {
+        Some(text) => Ok(text),
+        None => anyhow::bail!("mipns ended the stream before server VAD detected speech"),
+    }
+}
+
+#[allow(dead_code)]
+pub async fn record_utterance_server_vad_streaming_outcome<F, Fut, E, EFut>(
+    config: CaptureConfig,
+    idle_timeout: Duration,
+    playback: &PlaybackGate,
+    turn: &mut SpeechTurn,
+    session: &mut RealtimeAsrSession,
+    on_speech_start: F,
+    on_speech_stop: E,
+) -> anyhow::Result<Option<String>>
 where
     F: Fn() -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send,
@@ -274,6 +414,10 @@ where
             _ = quiet_tick.tick() => {
                 let was_muted = muted;
                 let now_muted = poll_quiet(playback, &mut muted, &mut dropped_bytes, turn.id());
+                if now_muted && speech_started && !input_closed {
+                    speech_started = false;
+                    appender.clear().await?;
+                }
                 // 进窗要按住空闲超时；出窗要重新起算，否则「已在静音里超时」的
                 // 定时器会在解除的瞬间把会话判掉。
                 if now_muted || was_muted {
@@ -324,7 +468,7 @@ where
                         if !input_closed {
                             turn.stop_capture().await?;
                         }
-                        return Ok(text);
+                        return Ok(Some(text));
                     }
                 }
             }
@@ -332,6 +476,10 @@ where
                 match input {
                     Some(SpeechInput::Pcm(bytes)) => {
                         if playback.mic_muted() {
+                            if speech_started && !input_closed {
+                                speech_started = false;
+                                appender.clear().await?;
+                            }
                             dropped_bytes += bytes.len();
                             continue;
                         }
@@ -343,7 +491,7 @@ where
                     }
                     Some(SpeechInput::End) => {
                         if !speech_started {
-                            anyhow::bail!("mipns ended the stream before server VAD detected speech");
+                            return Ok(None);
                         }
                         input_closed = true;
                         transcript_timer.as_mut().reset(Instant::now() + idle_timeout);
@@ -362,6 +510,23 @@ where
 
 fn max_utterance_duration(config: &CaptureConfig) -> Duration {
     Duration::from_secs_f64(config.max_utterance_s.max(1.0))
+}
+
+/// 拼接 `SpeechEvent::SpeechStart(prefix)` 与 `SpeechEvent::Utterance(tail)`。
+///
+/// `SpeechCollector` 在触发 `SpeechStart` 时会调用 `utterance.split().freeze()` 把
+/// pre-roll 和首字触发帧移交给 `SpeechStart(prefix)`，后续 `Utterance(tail)` 只包含
+/// 触发帧之后的尾段。不拼回 `prefix` 会导致整句开头 350~400ms 被截断。
+pub fn assemble_utterance(prefix: Option<Bytes>, tail: Bytes) -> Bytes {
+    match prefix {
+        Some(pre) if !pre.is_empty() => {
+            let mut combined = BytesMut::with_capacity(pre.len() + tail.len());
+            combined.extend_from_slice(&pre);
+            combined.extend_from_slice(&tail);
+            combined.freeze()
+        }
+        _ => tail,
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +807,197 @@ mod tests {
             "转发的块不应为空: {forwarded:?}"
         );
         assert!(pcm.len() >= 4 * BLOCK_BYTES);
+        assert_eq!(commands(&recorder).await, vec![TestCommand::StopCapture]);
+    }
+
+    /// 回归测试：`record_utterance` 必须保留 `SpeechStart(prefix)` 中的 pre-roll 与首字触发帧。
+    /// 若丢弃 `SpeechStart(prefix)`，首块有声帧（振幅 15_000）会从返回结果中消失。
+    #[tokio::test]
+    async fn record_utterance_preserves_preroll_and_first_voiced_trigger_block() {
+        let (mut turn, input_tx, _recorder) = SpeechTurn::for_test(8);
+        let handle = tokio::spawn(async move {
+            record_utterance(
+                test_config(),
+                Duration::from_secs(30),
+                &PlaybackGate::default(),
+                &mut turn,
+                || async {},
+            )
+            .await
+        });
+
+        // 1 块低底噪 pre-roll (振幅 50) + 首块触发帧 (振幅 15_000) + 后续有声帧 (振幅 10_000) + 静音收尾
+        input_tx.send(SpeechInput::Pcm(pcm_block(50))).await.unwrap();
+        input_tx
+            .send(SpeechInput::Pcm(pcm_block(15_000)))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            input_tx
+                .send(SpeechInput::Pcm(pcm_block(10_000)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            input_tx.send(SpeechInput::Pcm(pcm_block(0))).await.unwrap();
+        }
+
+        let pcm = handle.await.unwrap().expect("应当完成采集");
+        let has_pre_roll = pcm
+            .chunks_exact(2)
+            .any(|pair| i16::from_le_bytes([pair[0], pair[1]]) == 50);
+        let has_first_trigger = pcm
+            .chunks_exact(2)
+            .any(|pair| i16::from_le_bytes([pair[0], pair[1]]) == 15_000);
+        assert!(has_pre_roll, "返回的 PCM 必须保留 pre-roll 块 (sample=50)");
+        assert!(
+            has_first_trigger,
+            "返回的 PCM 必须保留 SpeechStart 首字触发块 (sample=15_000)"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_utterance_outcome_flushes_voiced_speech_on_end_and_returns_idle_end_on_silent_end()
+    {
+        // 1) Silent End -> CaptureOutcome::IdleEnd without StopCapture
+        let (mut turn, input_tx, recorder) = SpeechTurn::for_test(9);
+        input_tx.send(SpeechInput::End).await.unwrap();
+        let outcome = record_utterance_outcome(
+            test_config(),
+            Duration::from_secs(30),
+            &PlaybackGate::default(),
+            &mut turn,
+            || async {},
+        )
+        .await
+        .expect("silent End should return Ok(IdleEnd)");
+        assert!(matches!(outcome, CaptureOutcome::IdleEnd));
+        assert!(commands(&recorder).await.is_empty());
+
+        // 2) Voiced speech followed immediately by End (no trailing silence) -> flushed Utterance
+        let (mut turn, input_tx, recorder) = SpeechTurn::for_test(10);
+        let handle = tokio::spawn(async move {
+            record_utterance_outcome(
+                test_config(),
+                Duration::from_secs(30),
+                &PlaybackGate::default(),
+                &mut turn,
+                || async {},
+            )
+            .await
+        });
+
+        input_tx.send(SpeechInput::Pcm(pcm_block(50))).await.unwrap();
+        input_tx
+            .send(SpeechInput::Pcm(pcm_block(15_000)))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            input_tx
+                .send(SpeechInput::Pcm(pcm_block(10_000)))
+                .await
+                .unwrap();
+        }
+        input_tx.send(SpeechInput::End).await.unwrap();
+
+        let outcome = handle.await.unwrap().expect("voiced End should flush");
+        let CaptureOutcome::Utterance(pcm) = outcome else {
+            panic!("expected CaptureOutcome::Utterance on voiced End");
+        };
+        assert!(pcm.len() >= 4 * BLOCK_BYTES);
+        let has_first_trigger = pcm
+            .chunks_exact(2)
+            .any(|pair| i16::from_le_bytes([pair[0], pair[1]]) == 15_000);
+        assert!(
+            has_first_trigger,
+            "flushed utterance must include SpeechStart prefix"
+        );
+        assert!(commands(&recorder).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn record_utterance_streaming_resets_and_rejects_when_muted_mid_speech() {
+        let (mut turn, input_tx, recorder) = SpeechTurn::for_test(11);
+        let gate = Arc::new(PlaybackGate::default());
+        let task_gate = gate.clone();
+        let rejected_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rejected_counter = rejected_count.clone();
+        let started_notify = Arc::new(tokio::sync::Notify::new());
+        let started_signal = started_notify.clone();
+
+        let handle = tokio::spawn(async move {
+            record_utterance_streaming(
+                test_config(),
+                Duration::from_secs(30),
+                &task_gate,
+                &mut turn,
+                move || {
+                    let started_signal = started_signal.clone();
+                    async move {
+                        started_signal.notify_one();
+                    }
+                },
+                |_chunk: Bytes| async { Ok(()) },
+                move || {
+                    let rejected_counter = rejected_counter.clone();
+                    async move {
+                        rejected_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .await
+        });
+
+        // Trigger speech start
+        input_tx
+            .send(SpeechInput::Pcm(pcm_block(20_000)))
+            .await
+            .unwrap();
+        started_notify.notified().await;
+
+        // Mute mid-speech and send PCM while muted
+        gate.mute_mic_for(Duration::from_secs(5));
+        input_tx
+            .send(SpeechInput::Pcm(pcm_block(20_000)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            rejected_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "muting mid-speech must call on_speech_rejected"
+        );
+        assert!(!handle.is_finished());
+
+        // Unmute and deliver a clean utterance with a distinctive trigger block
+        gate.begin();
+        input_tx.send(SpeechInput::Pcm(pcm_block(50))).await.unwrap();
+        input_tx
+            .send(SpeechInput::Pcm(pcm_block(12_345)))
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            input_tx
+                .send(SpeechInput::Pcm(pcm_block(8_000)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            input_tx.send(SpeechInput::Pcm(pcm_block(0))).await.unwrap();
+        }
+
+        let pcm = handle
+            .await
+            .unwrap()
+            .expect("should capture utterance after unmute");
+        let has_trigger = pcm
+            .chunks_exact(2)
+            .any(|pair| i16::from_le_bytes([pair[0], pair[1]]) == 12_345);
+        assert!(
+            has_trigger,
+            "streaming utterance must assemble SpeechStart prefix"
+        );
         assert_eq!(commands(&recorder).await, vec![TestCommand::StopCapture]);
     }
 }
