@@ -33,7 +33,8 @@ xiaoai-agent/src/
 ├── frontend/              # 1. 语音前端适配层（屏蔽底层协议差异）
 │   ├── mod.rs             #    VoiceFrontend 契约、FrontendEvent、AudioStreamChunk
 │   ├── mipns.rs           #    exclusive 适配器（speech.usock + pnshelper + 陈旧帧排空）
-│   └── external_kws.rs    #    dual 适配器（arecord 采集/下采样/回采检测 + UDP XPCM 客户端 + 2.56s 缓冲）
+│   ├── external_kws.rs    #    dual 适配器（arecord 采集/下采样/回采检测 + UDP XPCM 客户端 + 2.56s 缓冲）
+│   └── native_monitor.rs  #    dual 原生小爱互锁监听器（ubus event_command + syslog/instruction.log 双源）
 ├── audio/                 # 2. 音频与输出协调层
 │   ├── mod.rs             #    AudioCoordinator（LED 状态灯、唤醒打断、earcon、静音窗口、音频焦点）
 │   └── text_prep.rs       #    Markdown/URL/Emoji 清洗 + 中英文/小数安全流式切句
@@ -92,9 +93,10 @@ Wakeup / ControlCommand::Chat
    - `llm.timeout_s` 默认 `20.0s`，流式读取采用 `read_timeout`（空闲超时）+ 总硬上限双重保护；
    - `asr.open_ai.timeout_s` 默认 `10.0s`，全包体读取受超时保护；
    - MCP 服务在启动时异步连接，不阻塞音箱语音就绪；IP 定位缓存 30 分钟，避免频繁外网查询。
-4. **双模式协同（`dual`）**：
+4. **双模式协同与原生打断让位（`dual`）**：
    - `ExternalKwsEngine` 通过标准 [UDP XPCM 协议](external-kws-protocol.md)向外部服务发送待机 PCM 与 `XPCM_FLAG_PING` 心跳（30s 保活），唤醒后自动发送 `XPCM_FLAG_RESET` 并回放 2.56s 唤醒缓冲实现 One-shot 连说；
-   - `capture_dual_utterance` 依据硬件 DAC 回采通道计算的 `sys_active` 门控语音起点，原生小爱外放时绝不误收录回声；所有参考服务端（Python / Docker、红米 AX5）均位于 `deploy/kws-server/`。
+   - `capture_dual_utterance` 依据硬件 DAC 回采通道计算的 `sys_active` 门控语音起点，原生小爱外放时绝不误收录回声；所有参考服务端（Python / Docker、红米 AX5）均位于 `deploy/kws-server/`；
+   - `NativeWakeMonitor` 同时支持可选 `dual.native_interlock.event_command`（如真机验证后的 `ubus listen`）与原生日志尾随（`/tmp/log/messages` + `/tmp/mico_aivs_lab/instruction.log`），结合 `max_active_s` 兜底上限与 `cooldown_s` 冷却窗；一旦检测到「小爱同学」，外层 `tokio::select!` 立即中断 One-shot、录音、ASR、大模型/工具调用、提示音、外部 TTS、控制面 `/speak`/`/chat` 与 Agent 自有音乐并静默让位（不动原生 LED、`tts_play.sh` 与 `mphelper`，`duck` 模式下自动恢复音量）。
 5. **tmpfs 空间保护**：外部 TTS 临时音频限制最长保留 600s 且最多保留 5 个文件，防止 50 MB `/tmp` 被撑爆。
 
 ---
@@ -110,7 +112,7 @@ Wakeup / ControlCommand::Chat
 
 通过 `kill -HUP` 或 `POST /reload` 触发，在独立异步任务中执行并自动合并并发请求：
 - **热生效（下一轮生效）**：`llm`、`agent`、`music`、`capture`、`tts`、`runtime.session_idle_timeout_s`、`mcp`、`dual.{enter_prompt,exit_prompt,*_earcon,session_timeout_s,exit_keywords}`（`AgentView` 原子替换配置与工具集，保留当前对话历史）。
-- **需重启（保持旧值并告警）**：`device`、`asr`、`airplay`、`server`、`runtime.mode`、`dual.kws`、`dual.capture`。
+- **需重启（保持旧值并告警）**：`device`、`asr`、`airplay`、`server`、`runtime.mode`、`dual.kws`、`dual.capture`、`dual.native_interlock`。
 - **拒绝修改**：`runtime.speech_socket`。
 - YAML 语法错误时保留旧配置继续运行，绝不导致音箱失声。
 

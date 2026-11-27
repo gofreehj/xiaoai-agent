@@ -483,6 +483,31 @@ impl MusicService {
         }
     }
 
+    /// 让位给原生小爱：清空自建音乐队列与打断恢复标记（绝不再自动 `mphelper play`），
+    /// 若先前已 duck 系统音量则恢复，并精准清理 Agent 在线音乐 `miplayer`。
+    pub async fn yield_to_native(&self) -> bool {
+        let (had_current, was_ducked) = {
+            let mut state = self.state.lock().await;
+            let had_current = state.current.is_some();
+            let was_ducked = state.interruption == Some(InterruptionAction::Duck);
+            state.play_gen = state.play_gen.wrapping_add(1);
+            state.current = None;
+            state.queue.clear();
+            state.history.clear();
+            state.paused = false;
+            state.interruption = None;
+            state.started_in_turn = false;
+            (had_current, was_ducked)
+        };
+        if was_ducked {
+            let _ = self.device.unduck_audio().await;
+        }
+        if had_current {
+            self.device.stop_agent_http_music().await;
+        }
+        had_current || was_ducked
+    }
+
     pub async fn status(&self) -> Value {
         let state = self.state.lock().await;
         json!({

@@ -232,6 +232,20 @@ impl AudioCoordinator {
         self.music.restore_after_interruption().await;
         self.airplay.restore_after_interruption().await;
     }
+
+    /// `dual` 模式下向原生小爱让位：
+    /// 1. 立即推进播放令牌并清静音窗（让在飞合成静默退出）；
+    /// 2. 仅更新 telemetry 为 `Idle`，**不发 `shut_led`**（避免熄灭原生小爱醒灯）；
+    /// 3. 放弃并清理 Agent 自有音乐状态（绝不随后误拉起 `mphelper play`，duck 模式下还原音量）；
+    /// 4. 按需清理 Agent 自己的外部 TTS (`xiaoai-tts-*`) / 提示音 (`qplayer`)，绝不发 `mphelper pause`。
+    pub async fn yield_to_native_dialog(&self, cleanup_tts: bool) {
+        self.playback.begin();
+        self.telemetry.set_phase(AgentPhase::Idle);
+        let had_music = self.music.yield_to_native().await;
+        if cleanup_tts || had_music {
+            self.device.abort_agent_owned_tts().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +439,88 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "令牌失效时必须立刻结束静音窗等待"
+        );
+    }
+
+    #[tokio::test]
+    async fn yield_to_native_dialog_never_touches_native_led_tts_or_mphelper() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let coord = test_coordinator(shell.clone()).await;
+        coord
+            .music
+            .set_current_for_test("kw_y", "夜曲", "https://example.com/yq.mp3")
+            .await;
+        assert!(coord.music.interrupt_for_wake().await);
+        coord.set_phase(AgentPhase::Speaking).await;
+        let old_token = coord.playback.current();
+        let before_scripts = shell.command_count();
+
+        coord.yield_to_native_dialog(true).await;
+
+        assert_eq!(coord.telemetry.phase(), AgentPhase::Idle);
+        assert!(!coord.playback.is_active(old_token));
+        assert!(!coord.music.has_current().await);
+
+        let yield_scripts = &shell.scripts()[before_scripts..];
+        assert!(
+            !yield_scripts.iter().any(|s| s.contains("shut_led")),
+            "让位绝不能熄灭原生 LED: {yield_scripts:?}"
+        );
+        assert!(
+            !yield_scripts.iter().any(|s| s.contains("mphelper")),
+            "让位绝不能调 mphelper pause/play: {yield_scripts:?}"
+        );
+        assert!(
+            !yield_scripts.iter().any(|s| s.contains("tts_play.sh")),
+            "让位绝不能杀原生 tts_play.sh: {yield_scripts:?}"
+        );
+        assert!(
+            yield_scripts.iter().any(|s| s.contains("xiaoai-tts-")),
+            "让位必须精准清理 Agent 外部 TTS 播放器: {yield_scripts:?}"
+        );
+
+        let before_restore = shell.count_matching("mphelper play");
+        coord.music.restore_after_interruption().await;
+        assert_eq!(
+            shell.count_matching("mphelper play"),
+            before_restore,
+            "让位后绝不允许再自动恢复音乐"
+        );
+    }
+
+    #[tokio::test]
+    async fn yield_to_native_dialog_unducks_ducked_music() {
+        let mut cfg = AppConfig::default();
+        cfg.airplay.enabled = false;
+        cfg.music.interruption.mode = "duck".to_string();
+        let shell = Arc::new(RecordingShell::always_ok());
+        let handle = ConfigHandle::new(Arc::new(cfg.clone()));
+        let device = Device::with_runner(cfg.device.clone(), shell.clone());
+        let playback = Arc::new(PlaybackGate::default());
+        let tts = TtsRouter::new(device.clone(), playback.clone());
+        let music = Arc::new(MusicService::new(handle, device.clone()).unwrap());
+        let airplay = AirPlayService::start(cfg.airplay).await.unwrap();
+        let coord = AudioCoordinator::new(
+            device,
+            cfg.device,
+            playback,
+            tts,
+            music,
+            airplay,
+            RuntimeTelemetry::default(),
+            Arc::new(TtsHealth::default()),
+        );
+        coord
+            .music
+            .set_current_for_test("kw_d", "稻香", "https://example.com/dx.mp3")
+            .await;
+        assert!(coord.music.interrupt_for_wake().await);
+        let before = shell.count_matching("mysoftvol");
+
+        coord.yield_to_native_dialog(false).await;
+        assert!(
+            shell.count_matching("mysoftvol") > before,
+            "duck 模式下让位必须恢复 mysoftvol 音量，避免原生小爱被迫低音量播放"
         );
     }
 }

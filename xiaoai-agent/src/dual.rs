@@ -11,6 +11,7 @@ use crate::asr::AsrClient;
 use crate::audio::{AudioCoordinator, FinishMode};
 use crate::config::{AppConfig, ConfigHandle, TtsProvider};
 use crate::frontend::external_kws::{ExternalKwsEngine, ExternalKwsHandle, SessionTracker};
+use crate::frontend::native_monitor::{drain_native_rx, wait_native_wake, NativeWakeMonitor};
 use crate::frontend::BargeInSignal;
 use crate::runtime::reload::{spawn_config_reload, ReloadGate};
 use crate::runtime::telemetry::AgentPhase;
@@ -25,12 +26,24 @@ const MAX_ENTER_PROMPT_DELAY_MS: u64 = 1250;
 const MAX_WAKE_ASR_DELAY_MS: u64 = 850;
 const MAX_CONSECUTIVE_NOISE_TURNS: u32 = 3;
 
+/// 判断在 dual 模式下识别出的句首是否是原生小爱唤醒词（避免把用户对原生小爱的指令送给 LLM）。
+pub fn is_native_xiaoai_utterance(raw_text: &str) -> bool {
+    let cleaned = raw_text.trim_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '。' | '，' | '！' | '？' | '；' | '：' | '、' | '.' | ',' | '!' | '?' | ';' | ':' | '…'
+            )
+    });
+    cleaned.starts_with("小爱同学")
+}
+
 /// 双助手共存守护进程 (mode=dual)
 ///
 /// 架构设计：
 /// 1. 原生小爱 ("小爱同学") 100% 保持不动，独占 speech.usock，听音乐、查天气、设闹钟、米家控制无任何影响；
 /// 2. 外部唤醒由内置 [`ExternalKwsEngine`] 采集 ALSA PCM 并通过通用 UDP XPCM 协议发往任意外部 KWS 服务；
-/// 3. 收到外部 KWS 唤醒响应后，直接在当前单二进制进程内切换到语音流消费模式，零跨进程中继开销；
+/// 3. 通过 [`NativeWakeMonitor`] 实时监听原生小爱唤醒信号，一旦用户改喊“小爱同学”，立刻打断全部会话与控制面任务；
 /// 4. 通过统一的 `AudioCoordinator` + `TurnPipeline` 驱动本地意图、TTS、LED 灯效与连续长对话，并响应 SIGHUP 热重载。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dual_daemon(
@@ -41,15 +54,18 @@ pub async fn run_dual_daemon(
     audio: AudioCoordinator,
     mut reload_rx: mpsc::Receiver<()>,
     reload_gate: Arc<ReloadGate>,
+    native_monitor: NativeWakeMonitor,
 ) -> anyhow::Result<()> {
     let initial_config = config_handle.get().await;
     info!(
         endpoint = %initial_config.dual.kws.endpoint,
         device = %initial_config.dual.capture.device,
+        native_interlock = initial_config.dual.native_interlock.enabled,
         "启动内置外部 KWS 双助手模式 (mode=dual)"
     );
 
     let mut kws = ExternalKwsEngine::spawn(&initial_config.dual).await?;
+    let mut native_rx = native_monitor.subscribe();
 
     audio
         .device
@@ -66,11 +82,23 @@ pub async fn run_dual_daemon(
                 spawn_config_reload(&config_handle, config_path.clone(), &agent, &reload_gate);
                 continue;
             }
+            _ = wait_native_wake(&mut native_rx) => {
+                info!("待机期间检测到原生小爱唤醒，清理 Agent 音频输出");
+                audio.yield_to_native_dialog(false).await;
+                kws.drain_pending_wakes();
+                continue;
+            }
         };
         if sig != BargeInSignal::Wake {
             // 待机状态忽略 __CMD_EXIT__，避免环境人声说“退出/停止”误唤醒设备
             continue;
         }
+        if native_monitor.is_blocked() {
+            info!("原生小爱活跃或冷却保护中，忽略本次外部 KWS 唤醒");
+            kws.drain_pending_wakes();
+            continue;
+        }
+        drain_native_rx(&mut native_rx);
 
         let cur_config = config_handle.get().await;
         let mut tracker = SessionTracker::new();
@@ -102,60 +130,95 @@ pub async fn run_dual_daemon(
             agent.reset_session("enter dual kws session"),
         );
 
-        // 2. 尝试 One-shot 连说探测：如果用户紧接着唤醒词继续提问，直接采集整句并回答；
-        //    若保持静默，再在时效窗内播报入场提示音/欢迎语。
-        let session_res = async {
-            let oneshot =
-                probe_oneshot_or_prompt(&mut kws, &cur_config, &asr, &agent, &audio, &tracker)
-                    .await?;
-            match oneshot {
-                OneshotOutcome::ExitImmediately => {
-                    kws.drain_pending_wakes();
-                    info!(
-                        session_id = tracker.session_id,
-                        "One-shot 阶段收到本地结束指令，回到双助手就绪待机状态"
-                    );
-                    Ok(())
-                }
-                OneshotOutcome::Query(initial_query) => {
-                    run_conversation_session(
-                        &mut kws,
-                        &config_handle,
-                        &asr,
-                        &agent,
-                        &audio,
-                        &mut tracker,
-                        &in_flight,
-                        Some(initial_query),
-                    )
-                    .await
-                }
-                OneshotOutcome::NoSpeech => {
-                    run_conversation_session(
-                        &mut kws,
-                        &config_handle,
-                        &asr,
-                        &agent,
-                        &audio,
-                        &mut tracker,
-                        &in_flight,
-                        None,
-                    )
-                    .await
-                }
-            }
+        // 2. 用外层 select! 统一兜住 One-shot + 连续对话全阶段，确保任何时刻喊「小爱同学」都秒停秒让位。
+        enum DualSessionOutcome {
+            Completed(anyhow::Result<SessionExit>),
+            NativeInterrupted,
         }
-        .await;
 
-        // 排空会话期间可能积压的残留唤醒事件，防止刚退出又立刻被拉回会话
-        kws.drain_pending_wakes();
+        let outcome = tokio::select! {
+            res = async {
+                let oneshot = probe_oneshot_or_prompt(
+                    &mut kws,
+                    &cur_config,
+                    &asr,
+                    &agent,
+                    &audio,
+                    &tracker,
+                    &native_monitor,
+                )
+                .await?;
+                match oneshot {
+                    OneshotOutcome::ExitImmediately => {
+                        info!(
+                            session_id = tracker.session_id,
+                            "One-shot 阶段收到本地结束指令，回到双助手就绪待机状态"
+                        );
+                        Ok(SessionExit::Normal)
+                    }
+                    OneshotOutcome::NativeYield => Ok(SessionExit::NativeYield),
+                    OneshotOutcome::Query(initial_query) => {
+                        run_conversation_session(
+                            &mut kws,
+                            &config_handle,
+                            &asr,
+                            &agent,
+                            &audio,
+                            &mut tracker,
+                            &in_flight,
+                            &native_monitor,
+                            Some(initial_query),
+                        )
+                        .await
+                    }
+                    OneshotOutcome::NoSpeech => {
+                        run_conversation_session(
+                            &mut kws,
+                            &config_handle,
+                            &asr,
+                            &agent,
+                            &audio,
+                            &mut tracker,
+                            &in_flight,
+                            &native_monitor,
+                            None,
+                        )
+                        .await
+                    }
+                }
+            } => DualSessionOutcome::Completed(res),
+            _ = wait_native_wake(&mut native_rx) => DualSessionOutcome::NativeInterrupted,
+        };
 
-        // 会话结束，熄灭灯光并按原状态恢复被打断的音乐与 AirPlay
-        audio.release_dialog_focus().await;
-        info!(
-            session_id = tracker.session_id,
-            "长对话会话已退出，回到双助手就绪待机状态"
-        );
+        let (yielded_to_native, session_res) = match outcome {
+            DualSessionOutcome::NativeInterrupted => (true, Ok(())),
+            DualSessionOutcome::Completed(Ok(SessionExit::NativeYield)) => (true, Ok(())),
+            DualSessionOutcome::Completed(Ok(SessionExit::Normal)) => {
+                (native_monitor.is_blocked(), Ok(()))
+            }
+            DualSessionOutcome::Completed(Err(err)) => (native_monitor.is_blocked(), Err(err)),
+        };
+
+        if yielded_to_native {
+            // 先立即止声让位，再停流并排空残留唤醒，绝不发 shut_led / mphelper / 退出播报。
+            audio.yield_to_native_dialog(true).await;
+            let _ = in_flight.take();
+            kws.stop_stream().await;
+            kws.drain_pending_wakes();
+            agent.reset_session("native xiaoai wake").await;
+            info!(
+                session_id = tracker.session_id,
+                "已立即打断当前对话并静默让位给原生小爱"
+            );
+        } else {
+            kws.stop_stream().await;
+            kws.drain_pending_wakes();
+            audio.release_dialog_focus().await;
+            info!(
+                session_id = tracker.session_id,
+                "长对话会话已退出，回到双助手就绪待机状态"
+            );
+        }
         session_res?;
     }
 }
@@ -164,8 +227,16 @@ enum OneshotOutcome {
     Query(String),
     NoSpeech,
     ExitImmediately,
+    NativeYield,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionExit {
+    Normal,
+    NativeYield,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn probe_oneshot_or_prompt(
     kws: &mut ExternalKwsHandle,
     cur_config: &AppConfig,
@@ -173,7 +244,11 @@ async fn probe_oneshot_or_prompt(
     agent: &Arc<AgentRuntime>,
     audio: &AudioCoordinator,
     tracker: &SessionTracker,
+    native_monitor: &NativeWakeMonitor,
 ) -> anyhow::Result<OneshotOutcome> {
+    if native_monitor.is_blocked() {
+        return Ok(OneshotOutcome::NativeYield);
+    }
     kws.start_oneshot_stream().await?;
     let max_timeout = Duration::from_secs(cur_config.dual.session_timeout_s.max(5));
     // One-shot 探测阶段按 40ms 包粒度即时判音，缩短首帧滞后
@@ -188,10 +263,23 @@ async fn probe_oneshot_or_prompt(
         .await;
     kws.stop_stream().await;
 
+    if native_monitor.is_blocked() {
+        return Ok(OneshotOutcome::NativeYield);
+    }
+
     if let Ok(Some(pcm)) = capture_res {
         audio.set_phase(AgentPhase::Thinking).await;
         let text_opt = transcribe_pcm_bytes(asr, &pcm, cur_config.capture.sample_rate).await;
         if let Some(raw_text) = text_opt {
+            if is_native_xiaoai_utterance(&raw_text) {
+                info!(
+                    session_id = tracker.session_id,
+                    raw = %raw_text,
+                    "One-shot 识别到原生小爱唤醒词，静默让位"
+                );
+                native_monitor.notify_native_utterance();
+                return Ok(OneshotOutcome::NativeYield);
+            }
             let mut empty_count = 0u32;
             let mut ctx = LocalIntentContext {
                 is_followup: false,
@@ -238,6 +326,9 @@ async fn probe_oneshot_or_prompt(
         );
         return Ok(OneshotOutcome::NoSpeech);
     }
+    if native_monitor.is_blocked() {
+        return Ok(OneshotOutcome::NativeYield);
+    }
 
     info!(
         session_id = tracker.session_id,
@@ -281,13 +372,17 @@ async fn run_conversation_session(
     audio: &AudioCoordinator,
     tracker: &mut SessionTracker,
     in_flight: &InFlightTurn,
+    native_monitor: &NativeWakeMonitor,
     mut pending_query: Option<String>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SessionExit> {
     let mut last_activity = Instant::now();
     let mut consecutive_noise_turns: u32 = 0;
     let mut answered_turns: u32 = 0;
 
     loop {
+        if native_monitor.is_blocked() {
+            return Ok(SessionExit::NativeYield);
+        }
         let cur_config = config_handle.get().await;
 
         let (user_text, asr_started_at, asr_ms) = if let Some(q) = pending_query.take() {
@@ -297,6 +392,9 @@ async fn run_conversation_session(
             let remaining = session_timeout.saturating_sub(last_activity.elapsed());
 
             if remaining.is_zero() {
+                if native_monitor.is_blocked() {
+                    return Ok(SessionExit::NativeYield);
+                }
                 info!("连续对话超过超时时间，自动退出");
                 play_prompt(
                     audio,
@@ -317,6 +415,10 @@ async fn run_conversation_session(
                 .await;
             kws.stop_stream().await;
 
+            if native_monitor.is_blocked() {
+                return Ok(SessionExit::NativeYield);
+            }
+
             let pcm = match utterance_res {
                 Ok(Some(pcm)) => pcm,
                 Ok(None) => {
@@ -332,6 +434,15 @@ async fn run_conversation_session(
             let asr_ms = utterance_captured_at.elapsed().as_millis() as u64;
 
             let raw_text = text_opt.unwrap_or_default();
+            if is_native_xiaoai_utterance(&raw_text) {
+                info!(
+                    session_id = tracker.session_id,
+                    raw = %raw_text,
+                    "连续对话中检测到原生小爱唤醒词，停止回答并静默让位"
+                );
+                native_monitor.notify_native_utterance();
+                return Ok(SessionExit::NativeYield);
+            }
             let allow_wake_ack =
                 utterance_captured_at.elapsed() <= Duration::from_millis(MAX_WAKE_ASR_DELAY_MS);
             let mut ctx = LocalIntentContext {
@@ -438,10 +549,19 @@ async fn run_conversation_session(
                 sleep(Duration::from_millis(60)).await;
                 audio.set_phase(AgentPhase::Listening).await;
                 tracker.reset_wake_window();
-                let oneshot =
-                    probe_oneshot_or_prompt(kws, &cur_config, asr, agent, audio, tracker).await?;
+                let oneshot = probe_oneshot_or_prompt(
+                    kws,
+                    &cur_config,
+                    asr,
+                    agent,
+                    audio,
+                    tracker,
+                    native_monitor,
+                )
+                .await?;
                 match oneshot {
                     OneshotOutcome::ExitImmediately => break,
+                    OneshotOutcome::NativeYield => return Ok(SessionExit::NativeYield),
                     OneshotOutcome::Query(q) => pending_query = Some(q),
                     OneshotOutcome::NoSpeech => {}
                 }
@@ -457,13 +577,15 @@ async fn run_conversation_session(
                 audio.playback.begin();
                 audio.device.abort_tts_preserving_music().await;
                 sleep(Duration::from_millis(60)).await;
-                play_prompt(
-                    audio,
-                    &cur_config,
-                    cur_config.dual.exit_earcon.as_deref(),
-                    &cur_config.dual.exit_prompt,
-                )
-                .await;
+                if !native_monitor.is_blocked() {
+                    play_prompt(
+                        audio,
+                        &cur_config,
+                        cur_config.dual.exit_earcon.as_deref(),
+                        &cur_config.dual.exit_prompt,
+                    )
+                    .await;
+                }
                 agent.reset_session("user exit command").await;
                 break;
             }
@@ -472,7 +594,7 @@ async fn run_conversation_session(
         last_activity = Instant::now();
     }
 
-    Ok(())
+    Ok(SessionExit::Normal)
 }
 
 enum DualTurnOutcome {
@@ -780,5 +902,15 @@ mod tests {
             peak, 12_000,
             "system 回声片段(20000)不应混入用户捕获样本，实际峰值为 {peak}"
         );
+    }
+
+    #[test]
+    fn is_native_xiaoai_utterance_matches_only_native_wake_prefix() {
+        assert!(is_native_xiaoai_utterance("小爱同学，定个闹钟"));
+        assert!(is_native_xiaoai_utterance("  小爱同学！ "));
+        assert!(is_native_xiaoai_utterance("小爱同学"));
+        assert!(!is_native_xiaoai_utterance("豆包，小爱同学是什么"));
+        assert!(!is_native_xiaoai_utterance("帮我问问小爱同学"));
+        assert!(!is_native_xiaoai_utterance("今天天气怎么样"));
     }
 }

@@ -23,6 +23,35 @@ pub const STOP_ACTIVE_TTS_SCRIPT: &str = "for p in /proc/[0-9]*; do \
  killall -q -9 qplayer 2>/dev/null || true; \
  mphelper pause >/dev/null 2>&1 || true";
 
+/// dual 模式下让位给原生小爱时使用：只杀 Agent 自己落盘的外部 TTS 音频 (`xiaoai-tts-*`) 与提示音 (`qplayer`)，
+/// **绝不**杀原生 `tts_play.sh`，**绝不**调 `mphelper pause`，**绝不**灭原生 LED。
+pub const ABORT_AGENT_TTS_ONLY_SCRIPT: &str = "for p in /proc/[0-9]*; do \
+   [ -r \"$p/cmdline\" ] || continue; \
+   cmd=$(tr '\\0' ' ' <\"$p/cmdline\" 2>/dev/null); \
+   case \"$cmd\" in \
+     *miplayer*) \
+       case \"$cmd\" in \
+         *xiaoai-tts-*) kill -9 \"${p#/proc/}\" 2>/dev/null || true ;; \
+       esac \
+       ;; \
+   esac; \
+ done; \
+ killall -q -9 qplayer 2>/dev/null || true";
+
+/// dual 模式下让位给原生小爱时使用：只停止 Agent 拉起的在线音乐 (`miplayer -f http(s)://...`)，
+/// **绝不**调 `mphelper` 或碰原生音频队列。
+pub const STOP_AGENT_HTTP_MUSIC_SCRIPT: &str = "for p in /proc/[0-9]*; do \
+   [ -r \"$p/cmdline\" ] || continue; \
+   cmd=$(tr '\\0' ' ' <\"$p/cmdline\" 2>/dev/null); \
+   case \"$cmd\" in \
+     *miplayer*) \
+       case \"$cmd\" in \
+         *http://*|*https://*) kill -9 \"${p#/proc/}\" 2>/dev/null || true ;; \
+       esac \
+       ;; \
+   esac; \
+ done";
+
 #[derive(Clone)]
 pub struct Device {
     config: DeviceConfig,
@@ -110,6 +139,26 @@ impl Device {
             .await
         {
             warn!(error = %err, "唤醒打断时没能掐掉 TTS 播放进程");
+        }
+    }
+
+    /// 让位给原生小爱时使用：只杀 Agent 外部 TTS (`xiaoai-tts-*`) 与提示音 (`qplayer`)。
+    pub async fn abort_agent_owned_tts(&self) {
+        if let Err(err) = self
+            .run_raw(ABORT_AGENT_TTS_ONLY_SCRIPT, Duration::from_secs(5))
+            .await
+        {
+            warn!(error = %err, "让位原生小爱时清理 Agent TTS 进程失败");
+        }
+    }
+
+    /// 让位给原生小爱时使用：只杀 Agent 播放在线音乐的 `miplayer` 进程，不碰 `mphelper`。
+    pub async fn stop_agent_http_music(&self) {
+        if let Err(err) = self
+            .run_raw(STOP_AGENT_HTTP_MUSIC_SCRIPT, Duration::from_secs(5))
+            .await
+        {
+            warn!(error = %err, "让位原生小爱时停止 Agent 在线音乐失败");
         }
     }
 
@@ -271,6 +320,22 @@ mod tests {
         let script = shell.last_script().expect("must run stop script");
         assert!(script.contains("*http://*|*https://*"), "{script}");
         assert!(!script.contains("killall miplayer"), "{script}");
+    }
+
+    #[tokio::test]
+    async fn native_yield_scripts_never_touch_tts_play_mphelper_or_led() {
+        assert!(!ABORT_AGENT_TTS_ONLY_SCRIPT.contains("tts_play.sh"));
+        assert!(!ABORT_AGENT_TTS_ONLY_SCRIPT.contains("mphelper"));
+        assert!(!ABORT_AGENT_TTS_ONLY_SCRIPT.contains("shut_led"));
+        assert!(!ABORT_AGENT_TTS_ONLY_SCRIPT.contains("killall miplayer"));
+        assert!(ABORT_AGENT_TTS_ONLY_SCRIPT.contains("xiaoai-tts-"));
+        assert!(ABORT_AGENT_TTS_ONLY_SCRIPT.contains("qplayer"));
+
+        assert!(!STOP_AGENT_HTTP_MUSIC_SCRIPT.contains("tts_play.sh"));
+        assert!(!STOP_AGENT_HTTP_MUSIC_SCRIPT.contains("mphelper"));
+        assert!(!STOP_AGENT_HTTP_MUSIC_SCRIPT.contains("shut_led"));
+        assert!(!STOP_AGENT_HTTP_MUSIC_SCRIPT.contains("killall miplayer"));
+        assert!(STOP_AGENT_HTTP_MUSIC_SCRIPT.contains("*http://*|*https://*"));
     }
 
     #[tokio::test]

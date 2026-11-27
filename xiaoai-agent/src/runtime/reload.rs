@@ -35,6 +35,9 @@ pub fn keep_pending_sections(
             "server" => effective.server = current.server.clone(),
             "dual.kws" => effective.dual.kws = current.dual.kws.clone(),
             "dual.capture" => effective.dual.capture = current.dual.capture.clone(),
+            "dual.native_interlock" => {
+                effective.dual.native_interlock = current.dual.native_interlock.clone();
+            }
             other => error!(
                 section = other,
                 "未知的待生效配置段：没有回填逻辑，句柄里会是新值（与实际运行值不一致）"
@@ -291,6 +294,7 @@ mod tests {
         let mut next = current.clone();
         next.dual.kws.endpoint = "10.0.0.2:6000".into();
         next.dual.capture.channels = 2;
+        next.dual.native_interlock.cooldown_s = 12;
         next.dual.enter_prompt = "请吩咐".into();
 
         let next = Arc::new(next);
@@ -298,6 +302,7 @@ mod tests {
         let effective = keep_pending_sections(&current, &next, &changes);
         assert_eq!(effective.dual.kws.endpoint, "192.168.31.1:5005");
         assert_eq!(effective.dual.capture.channels, 8);
+        assert_eq!(effective.dual.native_interlock.cooldown_s, 5);
         assert_eq!(effective.dual.enter_prompt, "请吩咐");
     }
 }

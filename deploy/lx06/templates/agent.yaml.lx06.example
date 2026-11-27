@@ -16,6 +16,14 @@ runtime:
 #   enter_prompt: "我在，请讲"
 #   exit_prompt: "已退出对话模式，再见"
 #   session_timeout_s: 60
+#   native_interlock:
+#     enabled: true
+#     # 若在实机通过 `ubus listen` 确认有唤醒事件，可填 "ubus listen" 并将关键字段加入 wake_patterns
+#     event_command: ""
+#     syslog_path: /tmp/log/messages
+#     instruction_log_path: /tmp/mico_aivs_lab/instruction.log
+#     max_active_s: 15
+#     cooldown_s: 5
 
 device:
   # LX06 tts_play.sh has no shebang, only consumes $1, and returns 1 when no music was playing prior to TTS.

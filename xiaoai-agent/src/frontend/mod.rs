@@ -2,6 +2,7 @@
 
 pub mod external_kws;
 pub mod mipns;
+pub mod native_monitor;
 
 use std::fmt;
 

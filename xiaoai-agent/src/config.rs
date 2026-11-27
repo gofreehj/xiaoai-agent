@@ -80,6 +80,7 @@ impl Default for RuntimeConfig {
 pub struct DualKwsConfig {
     pub kws: ExternalKwsConfig,
     pub capture: DualCaptureConfig,
+    pub native_interlock: NativeInterlockConfig,
     pub enter_prompt: String,
     pub exit_prompt: String,
     pub enter_earcon: Option<PathBuf>,
@@ -118,6 +119,7 @@ impl Default for DualKwsConfig {
         Self {
             kws: ExternalKwsConfig::default(),
             capture: DualCaptureConfig::default(),
+            native_interlock: NativeInterlockConfig::default(),
             enter_prompt: "我在，请讲".to_string(),
             exit_prompt: "已退出对话模式，再见".to_string(),
             enter_earcon: Some(PathBuf::from("enter_prompt.wav")),
@@ -135,6 +137,56 @@ impl Default for DualKwsConfig {
                 "结束".to_string(),
                 "关闭".to_string(),
             ],
+        }
+    }
+}
+
+/// 原生小爱唤醒实时互锁监听配置（仅 `runtime.mode: dual` 生效）。
+/// 支持双信号源：可选 `event_command`（如验证后的 `ubus listen` / `ubus monitor`）与
+/// 原生系统日志 / AIVS 指令日志尾随，任一命中均立即打断并让位给原生小爱。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NativeInterlockConfig {
+    pub enabled: bool,
+    /// 可选实时事件流命令（例如 "ubus listen" 或 "ubus monitor"）；留空则仅使用日志尾随。
+    pub event_command: String,
+    /// 原生系统日志路径（默认 `/tmp/log/messages`，不存在时自动尝试 `/var/log/messages`）。
+    pub syslog_path: Option<PathBuf>,
+    /// 原生 AIVS 指令日志路径（默认 `/tmp/mico_aivs_lab/instruction.log`）。
+    pub instruction_log_path: Option<PathBuf>,
+    /// 在 syslog 或 event_command 输出中表示「原生小爱已唤醒/开始收音」的子串列表。
+    pub wake_patterns: Vec<String>,
+    /// 在 syslog 或 event_command 输出中表示「原生小爱收音结束」的子串列表。
+    pub end_patterns: Vec<String>,
+    /// 在 instruction_log_path 中表示「原生小爱正在识别」的子串列表（严禁包含 SpeechSynthesizer）。
+    pub instruction_patterns: Vec<String>,
+    /// 原生激活状态安全上限（秒）：即使未观察到 end_patterns 也会在该时长后自动释放，避免永久互锁死锁。
+    pub max_active_s: u64,
+    /// 结束或命中指令后的冷却保护窗（秒）：期间丢弃外部 KWS 误唤醒。
+    pub cooldown_s: u64,
+    /// 日志文件尾随轮询间隔（毫秒，运行时钳制在 20..=1000ms）。
+    pub poll_interval_ms: u64,
+}
+
+impl Default for NativeInterlockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            event_command: String::new(),
+            syslog_path: Some(PathBuf::from("/tmp/log/messages")),
+            instruction_log_path: Some(PathBuf::from("/tmp/mico_aivs_lab/instruction.log")),
+            wake_patterns: vec![
+                "send real_wakeup event".to_string(),
+                "wakeup.sh: asrstart".to_string(),
+            ],
+            end_patterns: vec!["wakeup.sh: asrend".to_string()],
+            instruction_patterns: vec![
+                "SpeechRecognizer".to_string(),
+                "RecognizeResult".to_string(),
+            ],
+            max_active_s: 15,
+            cooldown_s: 5,
+            poll_interval_ms: 50,
         }
     }
 }
@@ -1027,6 +1079,9 @@ pub fn classify_config_change(old: &AppConfig, new: &AppConfig) -> ConfigChanges
     if section_changed(&old.dual.capture, &new.dual.capture) {
         changes.needs_restart.push("dual.capture");
     }
+    if section_changed(&old.dual.native_interlock, &new.dual.native_interlock) {
+        changes.needs_restart.push("dual.native_interlock");
+    }
     if section_changed(&old.dual.hot_view(), &new.dual.hot_view()) {
         changes.applied.push("dual");
     }
@@ -1531,10 +1586,12 @@ dual:
         let mut new = old.clone();
         new.dual.kws.endpoint = "192.168.31.2:5005".into();
         new.dual.capture.sample_rate = 16_000;
+        new.dual.native_interlock.cooldown_s = 12;
         new.dual.enter_prompt = "你好".into();
         let changes = classify_config_change(&old, &new);
         assert!(changes.needs_restart.contains(&"dual.kws"));
         assert!(changes.needs_restart.contains(&"dual.capture"));
+        assert!(changes.needs_restart.contains(&"dual.native_interlock"));
         assert!(changes.applied.contains(&"dual"));
     }
 }

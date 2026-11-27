@@ -24,6 +24,14 @@ runtime:
 #   exit_earcon: "exit_prompt.wav"
 #   thinking_earcon: "thinking_prompt.wav"
 #   session_timeout_s: 60
+#   native_interlock:
+#     enabled: true
+#     # 可选实时事件命令（如在实机验证 ubus listen 输出格式后填入 "ubus listen"，与日志监听互补）
+#     event_command: ""
+#     syslog_path: /tmp/log/messages
+#     instruction_log_path: /tmp/mico_aivs_lab/instruction.log
+#     max_active_s: 15
+#     cooldown_s: 5
 
 device:
   # 单条设备命令（tts_play.sh / miplayer / ubus）的最长执行时间，秒

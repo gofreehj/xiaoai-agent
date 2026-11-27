@@ -214,18 +214,54 @@ fn answer(reply: CannedReply, limit: Duration) -> ShellFuture<'static> {
     })
 }
 
-pub async fn run_shell(script: &str, limit: Duration) -> anyhow::Result<CommandResult> {
-    // kill_on_drop: 上层 abort 掉本轮任务时，sh 及其子进程必须一起死，
-    // 否则旧 TTS 会继续出声、与新回答叠在一起（双播）。
-    let fut = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(script)
-        .kill_on_drop(true)
-        .output();
+#[cfg(unix)]
+struct ProcessGroupGuard(Option<u32>);
 
-    let output = match timeout(limit, fut).await {
-        Ok(res) => res?,
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &format!("-{pgid}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+pub async fn run_shell(script: &str, limit: Duration) -> anyhow::Result<CommandResult> {
+    // kill_on_drop + 独立进程组：上层 abort 掉本轮任务时，sh 及其孙进程（如 tts_play.sh
+    // 内的播放器）必须一起死，否则旧 TTS 会继续出声；正常退出时立即撤防，不误杀 `&` 后台进程。
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd.spawn()?;
+    #[cfg(unix)]
+    let mut pg_guard = ProcessGroupGuard(child.id());
+
+    let output = match timeout(limit, child.wait_with_output()).await {
+        Ok(res) => {
+            #[cfg(unix)]
+            pg_guard.disarm();
+            res?
+        }
         Err(_) => {
+            #[cfg(unix)]
+            drop(pg_guard);
             let brief: String = script.chars().take(80).collect();
             return Err(anyhow::anyhow!(
                 "{TIMEOUT_ERROR_PREFIX} after {limit:?}: {brief}"
@@ -412,5 +448,50 @@ mod tests {
         }
         let _ = std::fs::remove_file(&file);
         assert!(!alive, "abort 后直接子进程 {pid} 仍然活着");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_run_shell_kills_grandchild_process_group() {
+        let file = pid_file("pg-drop");
+        let script = format!("sleep 30 & echo $! > {}; wait", file.display());
+        let handle = tokio::spawn(async move { run_shell(&script, Duration::from_secs(30)).await });
+
+        let mut waited = 0;
+        while !file.exists() && waited < 200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert!(file.exists(), "孙进程 pid 文件没有落盘");
+        let child_pid: i32 = std::fs::read_to_string(&file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&file);
+
+        handle.abort();
+        let _ = handle.await;
+
+        let mut alive = true;
+        for _ in 0..100 {
+            let still_alive = std::process::Command::new("kill")
+                .args(["-0", &child_pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !still_alive {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if alive {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &child_pid.to_string()])
+                .status();
+        }
+        assert!(!alive, "abort 后孙进程 {child_pid} 仍然活着");
     }
 }

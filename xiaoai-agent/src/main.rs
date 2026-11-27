@@ -143,6 +143,9 @@ async fn main() -> anyhow::Result<()> {
 
     if initial.runtime.mode == "dual" {
         info!("xiaoai-agent 启动模式: 内置外部 KWS 双助手共存模式 (mode=dual)");
+        let native_monitor = crate::frontend::native_monitor::NativeWakeMonitor::spawn(
+            &initial.dual.native_interlock,
+        );
         let ep = initial.dual.kws.endpoint.trim();
         let control_state = Arc::new(server::ControlState {
             token: initial.server.token.clone(),
@@ -157,10 +160,29 @@ async fn main() -> anyhow::Result<()> {
             telemetry: telemetry.clone(),
         });
         let _control_task = start_control_plane(&initial.server, control_state, hooks).await;
-        // dual 模式没有 mipns 会话句柄可打断，控制命令在独立任务里执行。
+        let mut control_native_rx = native_monitor.subscribe();
+        let control_native_monitor = native_monitor.clone();
+        // dual 模式下控制面任务同样监听原生小爱唤醒，命中时立刻 abort /speak 与 /chat。
         tokio::spawn(async move {
-            while let Some(cmd) = command_rx.recv().await {
-                control_runner.handle(cmd).await;
+            loop {
+                tokio::select! {
+                    maybe_cmd = command_rx.recv() => {
+                        let Some(cmd) = maybe_cmd else { break; };
+                        if matches!(cmd, ControlCommand::Speak(_) | ControlCommand::Chat(_))
+                            && control_native_monitor.is_blocked()
+                        {
+                            warn!("原生小爱活跃或冷却保护中，跳过控制面语音请求");
+                            continue;
+                        }
+                        control_runner.handle(cmd).await;
+                    }
+                    _ = crate::frontend::native_monitor::wait_native_wake(&mut control_native_rx) => {
+                        if control_runner.abort_running() {
+                            info!("检测到原生小爱唤醒，已打断控制面播报/对话任务");
+                            control_runner.audio.yield_to_native_dialog(true).await;
+                        }
+                    }
+                }
             }
         });
         return dual::run_dual_daemon(
@@ -171,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
             audio,
             reload_rx,
             reload_gate,
+            native_monitor,
         )
         .await;
     }
@@ -453,12 +476,14 @@ impl ControlRunner {
         }
     }
 
-    fn abort_running(&mut self) {
+    fn abort_running(&mut self) -> bool {
         if let Some(task) = self.task.take() {
             if !task.is_finished() {
                 task.abort();
+                return true;
             }
         }
+        false
     }
 
     async fn handle(&mut self, cmd: ControlCommand) {
@@ -710,6 +735,24 @@ async fn run_doctor_command(config_path: &Path) -> anyhow::Result<()> {
             config.dual.capture.format,
             config.dual.capture.mic_channel,
             config.dual.capture.ref_channel
+        );
+        let ni = &config.dual.native_interlock;
+        let syslog_desc = ni.syslog_path.as_ref().map_or_else(
+            || "none".to_string(),
+            |p| format!("{} (exists={})", p.display(), p.exists()),
+        );
+        let inst_desc = ni.instruction_log_path.as_ref().map_or_else(
+            || "none".to_string(),
+            |p| format!("{} (exists={})", p.display(), p.exists()),
+        );
+        let event_cmd = if ni.event_command.trim().is_empty() {
+            "<none>"
+        } else {
+            ni.event_command.trim()
+        };
+        println!(
+            "native_interlock: enabled={} event_command={} syslog={} instruction_log={} max_active={}s cooldown={}s",
+            ni.enabled, event_cmd, syslog_desc, inst_desc, ni.max_active_s, ni.cooldown_s
         );
     } else {
         let socket = &config.runtime.speech_socket;

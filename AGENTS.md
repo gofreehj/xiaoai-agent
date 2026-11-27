@@ -135,9 +135,14 @@ Full architecture overview lives in [docs/architecture.md](docs/architecture.md)
 external KWS endpoint; Redmi AX5 and Python/Docker in `deploy/kws-server/` are reference
 implementations) run as a single speaker binary (`xiaoai-agent`) and share the same core runtime:
 
-- `frontend/{mod,mipns,external_kws}.rs` encapsulates transport differences behind
+- `frontend/{mod,mipns,external_kws,native_monitor}.rs` encapsulates transport differences behind
   `VoiceFrontend` / `FrontendEvent` / `ExternalKwsHandle`. `capture_dual_utterance` must
   respect `AudioChunk::sys_active` (gate onset when native XiaoAI / hardware loopback plays).
+  In `dual` mode, `NativeWakeMonitor` combines optional `event_command` (`ubus listen`) with
+  native syslog + `instruction.log` tailing (`max_active_s=15`, `cooldown_s=5`) to immediately
+  cancel active `dual.rs` sessions (One-shot, capture, ASR, LLM/tools, TTS) and `ControlRunner`
+  tasks via `AudioCoordinator::yield_to_native_dialog` — never touching native `tts_play.sh`,
+  `mphelper`, or native LEDs, while unducking `mysoftvol` and discarding Agent music state.
 - `audio/{mod,text_prep}.rs` owns LED state, `PlaybackGate`, earcon playback,
   quiet-window settlement, and Markdown/URL/Emoji-free sentence splitting.
 - `session/{mod,pipeline,intent}.rs` owns the unified `SessionOrchestrator`,
@@ -147,8 +152,9 @@ implementations) run as a single speaker binary (`xiaoai-agent`) and share the s
 - `control/mod.rs` + `server.rs`: both `exclusive` and `dual` wire
   `server::spawn_with_hooks` + `ControlRunner`; every route except `/` stays
   behind router-level `require_token`, and mutating routes stay `POST`-only.
-- `runtime/reload.rs`: `runtime.mode`, `server`, `dual.kws`, and `dual.capture` are restart-only
-  sections rolled back on `SIGHUP` alongside `device`, `asr`, and `airplay`.
+- `runtime/reload.rs`: `runtime.mode`, `server`, `dual.kws`, `dual.capture`, and
+  `dual.native_interlock` are restart-only sections rolled back on `SIGHUP` alongside
+  `device`, `asr`, and `airplay`.
 - **LX06 flashing hard rules** (consolidated from former `deploy/lx06/AGENTS.md`):
   only write inactive `boot0/1` or `system0/1`; never write `bootloader`, `tpl`,
   or `data`; always back up all 6 partitions using real `/proc/mtd` sizes (never
