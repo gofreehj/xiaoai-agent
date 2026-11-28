@@ -39,6 +39,15 @@ pub const XPCM_FLAG_PCM: u16 = 1;
 pub const XPCM_FLAG_RESET: u16 = 2;
 pub const XPCM_FLAG_PING: u16 = 3;
 pub const XPCM_FLAG_SYS_ACTIVE: u16 = 0x0100;
+pub const XPCM_FLAG_EXIT_WORDS: u16 = 0x0200;
+
+/// Full external KWS wake/exit payload forwarded to session runners.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BargeInEvent {
+    pub signal: BargeInSignal,
+    pub keyword: String,
+    pub score: Option<f32>,
+}
 
 const SYS_REF_MEAN_SQ_THR: f64 = 25.0 * 25.0;
 const SYS_HANGOVER_CHUNKS: usize = 7; // ~280ms acoustic reverb tail
@@ -664,9 +673,16 @@ fn spawn_alsa_capture_worker(
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    Capture,
+    Oneshot,
+    Realtime,
+}
+
 enum EngineCommand {
     StartStream {
-        oneshot: bool,
+        mode: StreamMode,
         reply: oneshot::Sender<mpsc::Receiver<AudioChunk>>,
     },
     StopStream {
@@ -733,7 +749,7 @@ impl ExternalKwsEngine {
         let initial_ping = encode_xpcm_packet(0, XPCM_FLAG_PING, &[]);
         let _ = udp.send_to(&initial_ping, target_addr).await;
 
-        let (wake_tx, wake_rx) = mpsc::channel(16);
+        let (wake_tx, wake_rx) = mpsc::channel::<BargeInEvent>(16);
         let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
 
         let engine_task = tokio::spawn(async move {
@@ -741,6 +757,7 @@ impl ExternalKwsEngine {
             let mut ring_total: u64 = 0;
             let mut wake_replay_idx: Option<u64> = None;
             let mut stream_tx: Option<mpsc::Sender<AudioChunk>> = None;
+            let mut stream_mode: Option<StreamMode> = None;
             let mut seq: u16 = 0;
             let mut last_wake_seq: u32 = 0;
             let mut last_wake_at: Option<Instant> = None;
@@ -759,15 +776,22 @@ impl ExternalKwsEngine {
                         let Some(chunk) = maybe_chunk else {
                             break;
                         };
-                        if let Some(tx) = stream_tx.as_ref() {
-                            match tx.try_send(chunk) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {}
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    stream_tx = None;
-                                }
+                        let send_udp_in_stream = stream_mode == Some(StreamMode::Realtime);
+                        let active_stream_closed = if let Some(tx) = stream_tx.as_ref() {
+                            match tx.try_send(chunk.clone()) {
+                                Ok(()) => false,
+                                Err(mpsc::error::TrySendError::Full(_)) => false,
+                                Err(mpsc::error::TrySendError::Closed(_)) => true,
                             }
                         } else {
+                            false
+                        };
+                        if active_stream_closed {
+                            stream_tx = None;
+                            stream_mode = None;
+                        }
+
+                        if stream_tx.is_none() || send_udp_in_stream {
                             if ring.len() == RING_CAP {
                                 ring.pop_front();
                             }
@@ -776,7 +800,8 @@ impl ExternalKwsEngine {
                             ring_total += 1;
                             seq = seq.wrapping_add(1);
                             let flags = XPCM_FLAG_PCM
-                                | if chunk.sys_active { XPCM_FLAG_SYS_ACTIVE } else { 0 };
+                                | if chunk.sys_active { XPCM_FLAG_SYS_ACTIVE } else { 0 }
+                                | if send_udp_in_stream { XPCM_FLAG_EXIT_WORDS } else { 0 };
                             let pkt = if kws_agc_enabled {
                                 let boosted = kws_agc.process_pcm_bytes(&chunk.pcm);
                                 encode_xpcm_packet(seq, flags, &boosted)
@@ -829,7 +854,11 @@ impl ExternalKwsEngine {
                                             } else {
                                                 wake_replay_idx = None;
                                             }
-                                            let _ = wake_tx.try_send(signal);
+                                            let _ = wake_tx.try_send(BargeInEvent {
+                                                signal,
+                                                keyword,
+                                                score,
+                                            });
                                         }
                                     }
                                 }
@@ -844,33 +873,62 @@ impl ExternalKwsEngine {
                             break;
                         };
                         match cmd {
-                            EngineCommand::StartStream { oneshot, reply } => {
-                                let (tx, rx) = mpsc::channel(QUEUE_CAP);
+                            EngineCommand::StartStream { mode, reply } => {
+                                let cap = if mode == StreamMode::Realtime {
+                                    QUEUE_CAP.max(RING_CAP + 16)
+                                } else {
+                                    QUEUE_CAP
+                                };
+                                let (tx, rx) = mpsc::channel(cap);
                                 seq = seq.wrapping_add(1);
-                                let reset_pkt = encode_xpcm_packet(seq, XPCM_FLAG_RESET, &[]);
+                                let reset_flags = if mode == StreamMode::Realtime {
+                                    XPCM_FLAG_RESET | XPCM_FLAG_EXIT_WORDS
+                                } else {
+                                    XPCM_FLAG_RESET
+                                };
+                                let reset_pkt = encode_xpcm_packet(seq, reset_flags, &[]);
                                 let _ = udp.send_to(&reset_pkt, target_addr).await;
 
-                                if oneshot {
-                                    if let Some(replay_from) = wake_replay_idx.take() {
-                                        if ring_total > replay_from {
-                                            let avail = (ring_total - replay_from) as usize;
-                                            let replay_count = avail
-                                                .min(ONESHOT_MAX_REPLAY_CHUNKS)
-                                                .min(ring.len());
-                                            let skip = ring.len().saturating_sub(replay_count);
-                                            for chunk in ring.iter().skip(skip) {
-                                                let _ = tx.try_send(chunk.clone());
+                                match mode {
+                                    StreamMode::Oneshot => {
+                                        if let Some(replay_from) = wake_replay_idx.take() {
+                                            if ring_total > replay_from {
+                                                let avail = (ring_total - replay_from) as usize;
+                                                let replay_count = avail
+                                                    .min(ONESHOT_MAX_REPLAY_CHUNKS)
+                                                    .min(ring.len());
+                                                let skip = ring.len().saturating_sub(replay_count);
+                                                for chunk in ring.iter().skip(skip) {
+                                                    let _ = tx.try_send(chunk.clone());
+                                                }
                                             }
                                         }
                                     }
-                                } else {
-                                    wake_replay_idx = None;
+                                    StreamMode::Realtime => {
+                                        // Replay the full 2.56s pre-wake ring buffer (up to RING_CAP=64 chunks)
+                                        // so continuous real-time engines hear immediate post-wake speech.
+                                        wake_replay_idx = None;
+                                        for chunk in ring.iter() {
+                                            let _ = tx.try_send(chunk.clone());
+                                        }
+                                    }
+                                    StreamMode::Capture => {
+                                        wake_replay_idx = None;
+                                    }
                                 }
                                 stream_tx = Some(tx);
+                                stream_mode = Some(mode);
                                 let _ = reply.send(rx);
                             }
                             EngineCommand::StopStream { reply } => {
+                                let was_realtime = stream_mode == Some(StreamMode::Realtime);
                                 stream_tx = None;
+                                stream_mode = None;
+                                if was_realtime {
+                                    seq = seq.wrapping_add(1);
+                                    let reset_pkt = encode_xpcm_packet(seq, XPCM_FLAG_RESET, &[]);
+                                    let _ = udp.send_to(&reset_pkt, target_addr).await;
+                                }
                                 let _ = reply.send(());
                             }
                         }
@@ -909,7 +967,7 @@ impl ExternalKwsEngine {
 
 /// Handle used by the dual-mode session loop to wait for wakes and pull PCM streams.
 pub struct ExternalKwsHandle {
-    wake_rx: mpsc::Receiver<BargeInSignal>,
+    wake_rx: mpsc::Receiver<BargeInEvent>,
     cmd_tx: mpsc::Sender<EngineCommand>,
     active_rx: Option<mpsc::Receiver<AudioChunk>>,
     capture_task: Option<JoinHandle<()>>,
@@ -917,7 +975,51 @@ pub struct ExternalKwsHandle {
 }
 
 impl ExternalKwsHandle {
+    #[cfg(test)]
+    pub(crate) fn from_test_channels(
+        wake_rx: mpsc::Receiver<BargeInEvent>,
+        stream_rx: mpsc::Receiver<AudioChunk>,
+    ) -> (Self, mpsc::Sender<()>) {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<EngineCommand>(8);
+        let (stop_notify_tx, _) = mpsc::channel::<()>(1);
+        let stream_holder = std::sync::Arc::new(tokio::sync::Mutex::new(Some(stream_rx)));
+        let holder_clone = stream_holder.clone();
+        let stop_tx_clone = stop_notify_tx.clone();
+        let engine_task = tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    EngineCommand::StartStream { reply, .. } => {
+                        let rx = holder_clone
+                            .lock()
+                            .await
+                            .take()
+                            .unwrap_or_else(|| mpsc::channel(1).1);
+                        let _ = reply.send(rx);
+                    }
+                    EngineCommand::StopStream { reply } => {
+                        let _ = stop_tx_clone.try_send(());
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        });
+        (
+            Self {
+                wake_rx,
+                cmd_tx,
+                active_rx: None,
+                capture_task: None,
+                engine_task: Some(engine_task),
+            },
+            stop_notify_tx,
+        )
+    }
+
     pub async fn next_wake(&mut self) -> anyhow::Result<BargeInSignal> {
+        Ok(self.next_barge_in_event().await?.signal)
+    }
+
+    pub async fn next_barge_in_event(&mut self) -> anyhow::Result<BargeInEvent> {
         self.wake_rx
             .recv()
             .await
@@ -929,27 +1031,36 @@ impl ExternalKwsHandle {
     }
 
     pub async fn start_stream(&mut self) -> anyhow::Result<()> {
-        self.start_stream_mode(false).await
+        let rx = self.open_stream(StreamMode::Capture).await?;
+        self.active_rx = Some(rx);
+        Ok(())
     }
 
     pub async fn start_oneshot_stream(&mut self) -> anyhow::Result<()> {
-        self.start_stream_mode(true).await
+        let rx = self.open_stream(StreamMode::Oneshot).await?;
+        self.active_rx = Some(rx);
+        Ok(())
     }
 
-    async fn start_stream_mode(&mut self, oneshot: bool) -> anyhow::Result<()> {
+    /// Start a continuous real-time audio stream replaying the full 2.56s pre-wake ring buffer
+    /// while keeping UDP KWS barge-in + exit-word detection active during playback.
+    pub async fn start_realtime_stream(&mut self) -> anyhow::Result<mpsc::Receiver<AudioChunk>> {
+        self.active_rx = None;
+        self.open_stream(StreamMode::Realtime).await
+    }
+
+    async fn open_stream(&mut self, mode: StreamMode) -> anyhow::Result<mpsc::Receiver<AudioChunk>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(EngineCommand::StartStream {
-                oneshot,
+                mode,
                 reply: reply_tx,
             })
             .await
             .map_err(|_| anyhow::anyhow!("外部 KWS 引擎已停止"))?;
-        let rx = reply_rx
+        reply_rx
             .await
-            .map_err(|_| anyhow::anyhow!("外部 KWS 启动音频流失败"))?;
-        self.active_rx = Some(rx);
-        Ok(())
+            .map_err(|_| anyhow::anyhow!("外部 KWS 启动音频流失败"))
     }
 
     pub async fn stop_stream(&mut self) {
@@ -1663,5 +1774,88 @@ mod tests {
         assert!(!t1.is_fresh_for_enter_prompt(Duration::from_millis(10)));
         t1.reset_wake_window();
         assert!(t1.is_fresh_for_enter_prompt(Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn start_realtime_stream_replays_full_prewake_ring_and_keeps_udp_exit_barge_in_alive() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (audio_tx, audio_rx) = mpsc::channel(128);
+        let mut handle = ExternalKwsEngine::spawn_with_audio_rx_and_agc(
+            &addr.to_string(),
+            Duration::from_secs(30),
+            audio_rx,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let mut peer_addr = None;
+            let mut saw_exit_words_pcm = false;
+            for _ in 0..128 {
+                let Ok(Ok((n, peer))) = timeout(Duration::from_secs(2), server.recv_from(&mut buf)).await
+                else {
+                    break;
+                };
+                peer_addr = Some(peer);
+                if n >= XPCM_HDR_LEN && &buf[..4] == b"XPCM" {
+                    let flags = u16::from_le_bytes([buf[6], buf[7]]);
+                    if (flags & 0x00FF) == XPCM_FLAG_PCM && (flags & XPCM_FLAG_EXIT_WORDS) != 0 {
+                        saw_exit_words_pcm = true;
+                        let _ = server
+                            .send_to("WAKE:2:__CMD_EXIT__:0.61\n".as_bytes(), peer)
+                            .await;
+                        break;
+                    }
+                }
+            }
+            assert!(peer_addr.is_some());
+            assert!(
+                saw_exit_words_pcm,
+                "realtime stream must continue sending UDP XPCM_FLAG_PCM | XPCM_FLAG_EXIT_WORDS"
+            );
+        });
+
+        // Fill all 64 chunks (2.56s) in the standby ring buffer with identifiable sequential values.
+        for i in 1..=RING_CAP as i16 {
+            audio_tx.send(make_chunk(i, false)).await.unwrap();
+        }
+        sleep(Duration::from_millis(50)).await;
+
+        let mut rt_rx = handle.start_realtime_stream().await.unwrap();
+        let mut replayed = Vec::new();
+        while replayed.len() < RING_CAP {
+            let chunk = timeout(Duration::from_millis(200), rt_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let sample = i16::from_le_bytes([chunk.pcm[0], chunk.pcm[1]]);
+            replayed.push(sample);
+        }
+        assert_eq!(replayed.len(), RING_CAP);
+        assert_eq!(replayed[0], 1);
+        assert_eq!(replayed[RING_CAP - 1], RING_CAP as i16);
+
+        // Live chunk sent after start_realtime_stream must still forward UDP PCM + score.
+        audio_tx.send(make_chunk(777, false)).await.unwrap();
+        let live = timeout(Duration::from_millis(200), rt_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(i16::from_le_bytes([live.pcm[0], live.pcm[1]]), 777);
+
+        let ev = timeout(Duration::from_secs(2), handle.next_barge_in_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.signal, BargeInSignal::ExitCmd);
+        assert_eq!(ev.keyword, "__CMD_EXIT__");
+        assert_eq!(ev.score, Some(0.61));
+
+        handle.stop_stream().await;
+        srv_task.await.unwrap();
     }
 }

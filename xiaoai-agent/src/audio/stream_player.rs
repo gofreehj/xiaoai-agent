@@ -187,6 +187,11 @@ impl AplayStreamPlayer {
         self.queued_bytes.load(Ordering::Acquire)
     }
 
+    /// Snapshot of the default playback specification.
+    pub async fn default_spec(&self) -> StreamAudioSpec {
+        self.inner.lock().await.default_spec.clone()
+    }
+
     /// Begin a new playback turn (cancelling any prior turn) and return its generation token.
     pub async fn start_turn(&self, spec_override: Option<StreamAudioSpec>) -> u64 {
         // Bump generation immediately so any in-flight push_pcm sees stale token.

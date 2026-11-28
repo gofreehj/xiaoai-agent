@@ -193,6 +193,7 @@ impl<'a> TurnPipeline<'a> {
         let in_flight_ref = self.in_flight.clone();
         let turn_id = req.turn_id;
         let thinking_earcon = req.config.dual.thinking_earcon.clone();
+        let playback_gain = req.config.realtime.playback_gain;
 
         let producer_fut = async move {
             tokio::pin!(llm_fut);
@@ -261,14 +262,18 @@ impl<'a> TurnPipeline<'a> {
                     _ = &mut thinking_timer, if !earcon_fired && chunks_ref.load(Ordering::Relaxed) == 0 && llm_done.is_none() => {
                         earcon_fired = true;
                         if let Some(ref earcon_path) = thinking_earcon {
-                            if tokio::fs::metadata(earcon_path).await.is_ok() {
-                                earcon_played_ref.store(true, Ordering::Relaxed);
-                                let earcon_audio = audio_for_producer.clone();
-                                let path_str = earcon_path.to_string_lossy().into_owned();
-                                earcon_task.set(tokio::spawn(async move {
-                                    earcon_audio.play_earcon(&path_str).await;
-                                }));
-                            }
+                            earcon_played_ref.store(true, Ordering::Relaxed);
+                            let earcon_audio = audio_for_producer.clone();
+                            let path_owned = earcon_path.clone();
+                            earcon_task.set(tokio::spawn(async move {
+                                earcon_audio
+                                    .play_earcon_or_cue(
+                                        Some(&path_owned),
+                                        crate::audio::stream_player::CueKind::Wake,
+                                        playback_gain,
+                                    )
+                                    .await;
+                            }));
                         }
                     }
                     maybe_delta = delta_rx.recv(), if !delta_closed => {

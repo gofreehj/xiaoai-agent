@@ -554,6 +554,80 @@
                 </div>
               </div>
 
+              <div class="group-card">
+                <div class="group-head">
+                  <strong>对话引擎与实时语音（dialogue / realtime）</strong>
+                  <span class="pill" data-tone="ok">热生效</span>
+                </div>
+                <div class="group-body">
+                  <div class="form-grid">
+                    <div class="field"><label for="cDlgEngine">对话引擎 (dialogue.engine)</label>
+                      <select id="cDlgEngine"><option value="cascade">cascade（ASR → LLM → TTS 级联）</option><option value="realtime">realtime（端到端实时语音，仅 dual）</option></select>
+                    </div>
+                    <div class="field"><label for="cRtProv">实时语音厂商 (realtime.provider)</label>
+                      <select id="cRtProv"><option value="volcengine_o2">volcengine_o2（火山引擎豆包 O2/v3）</option><option value="openai_realtime">openai_realtime（预留扩展）</option></select>
+                    </div>
+                  </div>
+                  <div id="realtimeBox" class="hidden" style="margin-top:10px;">
+                    <div class="form-grid">
+                      <div class="field"><label for="cRtFallback">失败降级策略 (fallback)</label>
+                        <select id="cRtFallback"><option value="cascade">cascade（自动切级联）</option><option value="native_alert">native_alert（播报失败提示）</option><option value="none">none（直接报错）</option></select>
+                      </div>
+                      <div class="field"><label for="cRtOutDev">ALSA 输出设备 (output_device)</label><input id="cRtOutDev" type="text" placeholder="default"></div>
+                      <div class="field"><label for="cRtGain">播报增益 (playback_gain)</label><input id="cRtGain" type="number" step="0.05" min="0.1" max="1"></div>
+                      <div class="field"><label for="cRtTail">尾音保护 (playback_tail_ms)</label><input id="cRtTail" type="number" step="50" min="0"></div>
+                      <div class="field"><label for="cRtIdleS">空闲退出 (idle_timeout_s)</label><input id="cRtIdleS" type="number" step="5" min="5"></div>
+                      <div class="field full"><label for="cRtSysPrompt">系统提示词 (system_prompt，留空用默认)</label><textarea id="cRtSysPrompt" rows="2"></textarea></div>
+                    </div>
+
+                    <div id="rtVolcBox" class="group-card" style="margin-top:10px;">
+                      <div class="group-head"><strong>火山豆包 O2/v3 双鉴权与联网搜索（volcengine_o2）</strong></div>
+                      <div class="group-body form-grid">
+                        <div class="field"><label for="cVolcApiKey">API Key（X-Api-Key，优先于 AppId，留空保留原值）</label><input id="cVolcApiKey" type="password" placeholder="未更改"></div>
+                        <div class="field"><label for="cVolcAppId">App ID（X-Api-App-Id）</label><input id="cVolcAppId" type="text"></div>
+                        <div class="field"><label for="cVolcAccKey">Access Key（X-Api-Access-Key，留空保留原值）</label><input id="cVolcAccKey" type="password" placeholder="未更改"></div>
+                        <div class="field"><label for="cVolcModel">模型版本 (model)</label><input id="cVolcModel" type="text" placeholder="1.2.1.1"></div>
+                        <div class="field"><label for="cVolcVoice">音色 (voice)</label><input id="cVolcVoice" type="text"></div>
+                        <div class="field"><label for="cVolcBot">人设名称 (bot_name)</label><input id="cVolcBot" type="text"></div>
+                        <div class="field full"><label for="cVolcWsUrl">WebSocket 地址 (ws_url)</label><input id="cVolcWsUrl" type="text"></div>
+                        <div class="field"><label for="cVolcResId">Resource ID (X-Api-Resource-Id)</label><input id="cVolcResId" type="text"></div>
+                        <div class="field"><label for="cVolcAppKey">App Key (X-Api-App-Key)</label><input id="cVolcAppKey" type="text"></div>
+                        <div class="field"><label for="cVolcStyle">说话风格 (speaking_style)</label><input id="cVolcStyle" type="text"></div>
+                        <div class="field"><label for="cVolcSmooth">判停平滑窗 (end_smooth_window_ms)</label><input id="cVolcSmooth" type="number" step="100" min="200"></div>
+                        <div class="field check full"><label><input id="cVolcWsEn" type="checkbox"> 启用火山内置联网搜索 (enable_volc_websearch)</label></div>
+                        <div id="rtVolcWsBox" class="form-grid full">
+                          <div class="field"><label for="cVolcWsType">搜索模式 (volc_websearch_type)</label><input id="cVolcWsType" type="text" placeholder="web_summary"></div>
+                          <div class="field"><label for="cVolcWsCnt">结果条数 (1..10)</label><input id="cVolcWsCnt" type="number" min="1" max="10"></div>
+                          <div class="field"><label for="cVolcWsKey">联网搜索 API Key（可选，留空保留原值）</label><input id="cVolcWsKey" type="password" placeholder="未更改"></div>
+                          <div class="field"><label for="cVolcWsNoRes">无结果兜底话术 (volc_websearch_no_result_message)</label><input id="cVolcWsNoRes" type="text"></div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div id="rtOaiBox" class="group-card hidden" style="margin-top:10px;">
+                      <div class="group-head"><strong>OpenAI Realtime 兼容（预留 openai_realtime）</strong></div>
+                      <div class="group-body form-grid">
+                        <div class="field full"><label for="cRtOaiUrl">WebSocket 地址 (ws_url)</label><input id="cRtOaiUrl" type="text"></div>
+                        <div class="field"><label for="cRtOaiKey">API Key（留空保留原值）</label><input id="cRtOaiKey" type="password" placeholder="未更改"></div>
+                        <div class="field"><label for="cRtOaiModel">Model</label><input id="cRtOaiModel" type="text"></div>
+                        <div class="field"><label for="cRtOaiVoice">Voice</label><input id="cRtOaiVoice" type="text"></div>
+                      </div>
+                    </div>
+
+                    <details class="adv">
+                      <summary>高级策略（Smart Turn 与每日 Token 用量守卫）</summary>
+                      <div class="foldbody form-grid">
+                        <div class="field check full"><label><input id="cStEn" type="checkbox"> 启用 Smart Turn 语义判停</label></div>
+                        <div class="field"><label for="cStComp">完整句静音 (complete_quiet_ms)</label><input id="cStComp" type="number" step="100" min="300"></div>
+                        <div class="field"><label for="cStOpen">未说完延长 (unfinished_quiet_ms)</label><input id="cStOpen" type="number" step="100" min="500"></div>
+                        <div class="field"><label for="cDuDir">用量状态目录 (state_dir)</label><input id="cDuDir" type="text"></div>
+                        <div class="field"><label for="cDuLim">每日 Token 上限 (0=不限)</label><input id="cDuLim" type="number" step="1000" min="0"></div>
+                      </div>
+                    </details>
+                  </div>
+                </div>
+              </div>
+
               <div id="exclusiveBlock" class="group-card">
                 <div class="group-head">
                   <strong>独占模式通道（speech.usock）</strong>
@@ -631,9 +705,12 @@
                     <div class="field"><label for="cDcFmt">格式</label><select id="cDcFmt"><option value="S32_LE">S32_LE</option><option value="S16_LE">S16_LE</option></select></div>
                     <div class="field"><label for="cDcSr">采样率 (Hz)</label><input id="cDcSr" type="number" step="1000"></div>
                     <div class="field"><label for="cDcCh">通道数</label><input id="cDcCh" type="number" min="1"></div>
-                    <div class="field"><label for="cDcMic">麦通道 (mic_channel)</label><input id="cDcMic" type="number" min="0"></div>
+                    <div class="field"><label for="cDcMic">主麦通道 (mic_channel)</label><input id="cDcMic" type="number" min="0"></div>
+                    <div class="field"><label for="cDcMics">多麦波束成形通道 (mic_channels，逗号分隔)</label><input id="cDcMics" type="text" placeholder="留空单麦；如 0, 1, 2"></div>
                     <div class="field"><label for="cDcRef">回采通道 (ref_channel，可空)</label><input id="cDcRef" type="number" min="0" placeholder="null"></div>
                     <div class="field"><label for="cDcShift">右移位 (shift_bits)</label><input id="cDcShift" type="number" min="0" max="24"></div>
+                    <div class="field"><label for="cDcExitThr">播报期退出词阈值 (exit_playback_threshold)</label><input id="cDcExitThr" type="number" step="0.05" min="0.05" max="1"></div>
+                    <div class="field check"><label><input id="cDcAgc" type="checkbox"> 启用 KWS 专用 RMS AGC (kws_agc_enabled)</label></div>
                   </div>
                 </details>
               </div>
@@ -1321,6 +1398,13 @@
     $("dualBlock").classList.toggle("hidden", !isDual);
     $("niBody").classList.toggle("hidden", !$("cNiEn").checked);
 
+    var isRealtime = $("cDlgEngine").value === "realtime";
+    $("realtimeBox").classList.toggle("hidden", !isRealtime);
+    var rtProv = $("cRtProv").value;
+    $("rtVolcBox").classList.toggle("hidden", rtProv !== "volcengine_o2");
+    $("rtOaiBox").classList.toggle("hidden", rtProv !== "openai_realtime");
+    $("rtVolcWsBox").classList.toggle("hidden", !$("cVolcWsEn").checked);
+
     $("capNoiseExtra").classList.toggle("hidden", !$("cCapNoise").checked);
     $("capDynExtra").classList.toggle("hidden", !$("cCapDyn").checked);
 
@@ -1402,7 +1486,8 @@
     var hb = snapshot ? snapshot.health : {}, sb = (snapshot && snapshot.status) || {}, sp = hb.speech || {}, so = hb.socket || {};
     var hasSnap = !!snapshot, isDual = (hb.mode || sb.mode) === "dual", age = sp.last_packet_age_s;
 
-    $("modeBadge").textContent = !hasSnap ? "未知模式" : (isDual ? "dual 双助手" : "exclusive 独占");
+    var dlgEng = sb.dialogue_engine ? (" · " + sb.dialogue_engine) : "";
+    $("modeBadge").textContent = !hasSnap ? "未知模式" : (isDual ? ("dual 双助手" + dlgEng) : "exclusive 独占");
     $("modeBadge").setAttribute("data-tone", isDual ? "ok" : "");
 
     var ni = hb.native_interlock || sb.native_interlock, ib = $("interlockBadge");
@@ -1631,6 +1716,52 @@
     $("cRtMode").value = f.runtime.mode || "exclusive";
     $("cRtIdle").value = f.runtime.session_idle_timeout_s;
     $("cRtSock").value = f.runtime.speech_socket || "";
+    if (f.dialogue) $("cDlgEngine").value = f.dialogue.engine || "cascade";
+    if (f.realtime) {
+      var rt = f.realtime;
+      $("cRtProv").value = rt.provider || "volcengine_o2";
+      $("cRtFallback").value = rt.fallback || "cascade";
+      $("cRtOutDev").value = rt.output_device || "default";
+      $("cRtGain").value = rt.playback_gain !== undefined ? rt.playback_gain : 1.0;
+      $("cRtTail").value = rt.playback_tail_ms !== undefined ? rt.playback_tail_ms : 400;
+      $("cRtIdleS").value = rt.idle_timeout_s !== undefined ? rt.idle_timeout_s : 45;
+      $("cRtSysPrompt").value = rt.system_prompt || "";
+      if (rt.volcengine_o2) {
+        var vo = rt.volcengine_o2;
+        $("cVolcApiKey").value = ""; $("cVolcApiKey").placeholder = vo.api_key_set ? "已设置（留空保留原值）" : "未设置";
+        $("cVolcAppId").value = vo.app_id || "";
+        $("cVolcAccKey").value = ""; $("cVolcAccKey").placeholder = vo.access_key_set ? "已设置（留空保留原值）" : "未设置";
+        $("cVolcModel").value = vo.model || "1.2.1.1";
+        $("cVolcVoice").value = vo.voice || "";
+        $("cVolcBot").value = vo.bot_name || "";
+        $("cVolcWsUrl").value = vo.ws_url || "";
+        $("cVolcResId").value = vo.resource_id || "volc.speech.dialog";
+        $("cVolcAppKey").value = vo.app_key || "";
+        $("cVolcStyle").value = vo.speaking_style || "";
+        $("cVolcSmooth").value = vo.end_smooth_window_ms !== undefined ? vo.end_smooth_window_ms : 1500;
+        $("cVolcWsEn").checked = !!vo.enable_volc_websearch;
+        $("cVolcWsType").value = vo.volc_websearch_type || "web_summary";
+        $("cVolcWsCnt").value = vo.volc_websearch_result_count !== undefined ? vo.volc_websearch_result_count : 5;
+        $("cVolcWsKey").value = ""; $("cVolcWsKey").placeholder = vo.volc_websearch_api_key_set ? "已设置（留空保留原值）" : "可选，未设置";
+        $("cVolcWsNoRes").value = vo.volc_websearch_no_result_message || "";
+      }
+      if (rt.openai_realtime) {
+        var ro = rt.openai_realtime;
+        $("cRtOaiUrl").value = ro.ws_url || "";
+        $("cRtOaiKey").value = ""; $("cRtOaiKey").placeholder = ro.api_key_set ? "已设置（留空保留原值）" : "未设置";
+        $("cRtOaiModel").value = ro.model || "";
+        $("cRtOaiVoice").value = ro.voice || "";
+      }
+      if (rt.smart_turn) {
+        $("cStEn").checked = !!rt.smart_turn.enabled;
+        $("cStComp").value = rt.smart_turn.complete_quiet_ms !== undefined ? rt.smart_turn.complete_quiet_ms : 1500;
+        $("cStOpen").value = rt.smart_turn.unfinished_quiet_ms !== undefined ? rt.smart_turn.unfinished_quiet_ms : 4500;
+      }
+      if (rt.daily_usage) {
+        $("cDuDir").value = rt.daily_usage.state_dir || "/tmp/xiaoai-agent/usage";
+        $("cDuLim").value = rt.daily_usage.daily_token_limit !== undefined ? rt.daily_usage.daily_token_limit : 0;
+      }
+    }
     $("cSrvEn").checked = !!f.server.enabled;
     $("cSrvHost").value = f.server.host || "127.0.0.1";
     $("cSrvPort").value = f.server.port || 8765;
@@ -1757,8 +1888,11 @@
     $("cDcSr").value = f.dual.capture.sample_rate;
     $("cDcCh").value = f.dual.capture.channels;
     $("cDcMic").value = f.dual.capture.mic_channel;
+    $("cDcMics").value = (f.dual.capture.mic_channels || []).join(", ");
     $("cDcRef").value = f.dual.capture.ref_channel !== null && f.dual.capture.ref_channel !== undefined ? f.dual.capture.ref_channel : "";
     $("cDcShift").value = f.dual.capture.shift_bits;
+    $("cDcAgc").checked = f.dual.capture.kws_agc_enabled !== false;
+    $("cDcExitThr").value = f.dual.capture.exit_playback_threshold !== undefined ? f.dual.capture.exit_playback_threshold : 0.45;
 
     $("cCapSr").value = f.capture.sample_rate;
     $("cCapTh").value = f.capture.threshold;
@@ -1831,6 +1965,49 @@
     }
     return {
       runtime: { mode: $("cRtMode").value, session_idle_timeout_s: Number($("cRtIdle").value) },
+      dialogue: { engine: $("cDlgEngine").value },
+      realtime: {
+        provider: $("cRtProv").value,
+        fallback: $("cRtFallback").value,
+        system_prompt: $("cRtSysPrompt").value.trim(),
+        output_device: $("cRtOutDev").value.trim() || "default",
+        playback_gain: Number($("cRtGain").value),
+        playback_tail_ms: parseInt($("cRtTail").value, 10),
+        idle_timeout_s: parseInt($("cRtIdleS").value, 10),
+        volcengine_o2: {
+          api_key: $("cVolcApiKey").value,
+          app_id: $("cVolcAppId").value.trim(),
+          access_key: $("cVolcAccKey").value,
+          resource_id: $("cVolcResId").value.trim(),
+          app_key: $("cVolcAppKey").value.trim(),
+          enable_volc_websearch: $("cVolcWsEn").checked,
+          volc_websearch_type: $("cVolcWsType").value.trim(),
+          volc_websearch_api_key: $("cVolcWsKey").value,
+          volc_websearch_result_count: parseInt($("cVolcWsCnt").value, 10),
+          volc_websearch_no_result_message: $("cVolcWsNoRes").value.trim(),
+          ws_url: $("cVolcWsUrl").value.trim(),
+          model: $("cVolcModel").value.trim(),
+          voice: $("cVolcVoice").value.trim(),
+          bot_name: $("cVolcBot").value.trim(),
+          speaking_style: $("cVolcStyle").value.trim(),
+          end_smooth_window_ms: parseInt($("cVolcSmooth").value, 10)
+        },
+        openai_realtime: {
+          ws_url: $("cRtOaiUrl").value.trim(),
+          api_key: $("cRtOaiKey").value,
+          model: $("cRtOaiModel").value.trim(),
+          voice: $("cRtOaiVoice").value.trim()
+        },
+        smart_turn: {
+          enabled: $("cStEn").checked,
+          complete_quiet_ms: parseInt($("cStComp").value, 10),
+          unfinished_quiet_ms: parseInt($("cStOpen").value, 10)
+        },
+        daily_usage: {
+          state_dir: $("cDuDir").value.trim() || "/tmp/xiaoai-agent/usage",
+          daily_token_limit: parseInt($("cDuLim").value, 10) || 0
+        }
+      },
       server: {
         enabled: $("cSrvEn").checked, host: $("cSrvHost").value.trim(),
         port: parseInt($("cSrvPort").value, 10), token: $("cSrvToken").value
@@ -1913,8 +2090,12 @@
         capture: {
           device: $("cDcDev").value.trim(), sample_rate: parseInt($("cDcSr").value, 10),
           channels: parseInt($("cDcCh").value, 10), format: $("cDcFmt").value,
-          mic_channel: parseInt($("cDcMic").value, 10), ref_channel: optNum($("cDcRef"), true),
-          shift_bits: parseInt($("cDcShift").value, 10)
+          mic_channel: parseInt($("cDcMic").value, 10),
+          mic_channels: splitComma($("cDcMics").value).map(function (n) { return parseInt(n, 10); }).filter(function (n) { return !isNaN(n) && n >= 0; }),
+          ref_channel: optNum($("cDcRef"), true),
+          shift_bits: parseInt($("cDcShift").value, 10),
+          kws_agc_enabled: $("cDcAgc").checked,
+          exit_playback_threshold: Number($("cDcExitThr").value)
         },
         native_interlock: {
           enabled: $("cNiEn").checked, event_command: $("cNiCmd").value.trim(),
@@ -2131,7 +2312,9 @@
       $("docResult").classList.remove("hidden");
       var meta = $("docMeta"); meta.textContent = "";
       var rows = [
-        ["运行模式", d.mode], ["/tmp 剩余空间", fmtKib(d.tmp_free_kib)],
+        ["运行模式", d.mode + (d.dialogue_engine ? (" / " + d.dialogue_engine) : "")],
+        ["Realtime 驱动", d.realtime_provider || "—"],
+        ["/tmp 剩余空间", fmtKib(d.tmp_free_kib)],
         [d.data_path + " 剩余空间", fmtKib(d.data_free_kib)], ["PID 文件", d.pid_file || "无"]
       ];
       if (d.dual) {

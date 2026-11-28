@@ -26,18 +26,43 @@
 - **`exclusive`（独占接管模式）**：直接复用 LX06 原生 `mipns` 唤醒与回声消除，原生小爱静默不抢答，无需额外外部 KWS 服务。使用配置模板 [`templates/agent.yaml.lx06.example`](./templates/agent.yaml.lx06.example)。
 - **`dual`（外部 KWS 双助手共存模式）**：原生小爱保留日常功能（闹钟、倒计时、米家），音箱端同一个 `xiaoai-agent` 二进制内置采集并转发给任意外部 KWS 服务（NAS / Docker / PC / [红米 AX5](../kws-server/ax5/README.md)）触发大模型对话，只需在 `agent.yaml` 中设置 `runtime.mode: dual` 与 `dual.kws.endpoint`。
 
-部署完成后可在音箱端执行一键自检：
+部署完成后可在音箱端执行一键自检（含 `--probe-mic` 3 秒多声道实测）：
 
 ```sh
 /data/open-xiaoai/xiaoai-agent doctor -c /data/open-xiaoai/agent.yaml
+/data/open-xiaoai/xiaoai-agent doctor --probe-mic -c /data/open-xiaoai/agent.yaml
 ```
 
-### LX06 1.94.13 运行环境实测备忘
+### LX06 1.94.13 运行环境实测备忘与安全升级流程
 
-- **用户态 libc**：`/lib/ld-linux-armhf.so.3 -> ld-2.25.so`（glibc 2.25），可用 `cargo +1.96.0 zigbuild --release --target armv7-unknown-linux-gnueabihf.2.25` 产物直接部署，也支持静态 musl 构建。
-- **双助手采音与提示音**：`/etc/asound.conf` 暴露 `noop` ALSA 设备（`48000 Hz` / `8 ch` / `S32_LE` / `mic_channel=0` / `ref_channel=6`）；`enter_prompt.wav` / `exit_prompt.wav` / `thinking_prompt.wav` 随 `agent.yaml` 同放在 `/data/open-xiaoai/`。
-- **闪存与日志管理**：`/data` 为 `13.4 MiB` UBIFS（带透明压缩）；升级单二进制架构前需先移除旧版 `all_bundle.tar.gz`、`ax5_kws.env` 与 `/tmp/xiaoai-kws`，避免空间不足；`/data/init.sh` 应将 `XIAOAI_AGENT_LOG` 指向 `/tmp/xiaoai-agent.log` 以减少闪存擦写。
+- **用户态 libc**：`/lib/ld-linux-armhf.so.3 -> ld-2.25.so`（glibc 2.25），使用 `cargo +1.96.0 zigbuild --release --target armv7-unknown-linux-gnueabihf.2.25` 产物直接部署（全特性 ELF **`8,704,440 B` / `8.30 MiB` ≤ `8.5 MiB` 门禁**；如需进一步极限裁剪可在 `--no-default-features` 下关闭 `airplay` 降至 `7.60 MiB`）。
+- **无 `.bak` 安全升级流程（严防 `/data` 13.4 MiB UBIFS 写满）**：
+  1. **禁止**在 `/data/open-xiaoai/` 下保留 `xiaoai-agent.bak`（两份 ~8.7 MB 二进制会立刻挤爆 `/data` 空间）。回滚依据本地源码/Git 提交重传即可。
+  2. 先在音箱上停服：`sh /data/open-xiaoai/start-agent.sh stop`
+  3. 先把新二进制与 `start-agent.sh` 传到 tmpfs `/tmp`：`scp xiaoai-agent start-agent.sh root@<speaker-ip>:/tmp/`
+  4. 删除旧二进制后原地替换并赋权：`rm -f /data/open-xiaoai/xiaoai-agent /data/open-xiaoai/*.bak && mv /tmp/xiaoai-agent /data/open-xiaoai/xiaoai-agent && mv /tmp/start-agent.sh /data/open-xiaoai/start-agent.sh && chmod +x /data/open-xiaoai/xiaoai-agent /data/open-xiaoai/start-agent.sh`
+  5. 检查剩余空间与配置：`df -h /data && /data/open-xiaoai/xiaoai-agent doctor -c /data/open-xiaoai/agent.yaml`（确保 `/data` 可用 > `2 MiB`）。
+- **双助手采音与提示音**：`/etc/asound.conf` 暴露 `noop` ALSA 设备（`48000 Hz` / `8 ch` / `S32_LE` / `mic_channel=0` / `ref_channel=6`）；建议直接将 `*_earcon` 留空回退 `T-001` 零磁盘占用合成音，或控制口语提示音目录总大小 `≤ 300 KiB`；`/data/init.sh` 应将 `XIAOAI_AGENT_LOG` 指向 `/tmp/xiaoai-agent.log`（`daily_usage.state_dir` 默认 `/tmp/xiaoai-agent/usage`）以实现零闪存擦写。
 - **开机自启控制**：`/data/init.sh` 通过检查 `/data/open-xiaoai/disabled` 决定开机是否拉起服务，可在 Web 控制台「配置 → 运行与拾音」一键开关或通过 `POST /autostart` 远程切换。
+
+---
+
+## LX06 真机 P0 + P1 + P2 联调验收清单
+
+1. **P0（底座与拾音）**：
+   - `xiaoai-agent doctor --probe-mic -c /data/open-xiaoai/agent.yaml`：确认 8 声道 S32_LE 采音正常，主麦与 `ref_channel=6` 回采信号能量区分明显；
+   - `aplay` 24 kHz 流式播报清晰连贯无爆音；外部唤醒/退词、`stop_key` 等打断 `< 100 ms` 立即静音；
+   - 开启多麦波束 + `KwsAgc` 前后对比远场（3–5 m）与低音量背景音下“豆包豆包”唤醒率。
+2. **P1（火山端到端实时语音与降级）**：
+   - 使用火山双鉴权（`X-Api-Key` 或 `app_id` + `access_key`）+ `enable_volc_websearch: true` 进行连续 5 轮联网对话（例如查实时天气/新闻），确认首包延迟与多轮上下文记入面板历史；
+   - **4 通道打断无双播无熄灯**：AI 播报中分别用「豆包豆包」插话、「退出」/长句“不想关闭”防误退、AI 自说“再见”防自杀、途中改喊「小爱同学」让位（原生小爱接管发声，Agent 静默退出且不熄灯不恢复旧歌）；
+   - Web 控制面板（`POST /config` + 引擎状态卡）确认表单提交热切换 `cascade <-> realtime` 生效，且断网/坏密钥下自动 `FallbackToCascade`（或仅在未让位时 `NativeAlert`）。
+3. **P2（增强与保护闭环）**：
+   - 开启 `realtime.smart_turn.enabled: true`：停顿在“我想…”、“because…”等待约 4.5s 不抢答，说完完整句约 1.5s 内触发提交；
+   - 目录型 `spoken_cues` 随机轮播无连续重复，跳过 0 B 文件，缺失目录回退 `T-001` 合成音，>300 KiB 触发启动告警；
+   - 验证 `/tmp/xiaoai-agent/usage/daily_usage.json` 累加并在 `daily_token_limit` 达标后拒绝超额连接并回退；
+   - 模拟 `dual` 进程异常退出 5 次确认 `start_dual_watchdog` 触发 30 分钟熔断（且 `exclusive` 模式 `0/3/4/5` 退出码契约不受任何影响）；
+   - 如配置 `/dev/input/event*` 的 `dual.stop_key`，确认活跃会话播报中短按即停，待机短按不破坏原生触摸，修改 `dual.stop_key` 热重载保持旧值并标 `needs_restart`。
 
 ---
 

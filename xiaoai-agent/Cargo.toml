@@ -12,6 +12,12 @@ panic = "abort"
 strip = true
 debug = false
 
+[features]
+default = ["exclusive", "airplay", "music"]
+exclusive = []
+airplay = ["dep:shairplay"]
+music = []
+
 [dependencies]
 anyhow = "1"
 # 本地控制面（issue #9）：唯一的用途是给 HA/运维一个内网 HTTP 入口，
@@ -32,12 +38,12 @@ rmcp = { version = "1.8", features = ["client", "reqwest", "transport-streamable
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-shairplay = { version = "0.7.0", default-features = false }
+shairplay = { version = "0.7.0", default-features = false, optional = true }
 shell-words = "1"
 sse-stream = "0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

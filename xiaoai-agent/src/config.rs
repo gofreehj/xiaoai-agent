@@ -1412,6 +1412,75 @@ pub fn collect_startup_warnings(config: &AppConfig) -> Vec<String> {
             ));
         }
     }
+    if config.dialogue.engine == DialogueEngine::Realtime {
+        match config.realtime.provider {
+            RealtimeProvider::VolcengineO2 => {
+                let o2 = &config.realtime.volcengine_o2;
+                let has_api_key = !o2.api_key.trim().is_empty();
+                let has_app = !o2.app_id.trim().is_empty();
+                let has_acc = !o2.access_key.trim().is_empty();
+                if !has_api_key && !has_app && !has_acc {
+                    warnings.push(
+                        "dialogue.engine=realtime (volcengine_o2) 未配置鉴权密钥：请填写 api_key 或同时填写 app_id 与 access_key"
+                            .to_string(),
+                    );
+                } else if !has_api_key && (has_app != has_acc) {
+                    warnings.push(
+                        "realtime.volcengine_o2.app_id 与 access_key 必须成对配置".to_string(),
+                    );
+                }
+                let ws = o2.ws_url.trim();
+                if !ws.starts_with("ws://") && !ws.starts_with("wss://") {
+                    warnings.push(format!(
+                        "realtime.volcengine_o2.ws_url='{}' 无效：必须以 ws:// 或 wss:// 开头",
+                        o2.ws_url
+                    ));
+                }
+                if o2.enable_volc_websearch
+                    && (o2.volc_websearch_result_count == 0 || o2.volc_websearch_result_count > 10)
+                {
+                    warnings.push(format!(
+                        "realtime.volcengine_o2.volc_websearch_result_count={} 超出建议范围 1..=10",
+                        o2.volc_websearch_result_count
+                    ));
+                }
+            }
+            RealtimeProvider::OpenAiRealtime => {
+                let oai = &config.realtime.openai_realtime;
+                let ws = oai.ws_url.trim();
+                if !ws.starts_with("ws://") && !ws.starts_with("wss://") {
+                    warnings.push(format!(
+                        "realtime.openai_realtime.ws_url='{}' 无效：必须以 ws:// 或 wss:// 开头",
+                        oai.ws_url
+                    ));
+                }
+                if is_placeholder(&oai.api_key) {
+                    warnings.push(
+                        "dialogue.engine=realtime (openai_realtime) 未配置 realtime.openai_realtime.api_key"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    if config.runtime.mode == "dual" {
+        for (name, opt_path) in [
+            ("dual.enter_earcon", config.dual.enter_earcon.as_deref()),
+            ("dual.exit_earcon", config.dual.exit_earcon.as_deref()),
+            ("dual.thinking_earcon", config.dual.thinking_earcon.as_deref()),
+        ] {
+            if let Some(path) = opt_path {
+                let total_bytes = crate::audio::EarconPicker::dir_wav_total_bytes(path);
+                if total_bytes > crate::audio::SPOKEN_CUES_WARN_BYTES {
+                    warnings.push(format!(
+                        "{name} 目录 '{}' 音频总计 {} KiB（超过 300 KiB），在 LX06 13.4 MiB /data 分区上可能占用过多闪存空间",
+                        path.display(),
+                        total_bytes / 1024
+                    ));
+                }
+            }
+        }
+    }
     warnings
 }
 
@@ -1872,5 +1941,62 @@ dual:
         assert!(changes.applied.contains(&"dialogue"));
         assert!(changes.applied.contains(&"realtime"));
         assert!(changes.needs_restart.contains(&"dual.stop_key"));
+    }
+
+    #[test]
+    fn startup_warnings_validate_realtime_dual_auth_websearch_and_ws_url() {
+        let mut cfg = AppConfig::default();
+        cfg.asr.open_ai.api_key = "asr-k".into();
+        cfg.llm.api_key = "llm-k".into();
+        cfg.dialogue.engine = super::DialogueEngine::Realtime;
+
+        // 1) Missing both auth paths -> warning
+        let w_missing = collect_startup_warnings(&cfg);
+        assert!(w_missing.iter().any(|w| w.contains("未配置鉴权密钥")));
+
+        // 2) Partial app_id without access_key -> warning
+        cfg.realtime.volcengine_o2.app_id = "app-only".into();
+        let w_partial = collect_startup_warnings(&cfg);
+        assert!(w_partial.iter().any(|w| w.contains("成对配置")));
+
+        // 3) Complete app_id + access_key and valid ws_url -> clean
+        cfg.realtime.volcengine_o2.access_key = "acc-ok".into();
+        assert!(collect_startup_warnings(&cfg).is_empty());
+
+        // 4) Invalid ws_url and out-of-range websearch result count -> warnings
+        cfg.realtime.volcengine_o2.ws_url = "https://bad.example.com".into();
+        cfg.realtime.volcengine_o2.volc_websearch_result_count = 0;
+        let w_bad = collect_startup_warnings(&cfg);
+        assert!(w_bad.iter().any(|w| w.contains("ws_url")));
+        assert!(w_bad.iter().any(|w| w.contains("volc_websearch_result_count")));
+    }
+
+    #[test]
+    fn startup_warnings_flag_spoken_cues_dir_over_300_kib() {
+        let dir = std::env::temp_dir().join(format!(
+            "xiaoai_cfg_cues_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.wav"), vec![0u8; 301 * 1024]).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.asr.open_ai.api_key = "asr-k".into();
+        cfg.llm.api_key = "llm-k".into();
+        cfg.runtime.mode = "dual".into();
+        cfg.dual.kws.endpoint = "127.0.0.1:5005".into();
+        cfg.dual.enter_earcon = Some(dir.clone());
+
+        let warnings = collect_startup_warnings(&cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("dual.enter_earcon") && w.contains("300 KiB")),
+            "expected LX06 300 KiB warning, got: {:?}",
+            warnings
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

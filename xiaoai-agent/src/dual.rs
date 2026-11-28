@@ -8,11 +8,17 @@ use tracing::{error, info, warn};
 
 use crate::agent::AgentRuntime;
 use crate::asr::AsrClient;
+use crate::audio::stream_player::CueKind;
 use crate::audio::{AudioCoordinator, FinishMode};
-use crate::config::{AppConfig, ConfigHandle, TtsProvider};
+use crate::config::{AppConfig, ConfigHandle, DialogueEngine, RealtimeProvider, TtsProvider};
 use crate::frontend::external_kws::{ExternalKwsEngine, ExternalKwsHandle, SessionTracker};
 use crate::frontend::native_monitor::{drain_native_rx, wait_native_wake, NativeWakeMonitor};
+use crate::frontend::stop_key::StopKeyListener;
 use crate::frontend::BargeInSignal;
+use crate::realtime::daily_usage::DailyUsageGuard;
+use crate::realtime::runner::{RealtimeRunOutcome, RealtimeSessionRunner};
+use crate::realtime::volcengine_o2::VolcengineO2Driver;
+use crate::realtime::RealtimeDriver;
 use crate::runtime::reload::{spawn_config_reload, ReloadGate};
 use crate::runtime::telemetry::AgentPhase;
 use crate::session::pipeline::{InFlightTurn, TurnPipeline, TurnPipelineRequest};
@@ -36,6 +42,180 @@ pub fn is_native_xiaoai_utterance(raw_text: &str) -> bool {
             )
     });
     cleaned.starts_with("小爱同学")
+}
+
+/// 构造传给 Realtime 引擎的系统提示词（未配置 `realtime.system_prompt` 时提供轻量音箱人设默认值）。
+pub fn build_realtime_instructions(cfg: &AppConfig) -> String {
+    let custom = cfg.realtime.system_prompt.trim();
+    if !custom.is_empty() {
+        return custom.to_string();
+    }
+    "你是一个运行在智能音箱上的语音助手，回答简洁自然、口语化、适合直接朗读，避免输出 Markdown 符号或长篇列表。"
+        .to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DualSessionOutcomeKind {
+    Normal,
+    NativeYield,
+}
+
+async fn connect_configured_realtime(cfg: &AppConfig) -> anyhow::Result<VolcengineO2Driver> {
+    match cfg.realtime.provider {
+        RealtimeProvider::VolcengineO2 => {
+            let instructions = build_realtime_instructions(cfg);
+            VolcengineO2Driver::connect(&cfg.realtime.volcengine_o2, &instructions).await
+        }
+        RealtimeProvider::OpenAiRealtime => {
+            anyhow::bail!("openai_realtime dialogue driver is not enabled in this build (T-301)")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_dual_session_routed<D, F, Fut>(
+    kws: &mut ExternalKwsHandle,
+    config_handle: &ConfigHandle,
+    cur_config: &AppConfig,
+    asr: &AsrClient,
+    agent: &Arc<AgentRuntime>,
+    audio: &AudioCoordinator,
+    tracker: &mut SessionTracker,
+    in_flight: &InFlightTurn,
+    native_monitor: &NativeWakeMonitor,
+    native_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    mut stop_key_rx: Option<&mut mpsc::Receiver<()>>,
+    connect_realtime: F,
+) -> anyhow::Result<DualSessionOutcomeKind>
+where
+    D: RealtimeDriver,
+    F: FnOnce(AppConfig) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<D>>,
+{
+    let initial_cascade_query = if cur_config.dialogue.engine == DialogueEngine::Realtime {
+        let usage_guard = DailyUsageGuard::from_config(&cur_config.realtime.daily_usage);
+        let driver_res = if usage_guard.is_limit_exceeded() {
+            Err(anyhow::anyhow!("daily realtime token limit exceeded"))
+        } else {
+            connect_realtime(cur_config.clone()).await
+        };
+        match RealtimeSessionRunner::run_with_driver_result(
+            driver_res,
+            cur_config,
+            audio,
+            agent,
+            kws,
+            native_monitor,
+            native_rx,
+            stop_key_rx.as_deref_mut(),
+        )
+        .await?
+        {
+            RealtimeRunOutcome::Completed => return Ok(DualSessionOutcomeKind::Normal),
+            RealtimeRunOutcome::NativeYield => return Ok(DualSessionOutcomeKind::NativeYield),
+            RealtimeRunOutcome::FallbackToCascade { initial_query } => {
+                warn!(
+                    session_id = tracker.session_id,
+                    ?initial_query,
+                    "Realtime 会话降级到 cascade 引擎继续服务"
+                );
+                initial_query.map(|text| PendingVoiceQuery {
+                    text,
+                    asr_started_at: Instant::now(),
+                    asr_ms: 0,
+                    vad_stats: None,
+                    pcm_bytes: 0,
+                })
+            }
+        }
+    } else {
+        None
+    };
+
+    enum CascadeOutcome {
+        Completed(anyhow::Result<SessionExit>),
+        NativeInterrupted,
+    }
+
+    let outcome = tokio::select! {
+        res = async {
+            if let Some(q) = initial_cascade_query {
+                return run_conversation_session(
+                    kws,
+                    config_handle,
+                    asr,
+                    agent,
+                    audio,
+                    tracker,
+                    in_flight,
+                    native_monitor,
+                    stop_key_rx,
+                    Some(q),
+                )
+                .await;
+            }
+            let oneshot = probe_oneshot_or_prompt(
+                kws,
+                cur_config,
+                asr,
+                agent,
+                audio,
+                tracker,
+                native_monitor,
+            )
+            .await?;
+            match oneshot {
+                OneshotOutcome::ExitImmediately => {
+                    info!(
+                        session_id = tracker.session_id,
+                        "One-shot 阶段收到本地结束指令，回到双助手就绪待机状态"
+                    );
+                    Ok(SessionExit::Normal)
+                }
+                OneshotOutcome::NativeYield => Ok(SessionExit::NativeYield),
+                OneshotOutcome::Query(initial_query) => {
+                    run_conversation_session(
+                        kws,
+                        config_handle,
+                        asr,
+                        agent,
+                        audio,
+                        tracker,
+                        in_flight,
+                        native_monitor,
+                        stop_key_rx,
+                        Some(initial_query),
+                    )
+                    .await
+                }
+                OneshotOutcome::NoSpeech => {
+                    run_conversation_session(
+                        kws,
+                        config_handle,
+                        asr,
+                        agent,
+                        audio,
+                        tracker,
+                        in_flight,
+                        native_monitor,
+                        stop_key_rx,
+                        None,
+                    )
+                    .await
+                }
+            }
+        } => CascadeOutcome::Completed(res),
+        _ = wait_native_wake(native_rx) => CascadeOutcome::NativeInterrupted,
+    };
+
+    match outcome {
+        CascadeOutcome::NativeInterrupted => Ok(DualSessionOutcomeKind::NativeYield),
+        CascadeOutcome::Completed(Ok(SessionExit::NativeYield)) => {
+            Ok(DualSessionOutcomeKind::NativeYield)
+        }
+        CascadeOutcome::Completed(Ok(SessionExit::Normal)) => Ok(DualSessionOutcomeKind::Normal),
+        CascadeOutcome::Completed(Err(err)) => Err(err),
+    }
 }
 
 /// 双助手共存守护进程 (mode=dual)
@@ -66,6 +246,7 @@ pub async fn run_dual_daemon(
 
     let mut kws = ExternalKwsEngine::spawn(&initial_config.dual).await?;
     let mut native_rx = native_monitor.subscribe();
+    let mut stop_key = StopKeyListener::start(&initial_config.dual.stop_key);
 
     audio
         .device
@@ -80,6 +261,10 @@ pub async fn run_dual_daemon(
             wake_res = kws.next_wake() => wake_res?,
             Some(()) = reload_rx.recv() => {
                 spawn_config_reload(&config_handle, config_path.clone(), &agent, &reload_gate);
+                continue;
+            }
+            Some(()) = stop_key.recv() => {
+                // 待机状态忽略实体停止键，确保不影响原生小爱/触摸交互。
                 continue;
             }
             _ = wait_native_wake(&mut native_rx) => {
@@ -99,6 +284,7 @@ pub async fn run_dual_daemon(
             continue;
         }
         drain_native_rx(&mut native_rx);
+        stop_key.drain_pending();
 
         let cur_config = config_handle.get().await;
         let mut tracker = SessionTracker::new();
@@ -130,73 +316,27 @@ pub async fn run_dual_daemon(
             agent.reset_session("enter dual kws session"),
         );
 
-        // 2. 用外层 select! 统一兜住 One-shot + 连续对话全阶段，确保任何时刻喊「小爱同学」都秒停秒让位。
-        enum DualSessionOutcome {
-            Completed(anyhow::Result<SessionExit>),
-            NativeInterrupted,
-        }
-
-        let outcome = tokio::select! {
-            res = async {
-                let oneshot = probe_oneshot_or_prompt(
-                    &mut kws,
-                    &cur_config,
-                    &asr,
-                    &agent,
-                    &audio,
-                    &tracker,
-                    &native_monitor,
-                )
-                .await?;
-                match oneshot {
-                    OneshotOutcome::ExitImmediately => {
-                        info!(
-                            session_id = tracker.session_id,
-                            "One-shot 阶段收到本地结束指令，回到双助手就绪待机状态"
-                        );
-                        Ok(SessionExit::Normal)
-                    }
-                    OneshotOutcome::NativeYield => Ok(SessionExit::NativeYield),
-                    OneshotOutcome::Query(initial_query) => {
-                        run_conversation_session(
-                            &mut kws,
-                            &config_handle,
-                            &asr,
-                            &agent,
-                            &audio,
-                            &mut tracker,
-                            &in_flight,
-                            &native_monitor,
-                            Some(initial_query),
-                        )
-                        .await
-                    }
-                    OneshotOutcome::NoSpeech => {
-                        run_conversation_session(
-                            &mut kws,
-                            &config_handle,
-                            &asr,
-                            &agent,
-                            &audio,
-                            &mut tracker,
-                            &in_flight,
-                            &native_monitor,
-                            None,
-                        )
-                        .await
-                    }
-                }
-            } => DualSessionOutcome::Completed(res),
-            _ = wait_native_wake(&mut native_rx) => DualSessionOutcome::NativeInterrupted,
-        };
+        // 2. 按 dialogue.engine 分流至 Realtime 或 Cascade，并用外层互锁兜住原生小爱让位。
+        let outcome = run_dual_session_routed(
+            &mut kws,
+            &config_handle,
+            &cur_config,
+            &asr,
+            &agent,
+            &audio,
+            &mut tracker,
+            &in_flight,
+            &native_monitor,
+            &mut native_rx,
+            Some(stop_key.receiver_mut()),
+            |cfg| async move { connect_configured_realtime(&cfg).await },
+        )
+        .await;
 
         let (yielded_to_native, session_res) = match outcome {
-            DualSessionOutcome::NativeInterrupted => (true, Ok(())),
-            DualSessionOutcome::Completed(Ok(SessionExit::NativeYield)) => (true, Ok(())),
-            DualSessionOutcome::Completed(Ok(SessionExit::Normal)) => {
-                (native_monitor.is_blocked(), Ok(()))
-            }
-            DualSessionOutcome::Completed(Err(err)) => (native_monitor.is_blocked(), Err(err)),
+            Ok(DualSessionOutcomeKind::NativeYield) => (true, Ok(())),
+            Ok(DualSessionOutcomeKind::Normal) => (native_monitor.is_blocked(), Ok(())),
+            Err(err) => (native_monitor.is_blocked(), Err(err)),
         };
 
         if yielded_to_native {
@@ -361,6 +501,7 @@ async fn probe_oneshot_or_prompt(
         cur_config,
         cur_config.dual.enter_earcon.as_deref(),
         &cur_config.dual.enter_prompt,
+        CueKind::Wake,
     )
     .await;
     Ok(OneshotOutcome::NoSpeech)
@@ -394,6 +535,7 @@ async fn run_conversation_session(
     tracker: &mut SessionTracker,
     in_flight: &InFlightTurn,
     native_monitor: &NativeWakeMonitor,
+    mut stop_key_rx: Option<&mut mpsc::Receiver<()>>,
     mut pending_query: Option<PendingVoiceQuery>,
 ) -> anyhow::Result<SessionExit> {
     let mut last_activity = Instant::now();
@@ -430,6 +572,7 @@ async fn run_conversation_session(
                         &cur_config,
                         cur_config.dual.exit_earcon.as_deref(),
                         &cur_config.dual.exit_prompt,
+                        CueKind::Exit,
                     )
                     .await;
                     break;
@@ -540,6 +683,7 @@ async fn run_conversation_session(
         let turn_outcome = tokio::select! {
             res = pipeline.execute(req) => DualTurnOutcome::Finished(res),
             barge = kws.wait_for_barge_in() => DualTurnOutcome::BargeIn(barge?),
+            Some(()) = recv_opt_stop_key(&mut stop_key_rx) => DualTurnOutcome::StopKey,
         };
 
         match turn_outcome {
@@ -626,11 +770,27 @@ async fn run_conversation_session(
                         &cur_config,
                         cur_config.dual.exit_earcon.as_deref(),
                         &cur_config.dual.exit_prompt,
+                        CueKind::Exit,
                     )
                     .await;
                 }
                 agent.reset_session("user exit command").await;
                 break;
+            }
+            DualTurnOutcome::StopKey => {
+                info!(
+                    session_id = tracker.session_id,
+                    turn_seq,
+                    "实体按键触发打断，停止本轮播报并切回 Listening"
+                );
+                audio.interrupt_for_wake().await;
+                if let Some((user_q, partial_ans)) = in_flight.take() {
+                    agent.record_partial_turn(&user_q, &partial_ans).await;
+                }
+                sleep(Duration::from_millis(60)).await;
+                audio.set_phase(AgentPhase::Listening).await;
+                last_activity = Instant::now();
+                continue;
             }
         }
         // 从回复播报完毕开始重新计算静默超时
@@ -643,6 +803,14 @@ async fn run_conversation_session(
 enum DualTurnOutcome {
     Finished(anyhow::Result<crate::agent::AgentTurnResult>),
     BargeIn(BargeInSignal),
+    StopKey,
+}
+
+async fn recv_opt_stop_key(rx: &mut Option<&mut mpsc::Receiver<()>>) -> Option<()> {
+    match rx.as_deref_mut() {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn play_prompt(
@@ -650,8 +818,17 @@ async fn play_prompt(
     config: &AppConfig,
     wav_path: Option<&Path>,
     fallback_text: &str,
+    cue: CueKind,
 ) {
     audio.set_phase(AgentPhase::Speaking).await;
+    if wav_path.is_some()
+        && audio
+            .play_earcon_or_cue(wav_path, cue, config.realtime.playback_gain)
+            .await
+    {
+        sleep(Duration::from_millis(350)).await;
+        return;
+    }
     if play_optional_earcon(audio, wav_path).await {
         sleep(Duration::from_millis(350)).await;
         return;
@@ -955,5 +1132,146 @@ mod tests {
         assert!(!is_native_xiaoai_utterance("豆包，小爱同学是什么"));
         assert!(!is_native_xiaoai_utterance("帮我问问小爱同学"));
         assert!(!is_native_xiaoai_utterance("今天天气怎么样"));
+    }
+
+    #[tokio::test]
+    async fn dual_router_runs_realtime_and_falls_back_to_cascade_on_connect_error() {
+        use crate::audio::stream_player::{AplayStreamPlayer, StreamAudioSpec};
+        use crate::realtime::{BoxFuture, RealtimeEvent};
+
+        struct FakeDriver {
+            rx: mpsc::Receiver<anyhow::Result<RealtimeEvent>>,
+        }
+        impl RealtimeDriver for FakeDriver {
+            fn output_sample_rate(&self) -> u32 {
+                24_000
+            }
+            fn input_chunk_bytes(&self) -> usize {
+                640
+            }
+            fn send_audio<'a>(&'a mut self, _pcm: &'a [u8]) -> BoxFuture<'a, anyhow::Result<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+            fn commit_user_turn<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+            fn cancel_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+            fn submit_tool_output<'a>(
+                &'a mut self,
+                _call_id: &'a str,
+                _output: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+            fn next_event<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<Option<RealtimeEvent>>> {
+                Box::pin(async move {
+                    match self.rx.recv().await {
+                        Some(Ok(ev)) => Ok(Some(ev)),
+                        Some(Err(err)) => Err(err),
+                        None => Ok(None),
+                    }
+                })
+            }
+            fn close<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<()>> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let mut cfg = AppConfig::default();
+        cfg.runtime.mode = "dual".into();
+        cfg.dialogue.engine = DialogueEngine::Realtime;
+        cfg.airplay.enabled = false;
+        cfg.dual.exit_earcon = None;
+        cfg.dual.enter_earcon = None;
+        cfg.realtime.system_prompt = "测试音箱助手".into();
+        assert_eq!(build_realtime_instructions(&cfg), "测试音箱助手");
+
+        let handle = ConfigHandle::new(Arc::new(cfg.clone()));
+        let shell = Arc::new(RecordingShell::always_ok());
+        let device = Device::with_runner(cfg.device.clone(), shell);
+        let playback = Arc::new(PlaybackGate::default());
+        let tts = TtsRouter::new(device.clone(), playback.clone());
+        let music = Arc::new(MusicService::new(handle.clone(), device.clone()).unwrap());
+        let airplay = AirPlayService::start(cfg.airplay.clone()).await.unwrap();
+        let mock_player = Arc::new(AplayStreamPlayer::new(StreamAudioSpec {
+            command_override: Some(("cat".to_string(), vec![])),
+            ..StreamAudioSpec::default()
+        }));
+        let audio = AudioCoordinator::new(
+            device.clone(),
+            cfg.device.clone(),
+            playback,
+            tts,
+            music.clone(),
+            airplay,
+            RuntimeTelemetry::default(),
+            Arc::new(TtsHealth::default()),
+        )
+        .with_stream_player(mock_player);
+        let agent = Arc::new(AgentRuntime::new(handle.clone(), device, music).await.unwrap());
+        let asr = AsrClient::new(cfg.asr.clone()).unwrap();
+        let native_monitor = NativeWakeMonitor::disabled();
+        let mut native_rx = native_monitor.subscribe();
+        let mut tracker = SessionTracker::new();
+        let in_flight = InFlightTurn::default();
+
+        // 1) Realtime path completes with NativeYield when user says "小爱同学"
+        let (_wake_tx1, wake_rx1) = mpsc::channel(4);
+        let (_aud_tx1, aud_rx1) = mpsc::channel(4);
+        let (mut kws1, _stop1) = ExternalKwsHandle::from_test_channels(wake_rx1, aud_rx1);
+        let (ev_tx1, ev_rx1) = mpsc::channel(4);
+        ev_tx1
+            .send(Ok(RealtimeEvent::UserTranscriptCompleted(
+                "小爱同学，现在几点了".into(),
+            )))
+            .await
+            .unwrap();
+        let res1 = run_dual_session_routed(
+            &mut kws1,
+            &handle,
+            &cfg,
+            &asr,
+            &agent,
+            &audio,
+            &mut tracker,
+            &in_flight,
+            &native_monitor,
+            &mut native_rx,
+            None,
+            |_| async move { Ok(FakeDriver { rx: ev_rx1 }) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res1, DualSessionOutcomeKind::NativeYield);
+
+        // 2) Realtime connection error + Fallback::Cascade falls into cascade session cleanly
+        let (_wake_tx2, wake_rx2) = mpsc::channel(4);
+        let (aud_tx2, aud_rx2) = mpsc::channel(16);
+        // Seed oneshot stream silence then close, or session timeout = 0 for immediate clean exit
+        drop(aud_tx2);
+        let (mut kws2, _stop2) = ExternalKwsHandle::from_test_channels(wake_rx2, aud_rx2);
+        let mut fallback_cfg = cfg.clone();
+        fallback_cfg.dual.session_timeout_s = 0;
+        let fallback_handle = ConfigHandle::new(Arc::new(fallback_cfg.clone()));
+
+        let res2 = run_dual_session_routed(
+            &mut kws2,
+            &fallback_handle,
+            &fallback_cfg,
+            &asr,
+            &agent,
+            &audio,
+            &mut tracker,
+            &in_flight,
+            &native_monitor,
+            &mut native_rx,
+            None,
+            |_| async move { Err::<FakeDriver, _>(anyhow::anyhow!("connect refused")) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(res2, DualSessionOutcomeKind::Normal);
     }
 }

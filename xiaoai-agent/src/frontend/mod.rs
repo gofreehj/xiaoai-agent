@@ -3,6 +3,7 @@
 pub mod external_kws;
 pub mod mipns;
 pub mod native_monitor;
+pub mod stop_key;
 
 use std::fmt;
 

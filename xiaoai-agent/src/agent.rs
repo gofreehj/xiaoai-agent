@@ -503,6 +503,23 @@ impl AgentRuntime {
         self.push_history(user_trimmed, &assistant_record, true).await;
     }
 
+    /// 记录外部实时语音引擎（如 Volcengine O2 Realtime）的对话轮次，
+    /// 使其与 cascade 模式共享历史上下文与 Web Admin `conversation_log`。
+    pub async fn record_external_turn(&self, user: &str, assistant: &str, interrupted: bool) {
+        let user_trimmed = user.trim();
+        let assistant_trimmed = assistant.trim();
+        if user_trimmed.is_empty() && assistant_trimmed.is_empty() {
+            return;
+        }
+        let assistant_record = if interrupted && assistant_trimmed.is_empty() {
+            "（回答被用户唤醒打断）".to_string()
+        } else {
+            assistant_trimmed.to_string()
+        };
+        self.push_history(user_trimmed, &assistant_record, interrupted)
+            .await;
+    }
+
     pub fn history_limits() -> (usize, u64) {
         (HISTORY_MAX_TURNS, HISTORY_TTL.as_secs())
     }
@@ -1086,5 +1103,19 @@ mod tests {
         agent.clear_conversation_log().await;
         let (_, cleared_total, _) = agent.conversation_snapshot(50).await;
         assert_eq!(cleared_total, 0);
+
+        agent.reset_session("user exit command").await;
+        agent
+            .record_external_turn("你好豆包", "你好呀，有什么可以帮你的", false)
+            .await;
+        agent.record_external_turn("明天下雨吗", "", true).await;
+        let (ext_entries, ext_total, ext_ctx) = agent.conversation_snapshot(50).await;
+        assert_eq!(ext_total, 2);
+        assert_eq!(ext_ctx, 2);
+        assert_eq!(ext_entries[0].user, "明天下雨吗");
+        assert!(ext_entries[0].interrupted);
+        assert_eq!(ext_entries[1].user, "你好豆包");
+        assert_eq!(ext_entries[1].assistant, "你好呀，有什么可以帮你的");
+        assert!(!ext_entries[1].interrupted);
     }
 }

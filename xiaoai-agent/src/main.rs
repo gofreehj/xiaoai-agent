@@ -79,7 +79,11 @@ enum CliCommand {
     /// Inspect agent status, socket ownership, latency metrics, and upstream connectivity.
     Status,
     /// Preflight check: config warnings, socket/PID state, /tmp space, upstream connectivity.
-    Doctor,
+    Doctor {
+        /// Record 3 seconds of raw ALSA capture and inspect per-channel bit width / RMS / peak.
+        #[arg(long)]
+        probe_mic: bool,
+    },
 }
 
 #[tokio::main]
@@ -88,8 +92,8 @@ async fn main() -> anyhow::Result<()> {
     if cli.command == Some(CliCommand::Status) {
         return run_status_command(&cli.config).await;
     }
-    if cli.command == Some(CliCommand::Doctor) {
-        return run_doctor_command(&cli.config).await;
+    if let Some(CliCommand::Doctor { probe_mic }) = cli.command {
+        return run_doctor_command(&cli.config, probe_mic).await;
     }
 
     tracing_subscriber::fmt()
@@ -678,13 +682,15 @@ async fn run_status_command(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_doctor_command(config_path: &Path) -> anyhow::Result<()> {
+async fn run_doctor_command(config_path: &Path, probe_mic: bool) -> anyhow::Result<()> {
     let config = AppConfig::load(config_path)
         .with_context(|| format!("failed to load config {}", config_path.display()))?;
     let report = crate::runtime::doctor::collect_doctor_report(&config, Some(config_path), None).await;
 
     println!("config: {} (parsed ok)", config_path.display());
     println!("mode: {}", report.mode);
+    println!("dialogue_engine: {}", report.dialogue_engine);
+    println!("realtime_provider: {}", report.realtime_provider);
 
     if report.warnings.is_empty() {
         println!("warnings: none");
@@ -703,13 +709,16 @@ async fn run_doctor_command(config_path: &Path) -> anyhow::Result<()> {
             if ep.is_empty() { "<unconfigured>" } else { ep }
         );
         println!(
-            "dual_capture: device={} rate={}Hz ch={} format={:?} mic_ch={} ref_ch={:?}",
+            "dual_capture: device={} rate={}Hz ch={} format={:?} mic_ch={} mic_channels={:?} ref_ch={:?} shift_bits={} kws_agc={}",
             config.dual.capture.device,
             config.dual.capture.sample_rate,
             config.dual.capture.channels,
             config.dual.capture.format,
             config.dual.capture.mic_channel,
-            config.dual.capture.ref_channel
+            config.dual.capture.mic_channels,
+            config.dual.capture.ref_channel,
+            config.dual.capture.shift_bits,
+            config.dual.capture.kws_agc_enabled,
         );
         let ni = &config.dual.native_interlock;
         let syslog_desc = ni.syslog_path.as_ref().map_or_else(
@@ -741,15 +750,23 @@ async fn run_doctor_command(config_path: &Path) -> anyhow::Result<()> {
         }
         None => println!("tmp_free: unknown"),
     }
+    match report.data_free_kib {
+        Some(kib) => {
+            let note = if kib < 2048 { " LOW (<2 MiB)" } else { "" };
+            println!("data_free ({}): {} KiB{note}", report.data_path, kib);
+        }
+        None => println!("data_free ({}): unknown", report.data_path),
+    }
 
     println!("upstream:");
     for u in &report.upstreams {
-        if u.label == "external_kws" {
+        if u.label == "external_kws" || u.label == "realtime_ws" {
             if u.reachable {
-                println!("  external_kws: reachable ({} ms) {}", u.rtt_ms, u.url);
+                println!("  {}: reachable ({} ms) {}", u.label, u.rtt_ms, u.url);
             } else {
                 println!(
-                    "  external_kws: UNREACHABLE ({}) {}",
+                    "  {}: UNREACHABLE ({}) {}",
+                    u.label,
                     u.error.as_deref().unwrap_or("unknown"),
                     u.url
                 );
@@ -770,6 +787,73 @@ async fn run_doctor_command(config_path: &Path) -> anyhow::Result<()> {
                 u.url
             );
         }
+    }
+
+    if probe_mic {
+        run_probe_mic(&config).await?;
+    }
+    Ok(())
+}
+
+async fn run_probe_mic(config: &AppConfig) -> anyhow::Result<()> {
+    let cap = &config.dual.capture;
+    if cap.format != crate::config::DualCaptureFormat::S32Le {
+        anyhow::bail!(
+            "--probe-mic 仅支持 S32_LE 多通道诊断，当前 dual.capture.format={:?}",
+            cap.format
+        );
+    }
+    println!(
+        "probe_mic: recording 3s from device={} rate={}Hz channels={} format=S32_LE ...",
+        cap.device, cap.sample_rate, cap.channels
+    );
+    let output = tokio::time::timeout(
+        Duration::from_secs(7),
+        tokio::process::Command::new("arecord")
+            .args([
+                "-q",
+                "-D",
+                &cap.device,
+                "-t",
+                "raw",
+                "-f",
+                "S32_LE",
+                "-r",
+                &cap.sample_rate.to_string(),
+                "-c",
+                &cap.channels.to_string(),
+                "-d",
+                "3",
+            ])
+            .output(),
+    )
+    .await
+    .context("arecord --probe-mic 超时")?
+    .context("执行 arecord 失败")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("arecord 返回非零状态 ({}): {}", output.status, stderr.trim());
+    }
+
+    let stats = crate::frontend::external_kws::probe_capture_channels(
+        &output.stdout,
+        cap.channels as usize,
+    )?;
+    println!("probe_mic_channels ({} bytes captured):", output.stdout.len());
+    for ch in stats {
+        println!(
+            "  ch{}: active={} samples={} peak_abs={} rms={:.1} outside_s24={} low_byte_zero={} full_scale_32={} suggested_shift={}",
+            ch.channel,
+            ch.active,
+            ch.samples,
+            ch.peak_abs,
+            ch.rms,
+            ch.outside_signed_24,
+            ch.low_byte_zero,
+            ch.full_scale_32,
+            ch.suggested_shift_bits
+        );
     }
     Ok(())
 }
@@ -1588,7 +1672,10 @@ agent:
         let doctor =
             Cli::try_parse_from(["xiaoai-agent", "doctor", "-c", "/tmp/test.yaml"]).unwrap();
         assert_eq!(doctor.config, PathBuf::from("/tmp/test.yaml"));
-        assert_eq!(doctor.command, Some(CliCommand::Doctor));
+        assert_eq!(doctor.command, Some(CliCommand::Doctor { probe_mic: false }));
+
+        let probe = Cli::try_parse_from(["xiaoai-agent", "doctor", "--probe-mic"]).unwrap();
+        assert_eq!(probe.command, Some(CliCommand::Doctor { probe_mic: true }));
     }
 
     #[tokio::test]
@@ -1599,7 +1686,7 @@ agent:
             "runtime:\n  mode: exclusive\nllm:\n  base_url: http://127.0.0.1:1/v1\nasr:\n  open_ai:\n    base_url: http://127.0.0.1:1/v1\n",
         )
         .unwrap();
-        let res = run_doctor_command(&path).await;
+        let res = run_doctor_command(&path, false).await;
         let _ = std::fs::remove_file(&path);
         assert!(res.is_ok(), "doctor failed: {res:?}");
 
@@ -1619,12 +1706,12 @@ agent:
             ),
         )
         .unwrap();
-        let dual_res = run_doctor_command(&dual_path).await;
+        let dual_res = run_doctor_command(&dual_path, false).await;
         let _ = std::fs::remove_file(&dual_path);
         srv_task.await.unwrap();
         assert!(dual_res.is_ok(), "doctor in dual mode failed: {dual_res:?}");
 
-        let missing = run_doctor_command(Path::new("/nonexistent/xiaoai-agent.yaml")).await;
+        let missing = run_doctor_command(Path::new("/nonexistent/xiaoai-agent.yaml"), false).await;
         assert!(missing.is_err());
     }
 

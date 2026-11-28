@@ -26,6 +26,11 @@ FULL_DUPLEX=${XIAOAI_FULL_DUPLEX:-/data/mipns/dialog_continuous}
 DISABLED_FULL_DUPLEX=${XIAOAI_DISABLED_FULL_DUPLEX:-/data/mipns/dialog_continuous.xiaoai-agent-disabled}
 START_TIMEOUT=${XIAOAI_START_TIMEOUT:-30}
 WATCHDOG_INTERVAL=${XIAOAI_WATCHDOG_INTERVAL:-5}
+DUAL_CRASH_FILE=$RUNTIME_DIR/dual-crashes
+DUAL_CRASH_WINDOW_S=${XIAOAI_DUAL_CRASH_WINDOW_S:-1800}
+DUAL_CRASH_LIMIT=${XIAOAI_DUAL_CRASH_LIMIT:-5}
+DUAL_RESET_UPTIME_S=${XIAOAI_DUAL_RESET_UPTIME_S:-300}
+DUAL_MAX_BACKOFF_S=${XIAOAI_DUAL_MAX_BACKOFF_S:-30}
 PNS_PROCESS_NAMES="mipns-xiaomi mipns-sai mipns-gmems mipns-siot mipns-aispeech mipns-horizon mipns-nuance"
 RUST_LOG=${RUST_LOG:-info}
 case "$0" in
@@ -399,21 +404,65 @@ is_dual_mode() {
 start_dual_watchdog() {
     agent_pid=$1
     mkdir -p "$RUNTIME_DIR"
+    started_at=$(date +%s)
     (
         trap '' HUP
         trap 'exit 0' INT TERM
         ticks=0
+        uptime_reset=0
         while sleep "$WATCHDOG_INTERVAL"; do
             ticks=$((ticks + 1))
+            now=$(date +%s)
+            if [ "$uptime_reset" -eq 0 ] && [ "$((now - started_at))" -ge "$DUAL_RESET_UPTIME_S" ]; then
+                rm -f "$DUAL_CRASH_FILE"
+                uptime_reset=1
+                log "dual-mode uptime reached ${DUAL_RESET_UPTIME_S}s; cleared crash circuit-breaker history"
+            fi
             if [ "$((ticks % 12))" -eq 0 ]; then
                 trim_log_file "$AGENT_LOG" "$LOG_MAX_BYTES" "$LOG_KEEP_LINES"
                 trim_log_file "$LAUNCHER_LOG" 524288 500
             fi
             if ! kill -0 "$agent_pid" 2>/dev/null; then
-                log "dual-mode xiaoai-agent process exited; restarting dual mode"
+                ended_at=$(date +%s)
+                uptime_s=$((ended_at - started_at))
+                prev_delay=1
+                recent=""
+                if [ -r "$DUAL_CRASH_FILE" ]; then
+                    read -r saved_delay saved_times <"$DUAL_CRASH_FILE" 2>/dev/null || true
+                    case "$saved_delay" in
+                        ''|*[!0-9]*) prev_delay=1 ;;
+                        *) prev_delay=$saved_delay ;;
+                    esac
+                    for ts in $saved_times; do
+                        case "$ts" in
+                            *[!0-9]*|'') continue ;;
+                        esac
+                        if [ "$((ended_at - ts))" -lt "$DUAL_CRASH_WINDOW_S" ]; then
+                            recent="$recent $ts"
+                        fi
+                    done
+                fi
+                if [ "$uptime_s" -ge "$DUAL_RESET_UPTIME_S" ]; then
+                    prev_delay=1
+                    recent=""
+                fi
+                failure_times="$recent $ended_at"
+                set -- $failure_times
+                failures=$#
+                next_delay=$((prev_delay * 2))
+                if [ "$next_delay" -gt "$DUAL_MAX_BACKOFF_S" ]; then
+                    next_delay=$DUAL_MAX_BACKOFF_S
+                fi
+                printf '%s %s\n' "$next_delay" "$failure_times" >"$DUAL_CRASH_FILE"
+                log "dual-mode xiaoai-agent exited (uptime=${uptime_s}s, failures_window=${failures}/${DUAL_CRASH_LIMIT})"
                 rm -f "$WATCHDOG_PID_FILE"
-                "$LAUNCHER" restart >>"$LAUNCHER_LOG" 2>&1
-                exit
+                if [ "$failures" -ge "$DUAL_CRASH_LIMIT" ]; then
+                    log "dual-mode circuit breaker tripped after ${failures} failures in ${DUAL_CRASH_WINDOW_S}s; staying stopped"
+                    exit 0
+                fi
+                sleep "$prev_delay"
+                XIAOAI_DUAL_WATCHDOG_RESTART=1 "$LAUNCHER" restart >>"$LAUNCHER_LOG" 2>&1
+                exit 0
             fi
         done
     ) </dev/null >>"$LAUNCHER_LOG" 2>&1 &
@@ -428,6 +477,9 @@ start_dual() {
         return 0
     fi
     rm -f "$PID_FILE"
+    if [ "${XIAOAI_DUAL_WATCHDOG_RESTART:-0}" != "1" ]; then
+        rm -f "$DUAL_CRASH_FILE"
+    fi
 
     [ -x "$AGENT_BIN" ] || fail "agent binary is not executable: $AGENT_BIN" || return 1
     [ -r "$AGENT_CONFIG" ] || fail "agent config is not readable: $AGENT_CONFIG" || return 1
@@ -461,6 +513,9 @@ stop_dual() {
     log "stopping dual mode..."
     stop_watchdog
     stop_agent_process
+    if [ "${XIAOAI_DUAL_WATCHDOG_RESTART:-0}" != "1" ]; then
+        rm -f "$DUAL_CRASH_FILE"
+    fi
     log "dual mode stopped"
     return 0
 }

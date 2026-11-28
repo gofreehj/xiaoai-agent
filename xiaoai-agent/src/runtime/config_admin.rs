@@ -10,8 +10,9 @@ use serde_json::{json, Value as JsonValue};
 use serde_yaml::{Mapping, Value as YamlValue};
 
 use crate::config::{
-    classify_config_change, collect_startup_warnings, AppConfig, AsrProvider, DualCaptureFormat,
-    LlmProtocol, LlmThinkingMode, TtsProvider,
+    classify_config_change, collect_startup_warnings, AppConfig, AsrProvider, DialogueEngine,
+    DualCaptureFormat, LlmProtocol, LlmThinkingMode, RealtimeFallback, RealtimeProvider,
+    TtsProvider,
 };
 
 pub const REDACTED_PLACEHOLDER: &str = "__REDACTED__";
@@ -22,6 +23,10 @@ const SECRET_PATHS: &[&[&str]] = &[
     &["llm", "api_key"],
     &["tts", "openai", "api_key"],
     &["agent", "web_search", "api_key"],
+    &["realtime", "volcengine_o2", "api_key"],
+    &["realtime", "volcengine_o2", "access_key"],
+    &["realtime", "volcengine_o2", "volc_websearch_api_key"],
+    &["realtime", "openai_realtime", "api_key"],
     &["server", "token"],
     &["airplay", "password"],
     &["music", "netease", "password"],
@@ -276,6 +281,28 @@ fn dual_format_str(f: DualCaptureFormat) -> &'static str {
     }
 }
 
+fn dialogue_engine_str(engine: DialogueEngine) -> &'static str {
+    match engine {
+        DialogueEngine::Cascade => "cascade",
+        DialogueEngine::Realtime => "realtime",
+    }
+}
+
+fn realtime_provider_str(provider: RealtimeProvider) -> &'static str {
+    match provider {
+        RealtimeProvider::VolcengineO2 => "volcengine_o2",
+        RealtimeProvider::OpenAiRealtime => "openai_realtime",
+    }
+}
+
+fn realtime_fallback_str(fallback: RealtimeFallback) -> &'static str {
+    match fallback {
+        RealtimeFallback::Cascade => "cascade",
+        RealtimeFallback::NativeAlert => "native_alert",
+        RealtimeFallback::None => "none",
+    }
+}
+
 fn raw_opt_path_str(raw: &YamlValue, path: &[&str]) -> Option<String> {
     get_yaml_path(raw, path)
         .and_then(YamlValue::as_str)
@@ -319,6 +346,51 @@ pub fn read_config_view(path: &Path, effective: &AppConfig) -> anyhow::Result<Js
             "mode": disk_cfg.runtime.mode,
             "speech_socket": disk_cfg.runtime.speech_socket,
             "session_idle_timeout_s": disk_cfg.runtime.session_idle_timeout_s,
+        },
+        "dialogue": {
+            "engine": dialogue_engine_str(disk_cfg.dialogue.engine),
+        },
+        "realtime": {
+            "provider": realtime_provider_str(disk_cfg.realtime.provider),
+            "fallback": realtime_fallback_str(disk_cfg.realtime.fallback),
+            "system_prompt": disk_cfg.realtime.system_prompt,
+            "output_device": disk_cfg.realtime.output_device,
+            "playback_gain": disk_cfg.realtime.playback_gain,
+            "playback_tail_ms": disk_cfg.realtime.playback_tail_ms,
+            "idle_timeout_s": disk_cfg.realtime.idle_timeout_s,
+            "volcengine_o2": {
+                "api_key_set": is_real_secret(&disk_cfg.realtime.volcengine_o2.api_key),
+                "app_id": disk_cfg.realtime.volcengine_o2.app_id,
+                "access_key_set": is_real_secret(&disk_cfg.realtime.volcengine_o2.access_key),
+                "resource_id": disk_cfg.realtime.volcengine_o2.resource_id,
+                "app_key": disk_cfg.realtime.volcengine_o2.app_key,
+                "enable_volc_websearch": disk_cfg.realtime.volcengine_o2.enable_volc_websearch,
+                "volc_websearch_type": disk_cfg.realtime.volcengine_o2.volc_websearch_type,
+                "volc_websearch_api_key_set": is_real_secret(&disk_cfg.realtime.volcengine_o2.volc_websearch_api_key),
+                "volc_websearch_result_count": disk_cfg.realtime.volcengine_o2.volc_websearch_result_count,
+                "volc_websearch_no_result_message": disk_cfg.realtime.volcengine_o2.volc_websearch_no_result_message,
+                "ws_url": disk_cfg.realtime.volcengine_o2.ws_url,
+                "model": disk_cfg.realtime.volcengine_o2.model,
+                "voice": disk_cfg.realtime.volcengine_o2.voice,
+                "bot_name": disk_cfg.realtime.volcengine_o2.bot_name,
+                "speaking_style": disk_cfg.realtime.volcengine_o2.speaking_style,
+                "end_smooth_window_ms": disk_cfg.realtime.volcengine_o2.end_smooth_window_ms,
+            },
+            "openai_realtime": {
+                "ws_url": disk_cfg.realtime.openai_realtime.ws_url,
+                "api_key_set": is_real_secret(&disk_cfg.realtime.openai_realtime.api_key),
+                "model": disk_cfg.realtime.openai_realtime.model,
+                "voice": disk_cfg.realtime.openai_realtime.voice,
+            },
+            "smart_turn": {
+                "enabled": disk_cfg.realtime.smart_turn.enabled,
+                "complete_quiet_ms": disk_cfg.realtime.smart_turn.complete_quiet_ms,
+                "unfinished_quiet_ms": disk_cfg.realtime.smart_turn.unfinished_quiet_ms,
+            },
+            "daily_usage": {
+                "state_dir": disk_cfg.realtime.daily_usage.state_dir.display().to_string(),
+                "daily_token_limit": disk_cfg.realtime.daily_usage.daily_token_limit,
+            },
         },
         "server": {
             "enabled": disk_cfg.server.enabled,
@@ -472,8 +544,11 @@ pub fn read_config_view(path: &Path, effective: &AppConfig) -> anyhow::Result<Js
                 "channels": disk_cfg.dual.capture.channels,
                 "format": dual_format_str(disk_cfg.dual.capture.format),
                 "mic_channel": disk_cfg.dual.capture.mic_channel,
+                "mic_channels": disk_cfg.dual.capture.mic_channels,
                 "ref_channel": disk_cfg.dual.capture.ref_channel,
                 "shift_bits": disk_cfg.dual.capture.shift_bits,
+                "kws_agc_enabled": disk_cfg.dual.capture.kws_agc_enabled,
+                "exit_playback_threshold": disk_cfg.dual.capture.exit_playback_threshold,
             },
             "native_interlock": {
                 "enabled": disk_cfg.dual.native_interlock.enabled,
@@ -840,6 +915,14 @@ tts:
 agent:
   web_search:
     api_key: tavily-secret
+realtime:
+  volcengine_o2:
+    api_key: volc-api-secret
+    app_id: volc-app-id
+    access_key: volc-access-secret
+    volc_websearch_api_key: volc-ws-secret
+  openai_realtime:
+    api_key: oai-rt-dialogue-secret
 server:
   enabled: true
   host: 0.0.0.0
@@ -873,6 +956,10 @@ mcp:
             "llm-secret-key",
             "tts-secret-key",
             "tavily-secret",
+            "volc-api-secret",
+            "volc-access-secret",
+            "volc-ws-secret",
+            "oai-rt-dialogue-secret",
             "panel-token-xyz",
             "airplay-pw",
             "ne-pw",
@@ -888,6 +975,22 @@ mcp:
         }
         assert!(redacted_yaml.contains(REDACTED_PLACEHOLDER));
         assert_eq!(view["form"]["llm"]["api_key_set"], true);
+        assert_eq!(
+            view["form"]["realtime"]["volcengine_o2"]["api_key_set"],
+            true
+        );
+        assert_eq!(
+            view["form"]["realtime"]["volcengine_o2"]["access_key_set"],
+            true
+        );
+        assert_eq!(
+            view["form"]["realtime"]["volcengine_o2"]["volc_websearch_api_key_set"],
+            true
+        );
+        assert_eq!(
+            view["form"]["realtime"]["openai_realtime"]["api_key_set"],
+            true
+        );
 
         let edited_yaml = redacted_yaml.replace("gpt-5.4-mini", "gpt-5.4-nano");
         let outcome = validate_and_save_yaml(&path, &edited_yaml, &effective, false).unwrap();
@@ -901,6 +1004,16 @@ mcp:
         assert_eq!(saved_cfg.asr.openai_realtime.api_key, "asr-rt-secret");
         assert_eq!(saved_cfg.tts.openai.api_key, "tts-secret-key");
         assert_eq!(saved_cfg.agent.web_search.api_key, "tavily-secret");
+        assert_eq!(saved_cfg.realtime.volcengine_o2.api_key, "volc-api-secret");
+        assert_eq!(saved_cfg.realtime.volcengine_o2.access_key, "volc-access-secret");
+        assert_eq!(
+            saved_cfg.realtime.volcengine_o2.volc_websearch_api_key,
+            "volc-ws-secret"
+        );
+        assert_eq!(
+            saved_cfg.realtime.openai_realtime.api_key,
+            "oai-rt-dialogue-secret"
+        );
         assert_eq!(saved_cfg.server.token, "panel-token-xyz");
         assert_eq!(saved_cfg.airplay.password, "airplay-pw");
         assert_eq!(saved_cfg.music.netease.password, "ne-pw");

@@ -4,10 +4,13 @@ pub mod output_format;
 pub mod stream_player;
 pub mod text_prep;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rand::Rng;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::warn;
@@ -45,6 +48,96 @@ pub enum VolumeAction {
 const QUIET_WINDOW_WAIT_CAP: Duration = Duration::from_secs(15);
 const QUIET_WINDOW_POLL_STEP: Duration = Duration::from_millis(50);
 
+pub const SPOKEN_CUES_WARN_BYTES: u64 = 300 * 1024;
+
+/// 预录口语化提示音选择器（T-203）：
+/// 扫描目录中非空 `.wav` 文件（跳过 0B 文件），按目录独立记忆上次选曲避免连续重复。
+#[derive(Debug, Default)]
+pub struct EarconPicker {
+    last_picks: HashMap<PathBuf, PathBuf>,
+}
+
+impl EarconPicker {
+    /// 统计目录中所有 `.wav` 文件的总字节数（非目录或缺失返回 0）。
+    pub fn dir_wav_total_bytes(path: &Path) -> u64 {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return 0;
+        };
+        if !meta.is_dir() {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let p = entry.path();
+                if !is_wav_file(&p) {
+                    return None;
+                }
+                entry.metadata().ok().filter(|m| m.is_file()).map(|m| m.len())
+            })
+            .sum()
+    }
+
+    /// 从单文件或目录中选出一个非空 `.wav` 文件。
+    pub fn pick(&mut self, dir_or_file: &Path) -> Option<PathBuf> {
+        let meta = std::fs::metadata(dir_or_file).ok()?;
+        if meta.is_file() {
+            return (meta.len() > 0).then(|| dir_or_file.to_path_buf());
+        }
+        if !meta.is_dir() {
+            return None;
+        }
+
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir_or_file)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !is_wav_file(&path) {
+                    return None;
+                }
+                let m = entry.metadata().ok()?;
+                (m.is_file() && m.len() > 0).then_some(path)
+            })
+            .collect();
+
+        if files.is_empty() {
+            return None;
+        }
+        files.sort();
+
+        if files.len() == 1 {
+            let pick = files.into_iter().next().unwrap();
+            self.last_picks.insert(dir_or_file.to_path_buf(), pick.clone());
+            return Some(pick);
+        }
+
+        let previous = self.last_picks.get(dir_or_file).cloned();
+        let mut rng = rand::thread_rng();
+        let mut pick = files[rng.gen_range(0..files.len())].clone();
+        if Some(&pick) == previous.as_ref() {
+            let candidates: Vec<&PathBuf> = files
+                .iter()
+                .filter(|p| Some(*p) != previous.as_ref())
+                .collect();
+            if !candidates.is_empty() {
+                pick = candidates[rng.gen_range(0..candidates.len())].clone();
+            }
+        }
+        self.last_picks.insert(dir_or_file.to_path_buf(), pick.clone());
+        Some(pick)
+    }
+}
+
+fn is_wav_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+}
+
 /// 统一协调音频输出、播放令牌、LED 阶段灯效、音乐/AirPlay 焦点打断与音量控制。
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -58,6 +151,7 @@ pub struct AudioCoordinator {
     pub telemetry: RuntimeTelemetry,
     pub tts_health: Arc<TtsHealth>,
     pub stream_player: Arc<stream_player::AplayStreamPlayer>,
+    pub earcon_picker: Arc<Mutex<EarconPicker>>,
 }
 
 #[allow(dead_code)]
@@ -85,7 +179,14 @@ impl AudioCoordinator {
             stream_player: Arc::new(stream_player::AplayStreamPlayer::new(
                 stream_player::StreamAudioSpec::default(),
             )),
+            earcon_picker: Arc::new(Mutex::new(EarconPicker::default())),
         }
+    }
+
+    /// Override the shared [`AplayStreamPlayer`] (used by tests with mock playback commands).
+    pub fn with_stream_player(mut self, player: Arc<stream_player::AplayStreamPlayer>) -> Self {
+        self.stream_player = player;
+        self
     }
 
     fn led_for_phase(&self, phase: AgentPhase) -> Option<u8> {
@@ -150,17 +251,60 @@ impl AudioCoordinator {
         self.set_phase(AgentPhase::Idle).await;
     }
 
-    /// 若提示音文件存在则通过 `qplayer` 播报；缺失时静默返回 `false`，不触发任何 shell 命令。
+    /// 若提示音文件或目录内非空 `.wav` 存在则通过 `qplayer` 播报；缺失或仅含 0B 文件时静默返回 `false`。
     pub async fn play_earcon(&self, wav_path: &str) -> bool {
-        if tokio::fs::metadata(wav_path).await.is_err() {
+        let Some(picked) = self
+            .earcon_picker
+            .lock()
+            .unwrap()
+            .pick(Path::new(wav_path))
+        else {
             return false;
-        }
-        let quoted = shell_words::quote(wav_path);
+        };
+        let picked_str = picked.to_string_lossy();
+        let quoted = shell_words::quote(&picked_str);
         let script = format!("qplayer {quoted} 0 >/dev/null 2>&1");
         if let Err(err) = self.device.run_raw(&script, Duration::from_secs(6)).await {
-            warn!(path = wav_path, error = %err, "failed to play earcon");
+            warn!(path = %picked.display(), error = %err, "failed to play earcon");
         }
         true
+    }
+
+    /// 优先播报 `wav_path` 指向的文件或 `spoken_cues` 目录；若路径已配置但缺失/为空，则回退播放 `T-001` 零占用合成提示音。
+    pub async fn play_earcon_or_cue(
+        &self,
+        wav_path: Option<&Path>,
+        fallback_cue: stream_player::CueKind,
+        gain: f32,
+    ) -> bool {
+        let Some(path) = wav_path else {
+            return false;
+        };
+        if self.play_earcon(&path.to_string_lossy()).await {
+            return true;
+        }
+        self.play_synthetic_cue(fallback_cue, gain).await
+    }
+
+    /// 播放 `T-001` 零磁盘占用合成提示音（24 kHz mono S16_LE）。
+    pub async fn play_synthetic_cue(&self, cue: stream_player::CueKind, gain: f32) -> bool {
+        let pcm = stream_player::make_session_cue_pcm(cue, gain);
+        if pcm.is_empty() {
+            return false;
+        }
+        let mut spec = self.stream_player.default_spec().await;
+        spec.sample_rate = 24_000;
+        spec.channels = 1;
+        spec.playback_gain = gain;
+        let gen = self.stream_player.start_turn(Some(spec)).await;
+        if self.stream_player.push_pcm(gen, pcm).await.unwrap_or(false) {
+            let _ = self
+                .stream_player
+                .finish_and_drain(gen, Duration::from_secs(2))
+                .await;
+            return true;
+        }
+        false
     }
 
     /// 委托 `TtsRouter::speak_stream_with_mode` 执行流式播报。
@@ -531,5 +675,89 @@ mod tests {
             shell.count_matching("mysoftvol") > before,
             "duck 模式下让位必须恢复 mysoftvol 音量，避免原生小爱被迫低音量播放"
         );
+    }
+
+    #[tokio::test]
+    async fn earcon_picker_skips_zero_byte_avoids_repeat_and_falls_back_to_synthetic_cue() {
+        let dir = std::env::temp_dir().join(format!(
+            "xiaoai_spoken_cues_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("empty.wav"), b"").unwrap();
+        std::fs::write(dir.join("a.wav"), b"RIFF1234").unwrap();
+        std::fs::write(dir.join("b.wav"), b"RIFF5678").unwrap();
+        std::fs::write(dir.join("ignore.txt"), b"not-wav").unwrap();
+
+        let mut picker = EarconPicker::default();
+        assert_eq!(EarconPicker::dir_wav_total_bytes(&dir), 16);
+
+        let mut prev = picker.pick(&dir).expect("should pick valid wav");
+        assert_ne!(prev.file_name().unwrap(), "empty.wav");
+        assert_ne!(prev.file_name().unwrap(), "ignore.txt");
+        for _ in 0..8 {
+            let next = picker.pick(&dir).expect("should keep picking non-empty wav");
+            assert_ne!(next.file_name().unwrap(), "empty.wav");
+            assert_ne!(next, prev, "must not repeat previous spoken cue consecutively");
+            prev = next;
+        }
+
+        // Only 0B wav -> returns None cleanly
+        let zero_dir = dir.join("only_zero");
+        std::fs::create_dir_all(&zero_dir).unwrap();
+        std::fs::write(zero_dir.join("zero.wav"), b"").unwrap();
+        assert!(picker.pick(&zero_dir).is_none());
+
+        // Coordinator fallback: missing directory plays synthetic cue via stream_player override
+        let mut cfg = AppConfig::default();
+        cfg.airplay.enabled = false;
+        let shell = Arc::new(RecordingShell::always_ok());
+        let handle = ConfigHandle::new(Arc::new(cfg.clone()));
+        let device = Device::with_runner(cfg.device.clone(), shell.clone());
+        let playback = Arc::new(PlaybackGate::default());
+        let tts = TtsRouter::new(device.clone(), playback.clone());
+        let music = Arc::new(MusicService::new(handle, device.clone()).unwrap());
+        let airplay = AirPlayService::start(cfg.airplay).await.unwrap();
+        let out_pcm = std::env::temp_dir().join(format!(
+            "xiaoai_cue_fallback_{}.pcm",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&out_pcm);
+        let mock_player = Arc::new(stream_player::AplayStreamPlayer::new(
+            stream_player::StreamAudioSpec {
+                command_override: Some((
+                    "sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        format!("cat > {}", out_pcm.display()),
+                    ],
+                )),
+                ..stream_player::StreamAudioSpec::default()
+            },
+        ));
+        let coord = AudioCoordinator::new(
+            device,
+            cfg.device,
+            playback,
+            tts,
+            music,
+            airplay,
+            RuntimeTelemetry::default(),
+            Arc::new(TtsHealth::default()),
+        )
+        .with_stream_player(mock_player);
+
+        let missing_dir = dir.join("does_not_exist");
+        assert!(
+            coord
+                .play_earcon_or_cue(Some(&missing_dir), stream_player::CueKind::Wake, 0.8)
+                .await
+        );
+        let bytes = std::fs::read(&out_pcm).unwrap();
+        assert_eq!(bytes.len(), 3840 * 2, "missing spoken_cues dir must fall back to T-001 synthetic cue");
+
+        let _ = std::fs::remove_file(&out_pcm);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

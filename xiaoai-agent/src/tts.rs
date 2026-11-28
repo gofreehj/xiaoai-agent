@@ -934,35 +934,239 @@ pub enum ExitAction {
     Farewell,
 }
 
-/// 识别用户退出对话指令（仅精确匹配完整退出意图，绝不子串误伤「把客厅灯关闭 / 取消明天日程」）。
+/// Strip optional `"强退:"` internal prefix from an exit keyword label.
+pub fn strong_exit_word(label: &str) -> Option<&str> {
+    label.strip_prefix("强退:")
+}
+
+/// 1:1 port of `xiaoai-doubao/xiaoai-plus/src/wakeup/exit_echo_guard.hpp::ExitEchoGuard`.
+///
+/// Tracks whether recent assistant reply text (with a UTF-8-safe 32-byte sliding tail for
+/// words split across streaming deltas) contained exit keywords, preventing `__CMD_EXIT__`
+/// from self-terminating the session when the assistant reads those words aloud.
+#[derive(Debug, Clone, Default)]
+pub struct ExitEchoGuard {
+    response_id: String,
+    tail: String,
+    seen_strong: [bool; 5],
+    seen_weak: bool,
+}
+
+impl ExitEchoGuard {
+    const STRONG_WORDS: [&'static str; 5] = ["闭嘴", "别说了", "停下", "关闭", "退下"];
+    const WEAK_WORDS: [&'static str; 4] = ["再见", "拜拜", "退出", "结束"];
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.response_id.clear();
+        self.tail.clear();
+        self.seen_strong = [false; 5];
+        self.seen_weak = false;
+    }
+
+    pub fn update(&mut self, response_id: &str, text: &str, done: bool, created: bool) {
+        if created || (!response_id.is_empty() && response_id != self.response_id) {
+            self.reset();
+        }
+        if !response_id.is_empty() {
+            self.response_id = response_id.to_string();
+        }
+        if done {
+            self.seen_strong = [false; 5];
+            self.seen_weak = false;
+            self.tail.clear();
+        }
+
+        let normalized = strip_punctuation_and_space(text);
+        let mut joined = String::with_capacity(self.tail.len() + normalized.len());
+        joined.push_str(&self.tail);
+        joined.push_str(&normalized);
+
+        for (i, word) in Self::STRONG_WORDS.iter().enumerate() {
+            if joined.contains(word) {
+                self.seen_strong[i] = true;
+            }
+        }
+        if joined.contains("关掉") {
+            self.seen_strong[3] = true;
+        }
+        if joined.contains("停止") || joined.contains("停掉") {
+            self.seen_strong[2] = true;
+        }
+        if Self::WEAK_WORDS.iter().any(|w| joined.contains(w)) {
+            self.seen_weak = true;
+        }
+
+        // Keep at most 32 bytes at a valid UTF-8 char boundary so multi-delta keywords match.
+        if joined.len() <= 32 {
+            self.tail = joined;
+        } else {
+            let mut start = joined.len() - 32;
+            while !joined.is_char_boundary(start) {
+                start += 1;
+            }
+            self.tail = joined[start..].to_string();
+        }
+    }
+
+    pub fn contains(&self, label: &str) -> bool {
+        let trimmed = label.trim();
+        if trimmed == "__CMD_EXIT__" {
+            return self.seen_strong.iter().any(|&v| v) || self.seen_weak;
+        }
+        let word = strong_exit_word(trimmed).unwrap_or(trimmed);
+        for (i, &w) in Self::STRONG_WORDS.iter().enumerate() {
+            if word == w {
+                return self.seen_strong[i];
+            }
+        }
+        if word == "关掉" {
+            return self.seen_strong[3];
+        }
+        if word == "停止" || word == "停掉" {
+            return self.seen_strong[2];
+        }
+        if Self::WEAK_WORDS.contains(&word) {
+            return self.seen_weak;
+        }
+        false
+    }
+}
+
+const EXIT_DENY_PHRASES: [&str; 22] = [
+    "不想",
+    "不要",
+    "不能",
+    "别关闭",
+    "别退出",
+    "别结束",
+    "不会",
+    "不许",
+    "不是",
+    "没有",
+    "怎么",
+    "如何",
+    "什么",
+    "说再见",
+    "说拜拜",
+    "叫再见",
+    "叫拜拜",
+    "“",
+    "”",
+    "\"",
+    "翻译",
+    "意思",
+];
+
+const EXIT_FILLER_PREFIXES: [&str; 14] = [
+    "我们先",
+    "我先",
+    "那我",
+    "好了",
+    "好吧",
+    "好啦",
+    "行了",
+    "行吧",
+    "那就",
+    "那",
+    "先",
+    "嗯",
+    "啊",
+    "哦",
+];
+
+/// 识别用户退出对话指令（1:1 融合 `MatchedExitCommand` 长度/否定/元语言守卫与精确匹配，
+/// 绝不子串误伤「把客厅灯关闭 / 取消明天日程 / 停止播放音乐 / 不想关闭 / 怎么说再见」）。
 pub fn classify_exit_command(text: &str, custom_keywords: &[String]) -> Option<ExitAction> {
     let cleaned = strip_punctuation_and_space(text);
-    let core = cleaned
-        .trim_end_matches(|c| matches!(c, '吧' | '了' | '啊' | '呀' | '哦' | '呢'))
-        .trim();
-    if core.is_empty() {
+    if cleaned.is_empty() || cleaned.chars().count() > 8 {
         return None;
     }
-    if matches!(
-        core,
-        "闭嘴" | "别说" | "安静" | "不用" | "算" | "没事" | "退下" | "别讲"
-    ) || matches!(
-        cleaned.as_str(),
-        "算了" | "不用了" | "没事了" | "别说了" | "别讲了"
-    ) {
-        return Some(ExitAction::Silent);
+    if EXIT_DENY_PHRASES.iter().any(|deny| cleaned.contains(deny)) {
+        return None;
     }
-    if matches!(
-        core,
-        "再见" | "拜拜" | "退出" | "退出对话" | "结束对话" | "先这样" | "休息"
-    ) {
-        return Some(ExitAction::Farewell);
-    }
-    if custom_keywords.iter().any(|kw| {
-        let kw_clean = strip_punctuation_and_space(kw);
-        !kw_clean.is_empty() && (cleaned == kw_clean || core == kw_clean)
-    }) {
-        return Some(ExitAction::Farewell);
+
+    let mut normalized = cleaned.clone();
+    for _ in 0..4 {
+        let mut candidate = normalized.as_str();
+        for prefix in EXIT_FILLER_PREFIXES {
+            if let Some(rest) = candidate.strip_prefix(prefix) {
+                if !rest.is_empty() {
+                    candidate = rest;
+                    break;
+                }
+            }
+        }
+        let check_one = |s: &str| -> Option<ExitAction> {
+            if matches!(
+                s,
+                "闭嘴"
+                    | "别说"
+                    | "别说了"
+                    | "别讲"
+                    | "别讲了"
+                    | "安静"
+                    | "不用"
+                    | "不用了"
+                    | "算"
+                    | "算了"
+                    | "没事"
+                    | "没事了"
+                    | "退下"
+                    | "停下"
+                    | "停"
+                    | "停止"
+                    | "停掉"
+                    | "关闭"
+                    | "关掉"
+            ) {
+                return Some(ExitAction::Silent);
+            }
+            if matches!(
+                s,
+                "再见"
+                    | "拜拜"
+                    | "豆包再见"
+                    | "退出"
+                    | "退出对话"
+                    | "结束"
+                    | "结束对话"
+                    | "不聊了"
+                    | "先这样"
+                    | "休息"
+            ) {
+                return Some(ExitAction::Farewell);
+            }
+            if custom_keywords.iter().any(|kw| {
+                let kw_clean = strip_punctuation_and_space(kw);
+                !kw_clean.is_empty() && s == kw_clean
+            }) {
+                return Some(ExitAction::Farewell);
+            }
+            None
+        };
+
+        if let Some(action) = check_one(&normalized).or_else(|| check_one(candidate)) {
+            return Some(action);
+        }
+
+        let mut stripped = None;
+        for particle in ['吧', '啊', '了', '呀', '啦', '哦', '喽', '呢'] {
+            if let Some(rest) = normalized.strip_suffix(particle) {
+                stripped = Some(rest.to_string());
+                break;
+            }
+        }
+        let Some(next) = stripped else {
+            break;
+        };
+        if next.is_empty() {
+            break;
+        }
+        normalized = next;
     }
     None
 }
@@ -1936,12 +2140,92 @@ mod tests {
             Some(ExitAction::Farewell)
         );
         assert_eq!(
-            classify_exit_command("结束对话", &[]),
+            classify_exit_command("豆包再见啦！", &[]),
             Some(ExitAction::Farewell)
         );
+        assert_eq!(
+            classify_exit_command("好了，拜拜哦", &[]),
+            Some(ExitAction::Farewell)
+        );
+        assert_eq!(
+            classify_exit_command("不聊了呀", &[]),
+            Some(ExitAction::Farewell)
+        );
+        assert_eq!(
+            classify_exit_command("停下啦", &[]),
+            Some(ExitAction::Silent)
+        );
+        assert_eq!(
+            classify_exit_command("关掉吧", &[]),
+            Some(ExitAction::Silent)
+        );
         assert_eq!(classify_exit_command("把客厅灯关闭", &[]), None);
+        assert_eq!(classify_exit_command("关闭客厅灯", &[]), None);
         assert_eq!(classify_exit_command("取消明天的闹钟", &[]), None);
         assert_eq!(classify_exit_command("停止播放音乐", &[]), None);
+        // Negation / quotation / metalinguistic / >8-char false-exit guards
+        assert_eq!(classify_exit_command("不想关闭", &[]), None);
+        assert_eq!(classify_exit_command("别退出", &[]), None);
+        assert_eq!(classify_exit_command("怎么说再见", &[]), None);
+        assert_eq!(classify_exit_command("“再见”", &[]), None);
+        assert_eq!(classify_exit_command("翻译再见", &[]), None);
+        assert_eq!(
+            classify_exit_command("今天天气真不错我们下次再见吧", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn exit_echo_guard_tracks_split_deltas_resets_and_cmd_exit() {
+        let mut guard = ExitEchoGuard::new();
+        for word in ["关闭", "闭嘴", "别说了", "停下", "退下"] {
+            let label = format!("强退:{word}");
+            let first_char_len = word.chars().next().unwrap().len_utf8();
+            let (head, tail) = word.split_at(first_char_len);
+
+            guard.reset();
+            guard.update("r1", &format!("可以说{head}"), false, false);
+            assert!(!guard.contains(&label));
+            guard.update("r1", tail, false, false);
+            assert!(guard.contains(&label));
+            assert!(guard.contains("__CMD_EXIT__"));
+
+            // Long subsequent text keeps seen flag for current response.
+            guard.update("r1", &"x".repeat(10_000), false, false);
+            assert!(guard.contains(&label));
+
+            // done=true clears previous seen flags before scanning new text.
+            guard.update("r1", "我们聊恐龙", true, false);
+            assert!(!guard.contains(&label));
+            assert!(!guard.contains("__CMD_EXIT__"));
+
+            guard.update("r2", word, true, false);
+            assert!(guard.contains(&label));
+
+            // New response_id resets prior state.
+            guard.update("r3", "新回答", false, false);
+            assert!(!guard.contains(&label));
+
+            guard.update("r3", word, false, false);
+            guard.update("", "", false, true);
+            assert!(!guard.contains(&label));
+
+            guard.update("", &format!("可 以 说 {word}"), false, false);
+            assert!(guard.contains(&label));
+            guard.reset();
+            assert!(!guard.contains(&label));
+        }
+
+        // Alias normalization + weak word tracking for __CMD_EXIT__
+        guard.update("r4", "关掉、停止", true, false);
+        assert!(guard.contains("强退:关闭"));
+        assert!(guard.contains("强退:停下"));
+        assert!(!guard.contains("强退:闭嘴"));
+        assert!(guard.contains("__CMD_EXIT__"));
+
+        guard.update("r5", "不要说再见", true, false);
+        assert!(guard.contains("__CMD_EXIT__"));
+        assert!(!guard.contains("强退:关闭"));
     }
 
     #[test]

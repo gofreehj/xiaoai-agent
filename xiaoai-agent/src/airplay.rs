@@ -1,3 +1,5 @@
+#[cfg(feature = "airplay")]
+mod imp {
 use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -307,3 +309,31 @@ fn airplay_db_to_gain(volume: f32) -> f32 {
         10.0f32.powf(volume.min(0.0) / 20.0)
     }
 }
+}
+
+#[cfg(not(feature = "airplay"))]
+mod imp {
+    use anyhow::bail;
+
+    use crate::config::AirPlayConfig;
+
+    #[derive(Clone, Default)]
+    pub struct AirPlayService;
+
+    impl AirPlayService {
+        pub async fn start(config: AirPlayConfig) -> anyhow::Result<Self> {
+            if config.enabled {
+                bail!("airplay feature is disabled in this build");
+            }
+            Ok(Self)
+        }
+
+        pub async fn interrupt_for_wake(&self) -> bool {
+            false
+        }
+
+        pub async fn restore_after_interruption(&self) {}
+    }
+}
+
+pub use imp::AirPlayService;

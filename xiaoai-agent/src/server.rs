@@ -374,7 +374,27 @@ async fn health(State(state): State<RouterState>) -> Response {
 }
 
 async fn status(State(state): State<RouterState>) -> Response {
-    (StatusCode::OK, no_store(), Json(status_body(&state.control))).into_response()
+    let mut body = status_body(&state.control);
+    if let Some(cfg_handle) = &state.hooks.config {
+        let cfg = cfg_handle.get().await;
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "dialogue_engine".to_string(),
+                json!(match cfg.dialogue.engine {
+                    crate::config::DialogueEngine::Cascade => "cascade",
+                    crate::config::DialogueEngine::Realtime => "realtime",
+                }),
+            );
+            obj.insert(
+                "realtime_provider".to_string(),
+                json!(match cfg.realtime.provider {
+                    crate::config::RealtimeProvider::VolcengineO2 => "volcengine_o2",
+                    crate::config::RealtimeProvider::OpenAiRealtime => "openai_realtime",
+                }),
+            );
+        }
+    }
+    (StatusCode::OK, no_store(), Json(body)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1415,6 +1435,14 @@ mod tests {
         assert!(
             body.contains("/health") && body.contains("Bearer"),
             "页面要真的去调 API，并且用 Bearer"
+        );
+        assert!(
+            body.contains("volcengine_o2") && body.contains("enable_volc_websearch"),
+            "页面应包含火山 O2 实时语音与内置联网搜索表单"
+        );
+        assert!(
+            !body.contains("<script src=") && !body.contains("<link rel=\"stylesheet\" href=\"http"),
+            "控制台页面必须零外部 CDN 依赖"
         );
 
         // 除了面板，**每一条**路由都必须要求鉴权。这是路由级断言：

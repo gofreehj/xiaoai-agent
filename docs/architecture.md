@@ -28,29 +28,41 @@
 
 ```text
 xiaoai-agent/src/
-├── main.rs                # CLI 入口（run / doctor）、组件装配与信号监听
-├── config.rs              # 配置 schema、默认值、collect_startup_warnings 预检
+├── main.rs                # CLI 入口（run / doctor [--probe-mic]）、组件装配与信号监听
+├── config.rs              # 配置 schema（dialogue/realtime/dual.stop_key）、默认值、collect_startup_warnings 预检
 ├── frontend/              # 1. 语音前端适配层（屏蔽底层协议差异）
 │   ├── mod.rs             #    VoiceFrontend 契约、FrontendEvent、AudioStreamChunk
 │   ├── mipns.rs           #    exclusive 适配器（speech.usock + pnshelper + 陈旧帧排空）
-│   ├── external_kws.rs    #    dual 适配器（arecord 采集/下采样/回采检测 + UDP XPCM 客户端 + 2.56s 缓冲）
-│   └── native_monitor.rs  #    dual 原生小爱互锁监听器（ubus event_command + syslog/instruction.log 双源）
+│   ├── external_kws.rs    #    dual 适配器（多麦波束/AGC + arecord 下采样/回采检测 + UDP XPCM + 2.56s pre-wake 回放）
+│   ├── native_monitor.rs  #    dual 原生小爱互锁监听器（ubus event_command + syslog/instruction.log 双源）
+│   └── stop_key.rs        #    只读非阻塞实体停止键监听（/dev/input/event*，300 ms 去抖，绝不 grab）
 ├── audio/                 # 2. 音频与输出协调层
-│   ├── mod.rs             #    AudioCoordinator（LED 状态灯、唤醒打断、earcon、静音窗口、音频焦点）
+│   ├── mod.rs             #    AudioCoordinator（LED 状态灯、EarconPicker spoken_cues 提示音池、合成音回退）
+│   ├── output_format.rs   #    Realtime 下行格式自适应探测（S16_LE / F32_LE、拒绝 OggS）
+│   ├── stream_player.rs   #    aplay 24 kHz 持久化流式播放管线 + T-001 零占用合成提示音
 │   └── text_prep.rs       #    Markdown/URL/Emoji 清洗 + 中英文/小数安全流式切句
-├── session/               # 3. 会话编排与交互流水线
-│   ├── mod.rs             #    SessionOrchestrator（多轮状态机、双模式统一主循环）
+├── realtime/              # 3. 端到端实时语音协议与会话层（T-101 ~ T-204）
+│   ├── mod.rs             #    RealtimeDriver / RealtimeUsage / EchoCanceller 契约
+│   ├── volcengine_frame.rs#    火山二进制帧编解码（1 MiB Gzip 解压/包体硬上限）
+│   ├── volcengine_o2.rs   #    火山 O2/v3 驱动（官方双鉴权 + enable_volc_websearch + canceled_question_id 围栏）
+│   ├── runner.rs          #    RealtimeSessionRunner（默认半双工 + 四通道打断 + ExitEchoGuard + 降级出口）
+│   ├── smart_turn.rs      #    Smart Turn 中英文语义判停（完整 1.5s / 未说完 4.5s）
+│   └── daily_usage.rs     #    每日 token 用量守卫（默认 /tmp/xiaoai-agent/usage，零 NAND 擦写）
+├── session/               # 4. Cascade 会话编排与交互流水线
+│   ├── mod.rs             #    SessionOrchestrator（多轮状态机、exclusive/dual cascade 主循环）
 │   ├── pipeline.rs        #    TurnPipeline（ASR → 本地意图 → LLM 流式 → 1.2s 思考提示音 → 分句 TTS）
 │   └── intent.rs          #    LocalIntentRouter（音量/暂停/继续/下一首/退出，零延迟直达）
-├── brain/                 # 4. 认知与工具层（agent.rs / asr.rs / mcp.rs / tools.rs / weather.rs）
-├── control/               # 5. 本地控制面（control/mod.rs + server.rs + panel.html）
-└── runtime/               # 6. 运行时基础设施
+├── brain/                 # 5. 认知与工具层（agent.rs / asr.rs / mcp.rs / tools.rs / weather.rs）
+├── control/               # 6. 本地控制面（control/mod.rs + server.rs + panel.html，路由级 require_token）
+└── runtime/               # 7. 运行时基础设施
+    ├── config_admin.rs    #    agent.yaml 读写、SECRET_PATHS 脱敏与 __REDACTED__ 回填
+    ├── doctor.rs          #    离线+在线体检（WS 探针、/data < 2 MiB 告警、--probe-mic 声道体检）
     ├── reload.rs          #    SIGHUP 合并式异步热重载与不可热更段回滚
     ├── fault.rs           #    故障分级与让位决策（YieldOutcome 0/3/4/5 契约）
     └── telemetry.rs       #    阶段耗时与状态快照
 ```
 
-底层支撑模块：`speech.rs`（`speech.usock` 服务端与 `errno` 分级重试）、`vad.rs`（自适应底噪与动态判停）、`capture.rs`（音频采集与 `CaptureOutcome`）、`tts.rs`（`PlaybackGate`、`FinishMode`、`/tmp` 音频上限控制）、`music.rs`（Navidrome 与 `EndReached` 自动切歌）、`device.rs`（设备脚本执行与音量命令）、`airplay.rs`。
+底层支撑模块：`speech.rs`（`speech.usock` 服务端与 `errno` 分级重试）、`vad.rs`（自适应底噪与动态判停）、`capture.rs`（音频采集与 `CaptureOutcome`）、`tts.rs`（`PlaybackGate`、`FinishMode`、`ExitEchoGuard`、`/tmp` 音频上限控制）、`music.rs`（Navidrome 与 `EndReached` 自动切歌）、`device.rs`（设备脚本执行与音量命令）、`airplay.rs`（由 `airplay` Cargo feature 可选门控）。
 
 ---
 
@@ -96,8 +108,13 @@ Wakeup / ControlCommand::Chat
 4. **双模式协同与原生打断让位（`dual`）**：
    - `ExternalKwsEngine` 通过标准 [UDP XPCM 协议](external-kws-protocol.md)向外部服务发送待机 PCM 与 `XPCM_FLAG_PING` 心跳（30s 保活），唤醒后自动发送 `XPCM_FLAG_RESET` 并回放 2.56s 唤醒缓冲实现 One-shot 连说；
    - `capture_dual_utterance` 依据硬件 DAC 回采通道计算的 `sys_active` 门控语音起点，原生小爱外放时绝不误收录回声；所有参考服务端（Python / Docker、红米 AX5）均位于 `deploy/kws-server/`；
-   - `NativeWakeMonitor` 同时支持可选 `dual.native_interlock.event_command`（如真机验证后的 `ubus listen`）与原生日志尾随（`/tmp/log/messages` + `/tmp/mico_aivs_lab/instruction.log`），结合 `max_active_s` 兜底上限与 `cooldown_s` 冷却窗；一旦检测到「小爱同学」，外层 `tokio::select!` 立即中断 One-shot、录音、ASR、大模型/工具调用、提示音、外部 TTS、控制面 `/speak`/`/chat` 与 Agent 自有音乐并静默让位（不动原生 LED、`tts_play.sh` 与 `mphelper`，`duck` 模式下自动恢复音量）。
-5. **tmpfs 空间保护**：外部 TTS 临时音频限制最长保留 600s 且最多保留 5 个文件，防止 50 MB `/tmp` 被撑爆。
+   - `NativeWakeMonitor` 同时支持可选 `dual.native_interlock.event_command`（如真机验证后的 `ubus listen`）与原生日志尾随（`/tmp/log/messages` + `/tmp/mico_aivs_lab/instruction.log`），结合 `max_active_s` 兜底上限与 `cooldown_s` 冷却窗；一旦检测到「小爱同学」，外层 `tokio::select!` 立即中断 One-shot、录音、ASR、大模型/工具调用、提示音、外部 TTS、Realtime 会话、控制面 `/speak`/`/chat` 与 Agent 自有音乐并静默让位（不动原生 LED、`tts_play.sh` 与 `mphelper`，`duck` 模式下自动恢复音量）。
+5. **tmpfs 空间保护**：外部 TTS 临时音频限制最长保留 600s 且最多保留 5 个文件，防止 50 MB `/tmp` 被撑爆；`DailyUsageGuard` 默认写入 `/tmp/xiaoai-agent/usage/daily_usage.json`，跨日清零且 JSON 损坏自动恢复，实现零 NAND 擦写。
+6. **双对话引擎路由与半双工 Realtime 内核（`dual.rs` + `realtime/`）**：
+   - `dialogue.engine` 支持在 `cascade`（ASR + LLM + TTS）与 `realtime`（端到端实时语音）之间通过 `SIGHUP` / Web Console 热切换；
+   - `VolcengineO2Driver` 完整实现火山二进制帧协议（1 MiB Gzip 解压/包体上限）、官方双鉴权（`X-Api-Key` 或 `App-Id + Access-Key`）、`enable_volc_websearch` 内置联网搜索与 `canceled_question_id` 取消围栏；
+   - `RealtimeSessionRunner` 默认采用半双工门控（`Speaking`/`Tail` 阶段停传上行 PCM）、`ExitEchoGuard` 自回声防退、4 通道打断（原生唤醒 / 外部唤醒 / 外部退词 / 实体 `stop_key`）、Smart Turn 中英文语义判停，并在超限/首连失败/turn 0 异常时按 `realtime.fallback` 自动降级 `cascade`（或仅在 `!native_monitor.is_blocked()` 时播报 `native_alert`）。
+7. **口语化提示音池与实体停止键**：`EarconPicker` 支持 `*_earcon` 指向目录（随机选取非空 `.wav`、跳过 0 B、按目录记忆避免连续重复，缺失或为空自动回退 `T-001` `make_session_cue_pcm` 零磁盘占用合成音）；`StopKeyListener` 以 `O_RDONLY | O_NONBLOCK` 只读监听 `/dev/input/event*`（绝不 `EVIOCGRAB`、300 ms 去抖、仅在活跃对话生效）。
 
 ### 3.3 `dual` 模式原生小爱唤醒互锁与防双播放设计
 
@@ -155,18 +172,21 @@ dual:
 
 ### 4.1 故障处理边界（双主分工）
 
-- **启动脚本看门狗（`start-agent.sh`）**：只负责进程级守护（进程退出、`speech.usock` inode 替换、保护挂载消失），动作唯一为重启恢复；两个模式均通过 `acquire_lock` 串行化，避免并发竞争。
+- **启动脚本看门狗（`start-agent.sh`）**：只负责进程级守护；两个模式均通过 `acquire_lock` 串行化，避免并发竞争。
+  - `exclusive`：`start_watchdog` 仅在进程退出 / `speech.usock` inode 替换 / 保护挂载消失时重启，`0/3/4/5` 让位退出码契约严禁变动；
+  - `dual`：`start_dual_watchdog` 内置 **30 分钟 5 次崩溃熔断**（指数退避重启，连续运行满 300s 或人工 `start`/`stop` 后自动清零 `/tmp/xiaoai-agent/dual-crashes`），防止异常死循环拖垮设备。
 - **Agent 内部让位（`runtime/fault.rs`）**：只负责协议级不可恢复错误（`SpeechServiceEvent::Fatal`）与连续多轮失败；`speech.rs` 对瞬态 `errno` 先做有界重试，确认不可恢复后通过 `run_detached` 调用 `start-agent.sh stop` 将麦克风安全归还原生小爱。退出码 `0/3/4/5` 与 `SocketOwnership` inode 事实共同决定是否退出（详见 [AGENTS.md](../AGENTS.md)）。
 
 ### 4.2 `SIGHUP` 配置热重载
 
 通过 `kill -HUP` 或 `POST /reload` 触发，在独立异步任务中执行并自动合并并发请求：
-- **热生效（下一轮生效）**：`llm`、`agent`、`music`、`capture`、`tts`、`runtime.session_idle_timeout_s`、`mcp`、`dual.{enter_prompt,exit_prompt,*_earcon,session_timeout_s,exit_keywords}`（`AgentView` 原子替换配置与工具集，保留当前对话历史）。
-- **需重启（保持旧值并告警）**：`device`、`asr`、`airplay`、`server`、`runtime.mode`、`dual.kws`、`dual.capture`、`dual.native_interlock`。
+- **热生效（下一轮生效）**：`dialogue`、`realtime`（含 `volcengine_o2` / `smart_turn` / `daily_usage`）、`llm`、`agent`、`music`、`capture`、`tts`、`runtime.session_idle_timeout_s`、`mcp`、`dual.{enter_prompt,exit_prompt,*_earcon,session_timeout_s,exit_keywords}`（`AgentView` 原子替换配置与工具集，保留当前对话历史）。
+- **需重启（保持旧值并告警）**：`device`、`asr`、`airplay`、`server`、`runtime.mode`、`dual.kws`、`dual.capture`、`dual.native_interlock`、`dual.stop_key`。
 - **拒绝修改**：`runtime.speech_socket`。
-- YAML 语法错误时保留旧配置继续运行，绝不导致音箱失声。
+- YAML 语法错误时保留旧配置继续运行，绝不导致音箱失声；Web Control Console 通过 `SECRET_PATHS` 对 `api_key` / `access_key` / `volc_websearch_api_key` 等敏感字段统一脱敏并支持 `__REDACTED__` 原值回填。
 
-### 4.3 启动预检与 `xiaoai-agent doctor`
+### 4.3 启动预检、`doctor --probe-mic` 与 LX06 体积门禁
 
-- 启动时自动执行 `collect_startup_warnings`（仅告警不阻断启动），提前暴露空/占位 `api_key`、`llm.timeout_s < 10s`、`tts_command` 重复加单引号 `'{text}'`，以及 `dual` 模式下 `dual.kws.endpoint` 格式或采集参数越界问题。
-- 运行 `xiaoai-agent doctor -c <agent.yaml>` 可一键离线+在线自检：配置解析与预检告警、运行模式/Socket/PID 状态、`/tmp` 剩余空间，以及 ASR / LLM / 天气 / MCP；在 `dual` 模式下还会额外报告外部 KWS 服务 UDP RTT 连通性及 `native_interlock` 监听源配置与日志文件存在性。
+- 启动时自动执行 `collect_startup_warnings`（仅告警不阻断启动），提前暴露空/占位 `api_key`、`llm.timeout_s < 10s`、`tts_command` 重复加单引号 `'{text}'`、`dual.kws.endpoint`/采音通道越界、`realtime` 双鉴权配对与 `ws_url`、以及 `*_earcon` 口语池目录总大小 `> 300 KiB` 告警。
+- 运行 `xiaoai-agent doctor -c <agent.yaml>` 可一键离线+在线自检：配置解析与预检告警、`dialogue.engine` / `realtime.provider` 状态、Realtime WebSocket TLS/TCP 连通探针、`/tmp` 与 `/data`（`< 2 MiB` 告警）剩余空间，以及 ASR / LLM / 天气 / MCP；在 `dual` 模式下额外报告外部 KWS 服务 UDP RTT 连通性、`native_interlock` 监听源状态，并支持 `xiaoai-agent doctor --probe-mic` 实测 LX06 8 声道采音各通道 RMS 与 bit width。
+- **T-206 体积与依赖裁剪评估**：`Cargo.toml` 统一 `tokio-tungstenite = "0.28"` 消除了与 `rig-core 0.39.0` 的 `0.28/0.29` 双版本重复编译；提供可选 Cargo feature（默认全开 `exclusive,airplay,music`）。ARMv7 glibc 2.25（`cargo +1.96.0 zigbuild --release --target armv7-unknown-linux-gnueabihf.2.25`）实测全特性 Release ELF 为 **`8,704,440 B`（`8.30 MiB`）**，低于 `8.5 MiB`（`8,912,896 B`）门禁；若在空间紧张设备用 `--no-default-features` 裁剪 `airplay`（`shairplay`），ELF 降至 **`7,969,088 B`（`7.60 MiB`）**，净减 `735,352 B`（~`718 KiB`）。
