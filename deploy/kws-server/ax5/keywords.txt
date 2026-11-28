@@ -1,13 +1,7 @@
-d òu b āo d òu b āo @豆包豆包
-d òu b āo d òu b ao @豆包豆包
-d òu b ao d òu b āo @豆包豆包
-d òu b ao d òu b ao @豆包豆包
-d ou b āo d ou b āo @豆包豆包
-d ou b ao d ou b ao @豆包豆包
-d òu b ao d ou b ao @豆包豆包
-d ou b ao d òu b ao @豆包豆包
-d òu b āo òu b āo :3.5 #0.10 @豆包豆包
-d òu b āo d òu āo :3.5 #0.10 @豆包豆包
-d òu b āo t uì ch ū :2.5 #0.18 @__CMD_EXIT__
-d òu b āo t íng zh ǐ :2.5 #0.18 @__CMD_EXIT__
-d òu b āo b ì z uǐ :2.5 #0.18 @__CMD_EXIT__
+d òu b āo d òu b āo :1.5 #0.05 @豆包豆包
+b ì z uǐ #0.30 @__CMD_EXIT__
+b ié sh uō l e #0.30 @__CMD_EXIT__
+t íng x ià #0.30 @__CMD_EXIT__
+g uān b ì #0.30 @__CMD_EXIT__
+z ài j iàn #0.30 @__CMD_EXIT__
+t uì x ià #0.30 @__CMD_EXIT__

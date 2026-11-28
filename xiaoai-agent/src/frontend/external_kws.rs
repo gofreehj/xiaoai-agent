@@ -51,10 +51,14 @@ pub struct AudioChunk {
     pub sys_active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KwsUdpReply {
     Pong,
-    Wake { seq: u32, keyword: String },
+    Wake {
+        seq: u32,
+        keyword: String,
+        score: Option<f32>,
+    },
 }
 
 /// Encode an 8-byte XPCM packet: `"XPCM"` + `seq (u16 LE)` + `flags (u16 LE)` + `pcm`.
@@ -67,7 +71,8 @@ pub fn encode_xpcm_packet(seq: u16, flags: u16, pcm: &[u8]) -> Vec<u8> {
     pkt
 }
 
-/// Parse a UDP reply packet from an external KWS server (`XPONG\n` or `WAKE:<seq>:<kw>\n`).
+/// Parse a UDP reply packet from an external KWS server:
+/// `XPONG\n`, `WAKE:<seq>:<kw>\n`, or `WAKE:<seq>:<kw>:<score>\n`.
 pub fn parse_udp_reply(raw: &[u8]) -> Option<KwsUdpReply> {
     let text = std::str::from_utf8(raw).ok()?.trim_end_matches(['\r', '\n']);
     if text.starts_with("XPONG") {
@@ -77,24 +82,33 @@ pub fn parse_udp_reply(raw: &[u8]) -> Option<KwsUdpReply> {
         return Some(KwsUdpReply::Wake {
             seq: 0,
             keyword: "unknown".to_string(),
+            score: None,
         });
     }
     if let Some(rest) = text.strip_prefix("WAKE:") {
-        if let Some((seq_str, kw)) = rest.split_once(':') {
+        if let Some((seq_str, tail)) = rest.split_once(':') {
             let seq = seq_str.trim().parse::<u32>().unwrap_or(0);
-            let kw = kw.trim();
+            let (kw_raw, score) = match tail.rsplit_once(':') {
+                Some((kw_part, score_part)) => match score_part.trim().parse::<f32>() {
+                    Ok(v) if v.is_finite() => (kw_part.trim(), Some(v)),
+                    _ => (tail.trim(), None),
+                },
+                None => (tail.trim(), None),
+            };
             return Some(KwsUdpReply::Wake {
                 seq,
-                keyword: if kw.is_empty() {
+                keyword: if kw_raw.is_empty() {
                     "unknown".to_string()
                 } else {
-                    kw.to_string()
+                    kw_raw.to_string()
                 },
+                score,
             });
         }
         return Some(KwsUdpReply::Wake {
             seq: 0,
             keyword: rest.trim().to_string(),
+            score: None,
         });
     }
     None
@@ -152,18 +166,213 @@ async fn bind_matching_udp(target: SocketAddr) -> anyhow::Result<UdpSocket> {
     Ok(UdpSocket::bind(bind_addr).await?)
 }
 
+/// Maximum inter-mic cross-correlation lag in samples at 16 kHz (`±3` ≈ 6.4 cm mic spacing).
+const BEAMFORM_MAX_LAG: isize = 3;
+
+/// Delay-and-sum beamforming across aligned 16 kHz mono mic channels.
+///
+/// 1:1 port of `xiaoai-doubao/xiaoai-plus/src/app/app.cpp::DownmixToMono`:
+/// estimates per-channel integer delay relative to `channel_frames[0]` via
+/// cross-correlation within `[-max_lag, +max_lag]`, aligns, and averages.
+pub fn delay_and_sum_beamform(channel_frames: &[Vec<i16>], max_lag: isize) -> Vec<i16> {
+    let Some(ch0) = channel_frames.first() else {
+        return Vec::new();
+    };
+    let n = ch0.len();
+    if channel_frames.len() < 2 || n == 0 {
+        return ch0.clone();
+    }
+
+    let mut lags = vec![0isize; channel_frames.len()];
+    for (k, ch_k) in channel_frames.iter().enumerate().skip(1) {
+        let mut best_lag = 0isize;
+        let mut best_corr = i64::MIN;
+        for lag in -max_lag..=max_lag {
+            let t0 = (-lag).max(0) as usize;
+            let t1 = n.saturating_sub(lag.max(0) as usize);
+            let mut sum = 0i64;
+            for t in t0..t1 {
+                let idx_b = (t as isize + lag) as usize;
+                sum += (ch0[t] as i64) * (ch_k[idx_b] as i64);
+            }
+            if sum > best_corr {
+                best_corr = sum;
+                best_lag = lag;
+            }
+        }
+        lags[k] = best_lag;
+    }
+
+    let m = channel_frames.len() as i32;
+    let max_idx = (n - 1) as isize;
+    let mut out = Vec::with_capacity(n);
+    for t in 0..n {
+        let mut sum = ch0[t] as i32;
+        for (k, ch_k) in channel_frames.iter().enumerate().skip(1) {
+            let idx = (t as isize + lags[k]).clamp(0, max_idx) as usize;
+            sum += ch_k[idx] as i32;
+        }
+        out.push((sum / m).clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+    }
+    out
+}
+
+/// 10 ms smoothed RMS AGC for external KWS wake-word sensitivity.
+///
+/// 1:1 port of `xiaoai-doubao/xiaoai-plus/src/audio/kws_preprocess.cpp::KwsAgc`.
+/// Target RMS `-25 dBFS` (`0.0562`), gain clamped to `1.0..=15.85` with S16 saturation.
+/// MUST ONLY be applied to the UDP XPCM copy sent to external KWS — never to `AudioChunk::pcm`.
+#[derive(Debug, Clone)]
+pub struct KwsAgc {
+    envelope: f64,
+    gain: f64,
+}
+
+impl Default for KwsAgc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KwsAgc {
+    pub fn new() -> Self {
+        Self {
+            envelope: 0.0,
+            gain: 1.0,
+        }
+    }
+
+    pub fn process_i16(&mut self, samples: &mut [i16]) {
+        for block in samples.chunks_mut(160) {
+            let n = block.len() as f64;
+            let mut energy = 0.0_f64;
+            for &s in block.iter() {
+                let x = (s as f64) / 32768.0;
+                energy += x * x;
+            }
+            self.envelope = 0.9 * self.envelope + 0.1 * (energy / n);
+            let desired = (0.0562 / self.envelope.sqrt().max(1e-6)).clamp(1.0, 15.85);
+            self.gain = 0.9 * self.gain + 0.1 * desired;
+            for s in block.iter_mut() {
+                let amplified = (*s as f64) * self.gain;
+                *s = amplified.round().clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+    }
+
+    pub fn process_pcm_bytes(&mut self, pcm: &[u8]) -> Vec<u8> {
+        let mut samples: Vec<i16> = pcm
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        self.process_i16(&mut samples);
+        let mut out = Vec::with_capacity(pcm.len());
+        for s in samples {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        if pcm.len() % 2 == 1 {
+            out.push(*pcm.last().unwrap());
+        }
+        out
+    }
+}
+
+/// Per-channel raw S32_LE capture bit-width & signal level diagnostic.
+///
+/// 1:1 port of `xiaoai-doubao/xiaoai-plus/src/audio/kws_diagnostics.cpp::ObserveCaptureS32`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureChannelDiagnostic {
+    pub channel: usize,
+    pub samples: u64,
+    pub peak_abs: u32,
+    pub rms: f64,
+    pub outside_signed_24: u64,
+    pub low_byte_zero: u64,
+    pub full_scale_32: u64,
+    pub active: bool,
+    pub suggested_shift_bits: u8,
+}
+
+/// Inspect interleaved `S32_LE` raw capture bytes across `channels` (`1..=16`).
+#[allow(dead_code)]
+pub fn probe_capture_channels(
+    raw: &[u8],
+    channels: usize,
+) -> anyhow::Result<Vec<CaptureChannelDiagnostic>> {
+    anyhow::ensure!(
+        (1..=16).contains(&channels),
+        "capture channels must be 1..=16, got {channels}"
+    );
+    let frame_bytes = channels * 4;
+    let frames = raw.len() / frame_bytes;
+    let mut sum_sq = vec![0.0_f64; channels];
+    let mut stats: Vec<CaptureChannelDiagnostic> = (0..channels)
+        .map(|ch| CaptureChannelDiagnostic {
+            channel: ch,
+            samples: 0,
+            peak_abs: 0,
+            rms: 0.0,
+            outside_signed_24: 0,
+            low_byte_zero: 0,
+            full_scale_32: 0,
+            active: false,
+            suggested_shift_bits: 9,
+        })
+        .collect();
+
+    for f in 0..frames {
+        let base = f * frame_bytes;
+        for ch in 0..channels {
+            let off = base + ch * 4;
+            let sample = i32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
+            let mag = sample.unsigned_abs();
+            let dst = &mut stats[ch];
+            dst.samples += 1;
+            dst.peak_abs = dst.peak_abs.max(mag);
+            sum_sq[ch] += (sample as f64) * (sample as f64);
+            if !(-8_388_608..=8_388_607).contains(&sample) {
+                dst.outside_signed_24 += 1;
+            }
+            if (sample as u32 & 0xff) == 0 {
+                dst.low_byte_zero += 1;
+            }
+            if sample == i32::MIN || sample == i32::MAX {
+                dst.full_scale_32 += 1;
+            }
+        }
+    }
+
+    for (ch, dst) in stats.iter_mut().enumerate() {
+        if dst.samples > 0 {
+            dst.rms = (sum_sq[ch] / (dst.samples as f64)).sqrt();
+        }
+        dst.active = dst.peak_abs > 0;
+        dst.suggested_shift_bits = if dst.outside_signed_24 > 0 {
+            16
+        } else if dst.samples > 0 && dst.low_byte_zero == dst.samples {
+            8
+        } else {
+            9
+        };
+    }
+
+    Ok(stats)
+}
+
 /// Multi-channel ALSA raw PCM -> 16 kHz mono S16_LE downsampler + 1st-order HPF
-/// + soft-knee limiter + optional hardware DAC loopback activity detector.
+/// + soft-knee limiter + optional multi-mic Delay-and-Sum beamforming
+/// + optional hardware DAC loopback activity detector.
 #[derive(Debug, Clone)]
 pub struct PcmDownsampler {
     channels: usize,
-    mic_channel: usize,
+    mic_channels: Vec<usize>,
     ref_channel: Option<usize>,
     format: DualCaptureFormat,
     decim: usize,
     shift_bits: u8,
-    prev_x: f32,
-    prev_y: f32,
+    prev_x: Vec<f32>,
+    prev_y: Vec<f32>,
     ref_prev_x: f32,
     ref_prev_y: f32,
     sys_hangover: usize,
@@ -172,12 +381,26 @@ pub struct PcmDownsampler {
 impl PcmDownsampler {
     pub fn new(cfg: &DualCaptureConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(cfg.channels >= 1, "dual.capture.channels 必须 >= 1");
-        anyhow::ensure!(
-            cfg.mic_channel < cfg.channels,
-            "dual.capture.mic_channel ({}) 必须 < channels ({})",
-            cfg.mic_channel,
-            cfg.channels
-        );
+        let mic_channels: Vec<usize> = if cfg.mic_channels.is_empty() {
+            anyhow::ensure!(
+                cfg.mic_channel < cfg.channels,
+                "dual.capture.mic_channel ({}) 必须 < channels ({})",
+                cfg.mic_channel,
+                cfg.channels
+            );
+            vec![cfg.mic_channel as usize]
+        } else {
+            let mut resolved = Vec::with_capacity(cfg.mic_channels.len());
+            for &ch in &cfg.mic_channels {
+                anyhow::ensure!(
+                    ch < cfg.channels,
+                    "dual.capture.mic_channels 包含越界通道 ({ch})，必须 < channels ({})",
+                    cfg.channels
+                );
+                resolved.push(ch as usize);
+            }
+            resolved
+        };
         if let Some(ref_ch) = cfg.ref_channel {
             anyhow::ensure!(
                 ref_ch < cfg.channels,
@@ -191,15 +414,16 @@ impl PcmDownsampler {
             cfg.sample_rate,
             TARGET_SAMPLE_RATE
         );
+        let mic_count = mic_channels.len();
         Ok(Self {
             channels: cfg.channels as usize,
-            mic_channel: cfg.mic_channel as usize,
+            mic_channels,
             ref_channel: cfg.ref_channel.map(|c| c as usize),
             format: cfg.format,
             decim: (cfg.sample_rate / TARGET_SAMPLE_RATE) as usize,
             shift_bits: cfg.shift_bits,
-            prev_x: 0.0,
-            prev_y: 0.0,
+            prev_x: vec![0.0; mic_count],
+            prev_y: vec![0.0; mic_count],
             ref_prev_x: 0.0,
             ref_prev_y: 0.0,
             sys_hangover: 0,
@@ -230,6 +454,28 @@ impl PcmDownsampler {
         }
     }
 
+    #[inline]
+    fn condition_mic_sample(&mut self, slot: usize, mic_sum: i64, decim_i64: i64) -> i16 {
+        let avg = match self.format {
+            DualCaptureFormat::S32Le => ((mic_sum / decim_i64) >> self.shift_bits) as f32,
+            DualCaptureFormat::S16Le => (mic_sum / decim_i64) as f32,
+        };
+        let mut hp = avg - self.prev_x[slot] + 0.985 * self.prev_y[slot];
+        self.prev_x[slot] = avg;
+        self.prev_y[slot] = hp;
+
+        if matches!(self.format, DualCaptureFormat::S32Le) {
+            if hp > 24_576.0 {
+                hp = 24_576.0 + (hp - 24_576.0) / (1.0 + (hp - 24_576.0) / 8191.0);
+            } else if hp < -24_576.0 {
+                hp = -24_576.0 + (hp + 24_576.0) / (1.0 - (hp + 24_576.0) / 8191.0);
+            }
+        }
+
+        let rounded = if hp >= 0.0 { hp + 0.5 } else { hp - 0.5 } as i32;
+        rounded.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+    }
+
     /// Downsample one `raw_bytes_per_chunk()` buffer into a 40ms 16 kHz mono [`AudioChunk`].
     pub fn process_raw(&mut self, raw: &[u8]) -> AudioChunk {
         debug_assert_eq!(raw.len(), self.raw_bytes_per_chunk());
@@ -237,56 +483,85 @@ impl PcmDownsampler {
         let frame_bytes = self.channels * bps;
         let step_stride = self.decim * frame_bytes;
         let decim_i64 = self.decim as i64;
-        let mut out = Vec::with_capacity(PCM_BYTES);
+        let mic_count = self.mic_channels.len();
         let mut ref_sq_sum = 0.0f64;
 
-        for i in 0..STEP_SAMPLES {
-            let base = i * step_stride;
-            let mut mic_sum = 0i64;
-            let mut ref_sum = 0i64;
+        let out: Vec<u8> = if mic_count == 1 {
+            let mic_ch = self.mic_channels[0];
+            let mut buf = Vec::with_capacity(PCM_BYTES);
+            for i in 0..STEP_SAMPLES {
+                let base = i * step_stride;
+                let mut mic_sum = 0i64;
+                let mut ref_sum = 0i64;
 
-            for k in 0..self.decim {
-                let frame_off = base + k * frame_bytes;
-                let mic_off = frame_off + self.mic_channel * bps;
-                mic_sum += self.read_sample(raw, mic_off) as i64;
+                for k in 0..self.decim {
+                    let frame_off = base + k * frame_bytes;
+                    mic_sum += self.read_sample(raw, frame_off + mic_ch * bps) as i64;
+                    if let Some(ref_ch) = self.ref_channel {
+                        ref_sum += self.read_sample(raw, frame_off + ref_ch * bps) as i64;
+                    }
+                }
 
-                if let Some(ref_ch) = self.ref_channel {
-                    let ref_off = frame_off + ref_ch * bps;
-                    ref_sum += self.read_sample(raw, ref_off) as i64;
+                if self.ref_channel.is_some() {
+                    let ref_avg = match self.format {
+                        DualCaptureFormat::S32Le => ((ref_sum / decim_i64) >> self.shift_bits) as f32,
+                        DualCaptureFormat::S16Le => (ref_sum / decim_i64) as f32,
+                    };
+                    let ref_hp = ref_avg - self.ref_prev_x + 0.985 * self.ref_prev_y;
+                    self.ref_prev_x = ref_avg;
+                    self.ref_prev_y = ref_hp;
+                    ref_sq_sum += (ref_hp as f64) * (ref_hp as f64);
+                }
+
+                let sample = self.condition_mic_sample(0, mic_sum, decim_i64);
+                buf.extend_from_slice(&sample.to_le_bytes());
+            }
+            buf
+        } else {
+            let mut per_mic: Vec<Vec<i16>> = (0..mic_count)
+                .map(|_| Vec::with_capacity(STEP_SAMPLES))
+                .collect();
+            let mut mic_sums = vec![0i64; mic_count];
+
+            for i in 0..STEP_SAMPLES {
+                let base = i * step_stride;
+                mic_sums.fill(0);
+                let mut ref_sum = 0i64;
+
+                for k in 0..self.decim {
+                    let frame_off = base + k * frame_bytes;
+                    for (slot, &mic_ch) in self.mic_channels.iter().enumerate() {
+                        mic_sums[slot] += self.read_sample(raw, frame_off + mic_ch * bps) as i64;
+                    }
+                    if let Some(ref_ch) = self.ref_channel {
+                        ref_sum += self.read_sample(raw, frame_off + ref_ch * bps) as i64;
+                    }
+                }
+
+                if self.ref_channel.is_some() {
+                    let ref_avg = match self.format {
+                        DualCaptureFormat::S32Le => ((ref_sum / decim_i64) >> self.shift_bits) as f32,
+                        DualCaptureFormat::S16Le => (ref_sum / decim_i64) as f32,
+                    };
+                    let ref_hp = ref_avg - self.ref_prev_x + 0.985 * self.ref_prev_y;
+                    self.ref_prev_x = ref_avg;
+                    self.ref_prev_y = ref_hp;
+                    ref_sq_sum += (ref_hp as f64) * (ref_hp as f64);
+                }
+
+                for slot in 0..mic_count {
+                    let sample = self.condition_mic_sample(slot, mic_sums[slot], decim_i64);
+                    per_mic[slot].push(sample);
                 }
             }
 
-            if self.ref_channel.is_some() {
-                let ref_avg = match self.format {
-                    DualCaptureFormat::S32Le => ((ref_sum / decim_i64) >> self.shift_bits) as f32,
-                    DualCaptureFormat::S16Le => (ref_sum / decim_i64) as f32,
-                };
-                let ref_hp = ref_avg - self.ref_prev_x + 0.985 * self.ref_prev_y;
-                self.ref_prev_x = ref_avg;
-                self.ref_prev_y = ref_hp;
-                ref_sq_sum += (ref_hp as f64) * (ref_hp as f64);
+            let mono = delay_and_sum_beamform(&per_mic, BEAMFORM_MAX_LAG);
+            let mut buf = Vec::with_capacity(PCM_BYTES);
+            for s in mono {
+                buf.extend_from_slice(&s.to_le_bytes());
             }
-
-            let avg = match self.format {
-                DualCaptureFormat::S32Le => ((mic_sum / decim_i64) >> self.shift_bits) as f32,
-                DualCaptureFormat::S16Le => (mic_sum / decim_i64) as f32,
-            };
-            let mut hp = avg - self.prev_x + 0.985 * self.prev_y;
-            self.prev_x = avg;
-            self.prev_y = hp;
-
-            if matches!(self.format, DualCaptureFormat::S32Le) {
-                if hp > 24_576.0 {
-                    hp = 24_576.0 + (hp - 24_576.0) / (1.0 + (hp - 24_576.0) / 8191.0);
-                } else if hp < -24_576.0 {
-                    hp = -24_576.0 + (hp + 24_576.0) / (1.0 - (hp + 24_576.0) / 8191.0);
-                }
-            }
-
-            let rounded = if hp >= 0.0 { hp + 0.5 } else { hp - 0.5 } as i32;
-            let sample = rounded.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            out.extend_from_slice(&sample.to_le_bytes());
-        }
+            buf
+        };
 
         let sys_active = if self.ref_channel.is_some() {
             if (ref_sq_sum / STEP_SAMPLES as f64) >= SYS_REF_MEAN_SQ_THR {
@@ -410,7 +685,14 @@ impl ExternalKwsEngine {
         let _ = resolve_endpoint(&cfg.kws.endpoint).await?;
         let capture_task = spawn_alsa_capture_worker(cfg.capture.clone(), audio_tx)?;
         let ping_interval = Duration::from_secs(cfg.kws.ping_interval_s.max(5));
-        match Self::spawn_with_audio_rx(&cfg.kws.endpoint, ping_interval, audio_rx).await {
+        match Self::spawn_with_audio_rx_and_agc(
+            &cfg.kws.endpoint,
+            ping_interval,
+            audio_rx,
+            cfg.capture.kws_agc_enabled,
+        )
+        .await
+        {
             Ok(mut handle) => {
                 handle.capture_task = Some(capture_task);
                 Ok(handle)
@@ -426,7 +708,17 @@ impl ExternalKwsEngine {
     pub async fn spawn_with_audio_rx(
         endpoint: &str,
         ping_interval: Duration,
+        audio_rx: mpsc::Receiver<AudioChunk>,
+    ) -> anyhow::Result<ExternalKwsHandle> {
+        Self::spawn_with_audio_rx_and_agc(endpoint, ping_interval, audio_rx, false).await
+    }
+
+    /// Start UDP XPCM engine with explicit `kws_agc_enabled` toggle.
+    pub async fn spawn_with_audio_rx_and_agc(
+        endpoint: &str,
+        ping_interval: Duration,
         mut audio_rx: mpsc::Receiver<AudioChunk>,
+        kws_agc_enabled: bool,
     ) -> anyhow::Result<ExternalKwsHandle> {
         let target_addr = resolve_endpoint(endpoint).await?;
         let udp = bind_matching_udp(target_addr).await?;
@@ -434,6 +726,7 @@ impl ExternalKwsEngine {
         info!(
             endpoint = %target_addr,
             local_udp_port = local_port,
+            kws_agc_enabled,
             "外部 KWS UDP XPCM 客户端已启动"
         );
 
@@ -454,6 +747,7 @@ impl ExternalKwsEngine {
             let mut last_rx_at = Instant::now();
             let mut last_timeout_warn: Option<Instant> = None;
             let mut udp_buf = [0u8; 1024];
+            let mut kws_agc = KwsAgc::new();
 
             let mut ping_ticker = interval(ping_interval);
             ping_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -477,12 +771,18 @@ impl ExternalKwsEngine {
                             if ring.len() == RING_CAP {
                                 ring.pop_front();
                             }
+                            // Preserve untouched raw/beamformed PCM in ring for oneshot/ASR/Realtime.
                             ring.push_back(chunk.clone());
                             ring_total += 1;
                             seq = seq.wrapping_add(1);
                             let flags = XPCM_FLAG_PCM
                                 | if chunk.sys_active { XPCM_FLAG_SYS_ACTIVE } else { 0 };
-                            let pkt = encode_xpcm_packet(seq, flags, &chunk.pcm);
+                            let pkt = if kws_agc_enabled {
+                                let boosted = kws_agc.process_pcm_bytes(&chunk.pcm);
+                                encode_xpcm_packet(seq, flags, &boosted)
+                            } else {
+                                encode_xpcm_packet(seq, flags, &chunk.pcm)
+                            };
                             let _ = udp.send_to(&pkt, target_addr).await;
                         }
                     }
@@ -496,7 +796,7 @@ impl ExternalKwsEngine {
                                         KwsUdpReply::Pong => {
                                             debug!(endpoint = %target_addr, "收到外部 KWS XPONG 心跳响应");
                                         }
-                                        KwsUdpReply::Wake { seq: wake_seq, keyword } => {
+                                        KwsUdpReply::Wake { seq: wake_seq, keyword, score } => {
                                             let now = Instant::now();
                                             let is_dup = if wake_seq > 0 {
                                                 wake_seq == last_wake_seq
@@ -518,6 +818,7 @@ impl ExternalKwsEngine {
                                             info!(
                                                 seq = wake_seq,
                                                 keyword = %keyword,
+                                                ?score,
                                                 ?signal,
                                                 "收到外部 KWS 唤醒通知"
                                             );
@@ -938,7 +1239,16 @@ mod tests {
             parse_udp_reply("WAKE:7:豆包豆包\r\n".as_bytes()),
             Some(KwsUdpReply::Wake {
                 seq: 7,
-                keyword: "豆包豆包".to_string()
+                keyword: "豆包豆包".to_string(),
+                score: None,
+            })
+        );
+        assert_eq!(
+            parse_udp_reply("WAKE:8:__CMD_EXIT__:0.625\n".as_bytes()),
+            Some(KwsUdpReply::Wake {
+                seq: 8,
+                keyword: "__CMD_EXIT__".to_string(),
+                score: Some(0.625),
             })
         );
         assert_eq!(parse_wake_signal("豆包豆包"), BargeInSignal::Wake);
@@ -986,8 +1296,11 @@ mod tests {
             channels: 1,
             format: DualCaptureFormat::S16Le,
             mic_channel: 0,
+            mic_channels: Vec::new(),
             ref_channel: None,
             shift_bits: 0,
+            kws_agc_enabled: false,
+            exit_playback_threshold: 0.45,
         };
         let mut ds = PcmDownsampler::new(&cfg).unwrap();
         assert_eq!(ds.raw_bytes_per_chunk(), PCM_BYTES);
@@ -996,6 +1309,185 @@ mod tests {
         let chunk = ds.process_raw(&raw);
         assert_eq!(chunk.pcm.len(), PCM_BYTES);
         assert!(!chunk.sys_active);
+    }
+
+    #[test]
+    fn pcm_downsampler_multi_mic_beamforming_aligns_delayed_channels() {
+        // 4 kHz tone at 16 kHz has period = 4 samples -> a 2-sample delay is 180° out of phase!
+        // Naive summing cancels to ~0; Delay-and-Sum beamforming with ±3 lag aligns and preserves amplitude.
+        let cfg = DualCaptureConfig {
+            device: "default".into(),
+            sample_rate: 16_000,
+            channels: 3,
+            format: DualCaptureFormat::S16Le,
+            mic_channel: 0,
+            mic_channels: vec![0, 1, 2],
+            ref_channel: None,
+            shift_bits: 0,
+            kws_agc_enabled: false,
+            exit_playback_threshold: 0.45,
+        };
+        let mut ds = PcmDownsampler::new(&cfg).unwrap();
+        let mut raw = Vec::with_capacity(ds.raw_bytes_per_chunk());
+        let wave = |idx: isize| -> i16 {
+            let phase = (idx as f64) * std::f64::consts::FRAC_PI_2;
+            (phase.sin() * 10_000.0).round() as i16
+        };
+        for t in 0..STEP_SAMPLES as isize {
+            let ch0 = wave(t);
+            let ch1 = wave(t - 2); // 2-sample delay (anti-phase without alignment)
+            let ch2 = wave(t - 2); // 2-sample delay (anti-phase without alignment)
+            raw.extend_from_slice(&ch0.to_le_bytes());
+            raw.extend_from_slice(&ch1.to_le_bytes());
+            raw.extend_from_slice(&ch2.to_le_bytes());
+        }
+
+        let chunk = ds.process_raw(&raw);
+        let rms = {
+            let mut sq = 0.0_f64;
+            let samples: Vec<i16> = chunk
+                .pcm
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            for &s in &samples[32..] {
+                sq += (s as f64) * (s as f64);
+            }
+            (sq / (samples.len() - 32) as f64).sqrt()
+        };
+        // Aligned 3-mic sum retains full ~7071 RMS; unaligned (ch0 - ch1 - ch2)/3 drops to ~2357 RMS.
+        assert!(
+            rms > 6000.0,
+            "beamformed 2-sample delayed multi-mic RMS should stay high (>6000), got {rms:.1}"
+        );
+    }
+
+    #[test]
+    fn kws_agc_boosts_weak_signal_saturates_loud_and_keeps_audio_chunk_untouched() {
+        // 1. Weak signal (~300 amplitude) should be amplified toward target -25 dBFS (~1840 RMS).
+        let mut agc = KwsAgc::new();
+        let mut weak = vec![0i16; 160 * 20];
+        for (i, s) in weak.iter_mut().enumerate() {
+            *s = (((i as f64) * 0.25).sin() * 300.0) as i16;
+        }
+        let orig_weak = weak.clone();
+        agc.process_i16(&mut weak);
+        let tail_rms = {
+            let tail = &weak[160 * 15..];
+            let sq: f64 = tail.iter().map(|&s| (s as f64) * (s as f64)).sum();
+            (sq / tail.len() as f64).sqrt()
+        };
+        assert!(
+            tail_rms > 1000.0,
+            "KwsAgc should amplify weak signal toward -25 dBFS, got rms={tail_rms:.1}"
+        );
+
+        // 2. Sudden loud transient must saturate cleanly without S16 wrap-around.
+        let mut loud = vec![20_000i16; 160];
+        agc.process_i16(&mut loud);
+        assert!(
+            loud.iter().all(|&s| s > 0),
+            "loud positive transient must saturate to positive i16::MAX, never wrap negative"
+        );
+
+        // 3. process_pcm_bytes leaves original slice untouched.
+        let orig_bytes: Vec<u8> = orig_weak.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut agc2 = KwsAgc::new();
+        let boosted_bytes = agc2.process_pcm_bytes(&orig_bytes);
+        assert_eq!(boosted_bytes.len(), orig_bytes.len());
+        assert_ne!(boosted_bytes, orig_bytes);
+    }
+
+    #[test]
+    fn probe_capture_channels_reports_s32_metrics() {
+        // 2 channels, 4 frames of S32_LE:
+        // ch0: 24-bit left-shifted by 8 (low_byte_zero=4, outside_signed_24=4)
+        // ch1: silent (peak_abs=0, active=false)
+        let mut raw = Vec::new();
+        let ch0_vals = [1000i32 << 16, -2000i32 << 16, i32::MAX, -1000i32 << 16];
+        for &v in &ch0_vals {
+            raw.extend_from_slice(&v.to_le_bytes());
+            raw.extend_from_slice(&0i32.to_le_bytes());
+        }
+        let report = probe_capture_channels(&raw, 2).unwrap();
+        assert_eq!(report.len(), 2);
+        assert!(report[0].active);
+        assert_eq!(report[0].samples, 4);
+        assert_eq!(report[0].outside_signed_24, 4);
+        assert_eq!(report[0].low_byte_zero, 3); // i32::MAX has low byte 0xff
+        assert_eq!(report[0].full_scale_32, 1);
+        assert_eq!(report[0].suggested_shift_bits, 16);
+
+        assert!(!report[1].active);
+        assert_eq!(report[1].peak_abs, 0);
+        assert_eq!(report[1].rms, 0.0);
+    }
+
+    #[tokio::test]
+    async fn kws_agc_never_pollutes_replayed_audio_chunk_pcm() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (audio_tx, audio_rx) = mpsc::channel(16);
+        let mut handle = ExternalKwsEngine::spawn_with_audio_rx_and_agc(
+            &addr.to_string(),
+            Duration::from_secs(30),
+            audio_rx,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let raw_chunk = {
+            let mut buf = Vec::with_capacity(PCM_BYTES);
+            for i in 0..STEP_SAMPLES {
+                let v = (((i as f64) * 0.2).sin() * 200.0) as i16;
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            AudioChunk {
+                pcm: Bytes::from(buf),
+                sys_active: false,
+            }
+        };
+        let expected_pcm = raw_chunk.pcm.clone();
+
+        let srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let mut saw_boosted = false;
+            for _ in 0..16 {
+                let Ok(Ok((n, peer))) = timeout(Duration::from_secs(2), server.recv_from(&mut buf)).await
+                else {
+                    break;
+                };
+                if n > XPCM_HDR_LEN && &buf[..4] == b"XPCM" {
+                    let flags = u16::from_le_bytes([buf[6], buf[7]]);
+                    if (flags & 0x00FF) == XPCM_FLAG_PCM {
+                        if &buf[XPCM_HDR_LEN..n] != expected_pcm.as_ref() {
+                            saw_boosted = true;
+                        }
+                        let _ = server.send_to("WAKE:1:豆包豆包:0.85\n".as_bytes(), peer).await;
+                        break;
+                    }
+                }
+            }
+            assert!(saw_boosted, "UDP KWS packet should carry AGC-boosted PCM");
+        });
+
+        for _ in 0..6 {
+            audio_tx.send(raw_chunk.clone()).await.unwrap();
+        }
+        assert_eq!(handle.next_wake().await.unwrap(), BargeInSignal::Wake);
+        handle.start_oneshot_stream().await.unwrap();
+        let mut rx = handle.active_rx.take().unwrap();
+        let replayed = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            replayed.pcm, raw_chunk.pcm,
+            "AudioChunk::pcm replayed for ASR/Realtime must be 100% identical to pre-AGC PCM"
+        );
+        srv_task.await.unwrap();
     }
 
     #[tokio::test]

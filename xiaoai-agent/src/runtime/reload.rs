@@ -38,6 +38,9 @@ pub fn keep_pending_sections(
             "dual.native_interlock" => {
                 effective.dual.native_interlock = current.dual.native_interlock.clone();
             }
+            "dual.stop_key" => {
+                effective.dual.stop_key = current.dual.stop_key.clone();
+            }
             other => error!(
                 section = other,
                 "未知的待生效配置段：没有回填逻辑，句柄里会是新值（与实际运行值不一致）"
@@ -304,5 +307,44 @@ mod tests {
         assert_eq!(effective.dual.capture.channels, 8);
         assert_eq!(effective.dual.native_interlock.cooldown_s, 5);
         assert_eq!(effective.dual.enter_prompt, "请吩咐");
+    }
+
+    #[test]
+    fn keep_pending_sections_rolls_back_dual_stop_key_while_applying_dialogue_and_realtime() {
+        let current = AppConfig::default();
+        assert_eq!(current.dialogue.engine, crate::config::DialogueEngine::Cascade);
+        assert_eq!(current.dual.stop_key.key_code, -1);
+
+        let mut next = current.clone();
+        next.dialogue.engine = crate::config::DialogueEngine::Realtime;
+        next.realtime.volcengine_o2.bot_name = "小助手".to_string();
+        next.realtime.volcengine_o2.enable_volc_websearch = false;
+        next.dual.stop_key.device = "/dev/input/event0".to_string();
+        next.dual.stop_key.key_code = 164;
+
+        let next = Arc::new(next);
+        let changes = classify_config_change(&current, &next);
+        assert!(changes.applied.contains(&"dialogue"));
+        assert!(changes.applied.contains(&"realtime"));
+        assert!(changes.needs_restart.contains(&"dual.stop_key"));
+
+        let effective = keep_pending_sections(&current, &next, &changes);
+        assert_eq!(
+            effective.dialogue.engine,
+            crate::config::DialogueEngine::Realtime,
+            "dialogue must hot-apply"
+        );
+        assert_eq!(
+            effective.realtime.volcengine_o2.bot_name, "小助手",
+            "realtime must hot-apply"
+        );
+        assert_eq!(
+            effective.dual.stop_key.device, "",
+            "dual.stop_key is restart-only and must roll back to old value"
+        );
+        assert_eq!(
+            effective.dual.stop_key.key_code, -1,
+            "dual.stop_key.key_code must roll back to old value"
+        );
     }
 }

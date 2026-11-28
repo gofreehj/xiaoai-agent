@@ -14,6 +14,7 @@ mod frontend;
 mod mcp;
 mod mcp_legacy_sse;
 mod music;
+mod realtime;
 mod runtime;
 mod server;
 mod session;

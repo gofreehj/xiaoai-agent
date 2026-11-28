@@ -31,6 +31,8 @@ typedef const SherpaOnnxKeywordSpotter *(*fn_CreateKeywordSpotter)(
 typedef void (*fn_DestroyKeywordSpotter)(const SherpaOnnxKeywordSpotter *);
 typedef const SherpaOnnxOnlineStream *(*fn_CreateKeywordStream)(
     const SherpaOnnxKeywordSpotter *);
+typedef const SherpaOnnxOnlineStream *(*fn_CreateKeywordStreamWithKeywords)(
+    const SherpaOnnxKeywordSpotter *, const char *);
 typedef void (*fn_DestroyOnlineStream)(const SherpaOnnxOnlineStream *);
 typedef void (*fn_AcceptWaveform)(const SherpaOnnxOnlineStream *, int32_t,
                                   const float *, int32_t);
@@ -49,6 +51,7 @@ static struct {
   fn_CreateKeywordSpotter CreateKeywordSpotter;
   fn_DestroyKeywordSpotter DestroyKeywordSpotter;
   fn_CreateKeywordStream CreateKeywordStream;
+  fn_CreateKeywordStreamWithKeywords CreateKeywordStreamWithKeywords;
   fn_DestroyOnlineStream DestroyOnlineStream;
   fn_AcceptWaveform AcceptWaveform;
   fn_IsKeywordStreamReady IsKeywordStreamReady;
@@ -76,6 +79,8 @@ static int load_sherpa_api(const char *so_path) {
   LOAD_SYM(CreateKeywordSpotter, "SherpaOnnxCreateKeywordSpotter");
   LOAD_SYM(DestroyKeywordSpotter, "SherpaOnnxDestroyKeywordSpotter");
   LOAD_SYM(CreateKeywordStream, "SherpaOnnxCreateKeywordStream");
+  *(void **)(&g_api.CreateKeywordStreamWithKeywords) =
+      dlsym(g_api.handle, "SherpaOnnxCreateKeywordStreamWithKeywords");
   LOAD_SYM(DestroyOnlineStream, "SherpaOnnxDestroyOnlineStream");
   LOAD_SYM(AcceptWaveform, "SherpaOnnxOnlineStreamAcceptWaveform");
   LOAD_SYM(IsKeywordStreamReady, "SherpaOnnxIsKeywordStreamReady");
@@ -98,6 +103,7 @@ static int load_sherpa_api(const char *so_path) {
 #define XPCM_FLAG_RESET 2
 #define XPCM_FLAG_PING 3
 #define XPCM_FLAG_SYS_ACTIVE 0x0100
+#define XPCM_FLAG_EXIT_WORDS 0x0200
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -122,8 +128,9 @@ static void usage(const char *prog) {
           "  --keywords-file PATH       Path to keywords.txt\n"
           "  --sherpa-lib PATH          Path to libsherpa-onnx-c-api.so (default: libsherpa-onnx-c-api.so)\n"
           "  --num-threads N            ONNX threads (default: 2)\n"
-          "  --keywords-score F         Keywords bonus score (default: 1.0)\n"
-          "  --keywords-threshold F     Detection threshold (default: 0.25)\n"
+          "  --num-trailing-blanks N    Trailing blanks after keyword (default: 0)\n"
+          "  --keywords-score F         Keywords bonus score (default: 1.5)\n"
+          "  --keywords-threshold F     Detection threshold (default: 0.05)\n"
           "  --listen-port PORT         UDP listen port for PCM (default: 5005)\n"
           "  --wake-port PORT           Optional fixed UDP target port (default: 0 = reply to sender port)\n"
           "  --speaker-ip IP            Optional fixed speaker IP (default: auto-learn)\n"
@@ -132,6 +139,73 @@ static void usage(const char *prog) {
           "  --hangover-ms MS           Active hangover after energy drops (default: 2500)\n"
           "  --stats-sec N              Log RMS/decode stats every N sec, 0=off (default: 0)\n",
           prog);
+}
+
+/* Extract numeric "score" field from sherpa-onnx result JSON, if present. */
+static int extract_json_score(const char *json, float *out_score) {
+  if (!json || !out_score) return 0;
+  const char *p = strstr(json, "\"score\"");
+  if (!p) return 0;
+  p = strchr(p + 7, ':');
+  if (!p) return 0;
+  p++;
+  while (*p == ' ' || *p == '\t') p++;
+  char *end = NULL;
+  float v = strtof(p, &end);
+  if (end == p || !isfinite(v)) return 0;
+  *out_score = v;
+  return 1;
+}
+
+/* Split keywords.txt into standby wake-only file and slash-separated exit words. */
+static int split_keywords_file(const char *src_path, const char *wake_out_path,
+                               char *exit_buf, size_t exit_buf_sz,
+                               int *wake_count, int *exit_count) {
+  FILE *in = fopen(src_path, "r");
+  if (!in) return -1;
+  FILE *out = fopen(wake_out_path, "w");
+  if (!out) {
+    fclose(in);
+    return -1;
+  }
+  if (exit_buf && exit_buf_sz > 0) exit_buf[0] = '\0';
+  size_t exit_len = 0;
+  int wc = 0, ec = 0;
+  char line[512];
+  while (fgets(line, sizeof(line), in)) {
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' ||
+                       line[len - 1] == ' ' || line[len - 1] == '\t')) {
+      line[--len] = '\0';
+    }
+    char *s = line;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0' || *s == '#' || *s == ';') continue;
+
+    const char *at = strrchr(s, '@');
+    int is_exit = (at != NULL && strcmp(at + 1, "__CMD_EXIT__") == 0);
+    if (is_exit) {
+      if (exit_buf && exit_buf_sz > 0) {
+        size_t slen = strlen(s);
+        size_t need = (exit_len > 0 ? 1 : 0) + slen + 1;
+        if (exit_len + need <= exit_buf_sz) {
+          if (exit_len > 0) exit_buf[exit_len++] = '/';
+          memcpy(exit_buf + exit_len, s, slen);
+          exit_len += slen;
+          exit_buf[exit_len] = '\0';
+        }
+      }
+      ec++;
+    } else {
+      fprintf(out, "%s\n", s);
+      wc++;
+    }
+  }
+  fclose(out);
+  fclose(in);
+  if (wake_count) *wake_count = wc;
+  if (exit_count) *exit_count = ec;
+  return wc > 0 ? 0 : -1;
 }
 
 static int parse_flag_str(int *i, int argc, char **argv, const char *name,
@@ -192,8 +266,15 @@ static void feed_and_decode(const SherpaOnnxKeywordSpotter *kws,
               dst.sin_port = htons(wake_port);
             }
             char msg[256];
-            int mlen = snprintf(msg, sizeof(msg), "WAKE:%u:%s\n",
-                                *wake_seq, r->keyword);
+            float score = 0.0f;
+            int mlen;
+            if (extract_json_score(r->json, &score)) {
+              mlen = snprintf(msg, sizeof(msg), "WAKE:%u:%s:%.4f\n",
+                              *wake_seq, r->keyword, score);
+            } else {
+              mlen = snprintf(msg, sizeof(msg), "WAKE:%u:%s\n",
+                              *wake_seq, r->keyword);
+            }
             if (mlen > 0 && (size_t)mlen < sizeof(msg)) {
               sendto(sock, msg, (size_t)mlen, 0,
                      (const struct sockaddr *)&dst, sizeof(dst));
@@ -228,8 +309,9 @@ int main(int argc, char **argv) {
 
   int num_threads = 2;
   int max_active_paths = 12;
-  float keywords_score = 1.0f;
-  float keywords_threshold = 0.25f;
+  int num_trailing_blanks = 0;
+  float keywords_score = 1.5f;
+  float keywords_threshold = 0.05f;
   int listen_port = 5005;
   int wake_port = 0; /* 0 = reply directly to sender's UDP source port */
   int cooldown_ms = 2000;
@@ -252,6 +334,8 @@ int main(int argc, char **argv) {
       num_threads = atoi(val);
     } else if (parse_flag_str(&i, argc, argv, "--max-active-paths", &val)) {
       max_active_paths = atoi(val);
+    } else if (parse_flag_str(&i, argc, argv, "--num-trailing-blanks", &val)) {
+      num_trailing_blanks = atoi(val);
     } else if (parse_flag_str(&i, argc, argv, "--keywords-score", &val)) {
       keywords_score = strtof(val, NULL);
     } else if (parse_flag_str(&i, argc, argv, "--keywords-threshold", &val)) {
@@ -294,6 +378,29 @@ int main(int argc, char **argv) {
           keywords_score, vad_rms);
   fflush(stdout);
 
+  if (load_sherpa_api(sherpa_lib) != 0) {
+    return 1;
+  }
+
+  char exit_keywords_buf[2048];
+  exit_keywords_buf[0] = '\0';
+  const char *wake_only_path = "/tmp/ax5-kws-wake-only.txt";
+  int wake_kw_count = 0, exit_kw_count = 0;
+  int has_split_exit = 0;
+  const char *effective_keywords_file = keywords_file;
+  if (g_api.CreateKeywordStreamWithKeywords != NULL &&
+      split_keywords_file(keywords_file, wake_only_path, exit_keywords_buf,
+                          sizeof(exit_keywords_buf), &wake_kw_count,
+                          &exit_kw_count) == 0 &&
+      exit_kw_count > 0) {
+    effective_keywords_file = wake_only_path;
+    has_split_exit = 1;
+    fprintf(stdout,
+            "[KWS] Separated %d wake keyword(s) and %d session-only exit keyword(s)\n",
+            wake_kw_count, exit_kw_count);
+    fflush(stdout);
+  }
+
   SherpaOnnxKeywordSpotterConfig config;
   memset(&config, 0, sizeof(config));
   config.feat_config.sample_rate = SAMPLE_RATE;
@@ -306,27 +413,35 @@ int main(int argc, char **argv) {
   config.model_config.provider = "cpu";
   config.model_config.modeling_unit = "cjkchar";
   config.max_active_paths = max_active_paths > 0 ? max_active_paths : 12;
-  config.num_trailing_blanks = 0;
+  config.num_trailing_blanks = num_trailing_blanks >= 0 ? num_trailing_blanks : 0;
   config.keywords_score = keywords_score;
   config.keywords_threshold = keywords_threshold;
-  config.keywords_file = keywords_file;
-
-  if (load_sherpa_api(sherpa_lib) != 0) {
-    return 1;
-  }
+  config.keywords_file = effective_keywords_file;
 
   uint64_t t0 = monotonic_ms();
   const SherpaOnnxKeywordSpotter *kws = g_api.CreateKeywordSpotter(&config);
+  if (has_split_exit) {
+    unlink(wake_only_path);
+  }
   if (!kws) {
     fprintf(stderr, "Failed to create SherpaOnnxKeywordSpotter!\n");
     return 1;
   }
-  const SherpaOnnxOnlineStream *stream = g_api.CreateKeywordStream(kws);
-  if (!stream) {
+  const SherpaOnnxOnlineStream *standby_stream = g_api.CreateKeywordStream(kws);
+  if (!standby_stream) {
     fprintf(stderr, "Failed to create SherpaOnnxOnlineStream!\n");
     g_api.DestroyKeywordSpotter(kws);
     return 1;
   }
+  const SherpaOnnxOnlineStream *session_stream = NULL;
+  if (has_split_exit && exit_keywords_buf[0] != '\0') {
+    session_stream =
+        g_api.CreateKeywordStreamWithKeywords(kws, exit_keywords_buf);
+    if (!session_stream) {
+      fprintf(stderr, "[KWS] Warning: failed to create exit-keyword stream, using standby stream\n");
+    }
+  }
+  const SherpaOnnxOnlineStream *stream = standby_stream;
   fprintf(stdout, "[KWS] Model loaded in %llu ms, ready!\n",
           (unsigned long long)(monotonic_ms() - t0));
   fflush(stdout);
@@ -460,6 +575,15 @@ int main(int argc, char **argv) {
 
     uint16_t base_flags = flags & 0x00FF;
     int sys_active = (flags & XPCM_FLAG_SYS_ACTIVE) != 0;
+    int want_exit_words = (flags & XPCM_FLAG_EXIT_WORDS) != 0;
+    if (session_stream != NULL) {
+      const SherpaOnnxOnlineStream *desired =
+          want_exit_words ? session_stream : standby_stream;
+      if (desired != stream) {
+        g_api.ResetKeywordStream(kws, desired);
+        stream = desired;
+      }
+    }
     if (sys_active) {
       last_sys_active_ms = monotonic_ms();
     }
@@ -579,7 +703,8 @@ int main(int argc, char **argv) {
 
   fprintf(stdout, "[KWS] Shutting down...\n");
   close(sock);
-  g_api.DestroyOnlineStream(stream);
+  if (session_stream) g_api.DestroyOnlineStream(session_stream);
+  g_api.DestroyOnlineStream(standby_stream);
   g_api.DestroyKeywordSpotter(kws);
   if (g_api.handle) dlclose(g_api.handle);
   return 0;

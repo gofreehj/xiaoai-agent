@@ -10,8 +10,9 @@ KWS_LOG=${AX5_KWS_LOG:-/tmp/ax5-kws.log}
 KWS_PID_FILE=${AX5_KWS_PID_FILE:-/tmp/ax5-kws.pid}
 
 NUM_THREADS=${AX5_KWS_THREADS:-2}
-KEYWORDS_THRESHOLD=${AX5_KWS_THRESHOLD:-0.06}
-KEYWORDS_SCORE=${AX5_KWS_SCORE:-3.2}
+KEYWORDS_THRESHOLD=${AX5_KWS_THRESHOLD:-0.05}
+KEYWORDS_SCORE=${AX5_KWS_SCORE:-1.5}
+NUM_TRAILING_BLANKS=${AX5_KWS_NUM_TRAILING_BLANKS:-0}
 MAX_ACTIVE_PATHS=${AX5_KWS_MAX_PATHS:-12}
 LISTEN_PORT=${AX5_KWS_LISTEN_PORT:-5005}
 WAKE_PORT=${AX5_KWS_WAKE_PORT:-0}
@@ -112,6 +113,7 @@ start_kws() {
         --tokens "$KWS_RUN_DIR/models/tokens.txt" \
         --keywords-file "$KWS_RUN_DIR/keywords.txt" \
         --num-threads "$NUM_THREADS" \
+        --num-trailing-blanks "$NUM_TRAILING_BLANKS" \
         --max-active-paths "$MAX_ACTIVE_PATHS" \
         --keywords-threshold "$KEYWORDS_THRESHOLD" \
         --keywords-score "$KEYWORDS_SCORE" \

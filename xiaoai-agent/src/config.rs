@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub tts: TtsConfig,
     pub server: ServerConfig,
     pub dual: DualKwsConfig,
+    pub dialogue: DialogueConfig,
+    pub realtime: RealtimeConfig,
 }
 
 impl AppConfig {
@@ -83,6 +85,7 @@ pub struct DualKwsConfig {
     pub kws: ExternalKwsConfig,
     pub capture: DualCaptureConfig,
     pub native_interlock: NativeInterlockConfig,
+    pub stop_key: StopKeyConfig,
     pub enter_prompt: String,
     pub exit_prompt: String,
     pub enter_earcon: Option<PathBuf>,
@@ -122,6 +125,7 @@ impl Default for DualKwsConfig {
             kws: ExternalKwsConfig::default(),
             capture: DualCaptureConfig::default(),
             native_interlock: NativeInterlockConfig::default(),
+            stop_key: StopKeyConfig::default(),
             enter_prompt: "我在，请讲".to_string(),
             exit_prompt: "已退出对话模式，再见".to_string(),
             enter_earcon: Some(PathBuf::from("enter_prompt.wav")),
@@ -220,7 +224,7 @@ pub enum DualCaptureFormat {
     S16Le,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DualCaptureConfig {
     pub device: String,
@@ -228,8 +232,14 @@ pub struct DualCaptureConfig {
     pub channels: u16,
     pub format: DualCaptureFormat,
     pub mic_channel: u16,
+    /// Optional multi-mic channel list (e.g. `[0, 1, 2]`). When empty, falls back to `[mic_channel]`.
+    pub mic_channels: Vec<u16>,
     pub ref_channel: Option<u16>,
     pub shift_bits: u8,
+    /// Enable 10 ms RMS AGC on the UDP XPCM copy sent to external KWS (never mutates `AudioChunk::pcm`).
+    pub kws_agc_enabled: bool,
+    /// Higher KWS score threshold required for `__CMD_EXIT__` during active playback.
+    pub exit_playback_threshold: f32,
 }
 
 impl Default for DualCaptureConfig {
@@ -240,8 +250,202 @@ impl Default for DualCaptureConfig {
             channels: 8,
             format: DualCaptureFormat::S32Le,
             mic_channel: 0,
+            mic_channels: Vec::new(),
             ref_channel: Some(6),
             shift_bits: 9,
+            kws_agc_enabled: true,
+            exit_playback_threshold: 0.45,
+        }
+    }
+}
+
+/// Read-only physical play/pause button interrupt configuration (`dual` mode, restart-only).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StopKeyConfig {
+    /// Linux input device path (e.g. `"/dev/input/event0"`). Empty string disables listener.
+    pub device: String,
+    /// Linux `EV_KEY` code to listen for. Negative value disables listener.
+    pub key_code: i32,
+    /// Debounce window in milliseconds (default `300`).
+    pub debounce_ms: u64,
+}
+
+impl Default for StopKeyConfig {
+    fn default() -> Self {
+        Self {
+            device: String::new(),
+            key_code: -1,
+            debounce_ms: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogueEngine {
+    #[default]
+    Cascade,
+    Realtime,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct DialogueConfig {
+    pub engine: DialogueEngine,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeProvider {
+    #[default]
+    VolcengineO2,
+    OpenAiRealtime,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeFallback {
+    #[default]
+    Cascade,
+    NativeAlert,
+    None,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RealtimeConfig {
+    pub provider: RealtimeProvider,
+    pub fallback: RealtimeFallback,
+    pub system_prompt: String,
+    pub output_device: String,
+    pub playback_gain: f32,
+    pub playback_tail_ms: u64,
+    pub idle_timeout_s: u64,
+    pub volcengine_o2: VolcengineO2Config,
+    pub openai_realtime: OpenAiRealtimeDialogueConfig,
+    pub smart_turn: SmartTurnConfig,
+    pub daily_usage: DailyUsageConfig,
+}
+
+impl Default for RealtimeConfig {
+    fn default() -> Self {
+        Self {
+            provider: RealtimeProvider::VolcengineO2,
+            fallback: RealtimeFallback::Cascade,
+            system_prompt: String::new(),
+            output_device: "default".to_string(),
+            playback_gain: 1.0,
+            playback_tail_ms: 400,
+            idle_timeout_s: 45,
+            volcengine_o2: VolcengineO2Config::default(),
+            openai_realtime: OpenAiRealtimeDialogueConfig::default(),
+            smart_turn: SmartTurnConfig::default(),
+            daily_usage: DailyUsageConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct VolcengineO2Config {
+    /// API Key auth (`X-Api-Key`). Takes precedence over `app_id` + `access_key` when non-empty.
+    pub api_key: String,
+    /// App ID auth (`X-Api-App-Id`), paired with `access_key`.
+    pub app_id: String,
+    /// Access Key auth (`X-Api-Access-Key`), paired with `app_id`.
+    pub access_key: String,
+    pub resource_id: String,
+    pub app_key: String,
+    pub enable_volc_websearch: bool,
+    pub volc_websearch_type: String,
+    pub volc_websearch_api_key: String,
+    pub volc_websearch_result_count: u8,
+    pub volc_websearch_no_result_message: String,
+    pub ws_url: String,
+    pub model: String,
+    pub voice: String,
+    pub bot_name: String,
+    pub speaking_style: String,
+    pub end_smooth_window_ms: u32,
+}
+
+impl Default for VolcengineO2Config {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            app_id: String::new(),
+            access_key: String::new(),
+            resource_id: "volc.speech.dialog".to_string(),
+            app_key: "PlgvMymc7f3tQnJ6".to_string(),
+            enable_volc_websearch: true,
+            volc_websearch_type: "web_summary".to_string(),
+            volc_websearch_api_key: String::new(),
+            volc_websearch_result_count: 5,
+            volc_websearch_no_result_message: String::new(),
+            ws_url: "wss://openspeech.bytedance.com/api/v3/realtime/dialogue".to_string(),
+            model: "1.2.1.1".to_string(),
+            voice: "zh_female_vv_jupiter_bigtts".to_string(),
+            bot_name: "豆包".to_string(),
+            speaking_style: String::new(),
+            end_smooth_window_ms: 1500,
+        }
+    }
+}
+
+/// Reserved configuration for non-Volcengine OpenAI Realtime compatible providers (`T-301`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OpenAiRealtimeDialogueConfig {
+    pub ws_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub voice: String,
+}
+
+impl Default for OpenAiRealtimeDialogueConfig {
+    fn default() -> Self {
+        Self {
+            ws_url: "wss://api.openai.com/v1/realtime".to_string(),
+            api_key: String::new(),
+            model: "gpt-4o-realtime-preview".to_string(),
+            voice: "alloy".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SmartTurnConfig {
+    pub enabled: bool,
+    pub complete_quiet_ms: u64,
+    pub unfinished_quiet_ms: u64,
+}
+
+impl Default for SmartTurnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            complete_quiet_ms: 1500,
+            unfinished_quiet_ms: 4500,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DailyUsageConfig {
+    /// Directory for daily usage JSON state (defaults to tmpfs `/tmp/xiaoai-agent/usage` for zero NAND wear).
+    pub state_dir: PathBuf,
+    /// Daily token cap (`0` = unlimited).
+    pub daily_token_limit: u64,
+}
+
+impl Default for DailyUsageConfig {
+    fn default() -> Self {
+        Self {
+            state_dir: PathBuf::from("/tmp/xiaoai-agent/usage"),
+            daily_token_limit: 0,
         }
     }
 }
@@ -1084,8 +1288,17 @@ pub fn classify_config_change(old: &AppConfig, new: &AppConfig) -> ConfigChanges
     if section_changed(&old.dual.native_interlock, &new.dual.native_interlock) {
         changes.needs_restart.push("dual.native_interlock");
     }
+    if section_changed(&old.dual.stop_key, &new.dual.stop_key) {
+        changes.needs_restart.push("dual.stop_key");
+    }
     if section_changed(&old.dual.hot_view(), &new.dual.hot_view()) {
         changes.applied.push("dual");
+    }
+    if section_changed(&old.dialogue, &new.dialogue) {
+        changes.applied.push("dialogue");
+    }
+    if section_changed(&old.realtime, &new.realtime) {
+        changes.applied.push("realtime");
     }
     // device: Device 启动时把 DeviceConfig 克隆走了（TTS 模板、命令超时、LED id），
     // 只换配置会让「模板还是旧命令、ID 是新的」，所以整段按需重启处理。
@@ -1184,6 +1397,12 @@ pub fn collect_startup_warnings(config: &AppConfig) -> Vec<String> {
             warnings.push(format!(
                 "dual.capture.mic_channel={} 越界（channels={}）",
                 cap.mic_channel, cap.channels
+            ));
+        }
+        if let Some(&bad) = cap.mic_channels.iter().find(|&&ch| ch >= cap.channels) {
+            warnings.push(format!(
+                "dual.capture.mic_channels 包含越界通道 {}（channels={}）",
+                bad, cap.channels
             ));
         }
         if cap.ref_channel.is_some_and(|r| r >= cap.channels) {
@@ -1595,5 +1814,63 @@ dual:
         assert!(changes.needs_restart.contains(&"dual.capture"));
         assert!(changes.needs_restart.contains(&"dual.native_interlock"));
         assert!(changes.applied.contains(&"dual"));
+    }
+
+    #[test]
+    fn dialogue_and_realtime_yaml_defaults_are_backward_compatible() {
+        let cfg: AppConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(cfg.dialogue.engine, super::DialogueEngine::Cascade);
+        assert_eq!(cfg.realtime.provider, super::RealtimeProvider::VolcengineO2);
+        assert_eq!(cfg.realtime.fallback, super::RealtimeFallback::Cascade);
+        assert_eq!(
+            cfg.realtime.volcengine_o2.ws_url,
+            "wss://openspeech.bytedance.com/api/v3/realtime/dialogue"
+        );
+        assert_eq!(cfg.realtime.volcengine_o2.resource_id, "volc.speech.dialog");
+        assert_eq!(cfg.realtime.volcengine_o2.app_key, "PlgvMymc7f3tQnJ6");
+        assert!(cfg.realtime.volcengine_o2.enable_volc_websearch);
+        assert_eq!(cfg.realtime.volcengine_o2.volc_websearch_type, "web_summary");
+        assert_eq!(cfg.realtime.volcengine_o2.volc_websearch_result_count, 5);
+        assert_eq!(cfg.realtime.volcengine_o2.model, "1.2.1.1");
+        assert_eq!(
+            cfg.realtime.daily_usage.state_dir,
+            std::path::PathBuf::from("/tmp/xiaoai-agent/usage")
+        );
+        assert_eq!(cfg.realtime.daily_usage.daily_token_limit, 0);
+        assert_eq!(cfg.dual.stop_key.device, "");
+        assert_eq!(cfg.dual.stop_key.key_code, -1);
+        assert_eq!(cfg.dual.capture.mic_channels, Vec::<u16>::new());
+        assert!(cfg.dual.capture.kws_agc_enabled);
+        assert_eq!(cfg.dual.capture.exit_playback_threshold, 0.45);
+
+        let custom: AppConfig = serde_yaml::from_str(
+            r#"
+dialogue:
+  engine: realtime
+realtime:
+  provider: volcengine_o2
+  fallback: native_alert
+  volcengine_o2:
+    api_key: "vk-test"
+    enable_volc_websearch: true
+    volc_websearch_result_count: 3
+dual:
+  stop_key:
+    device: "/dev/input/event0"
+    key_code: 164
+"#,
+        )
+        .unwrap();
+        assert_eq!(custom.dialogue.engine, super::DialogueEngine::Realtime);
+        assert_eq!(custom.realtime.fallback, super::RealtimeFallback::NativeAlert);
+        assert_eq!(custom.realtime.volcengine_o2.api_key, "vk-test");
+        assert_eq!(custom.realtime.volcengine_o2.volc_websearch_result_count, 3);
+        assert_eq!(custom.dual.stop_key.device, "/dev/input/event0");
+        assert_eq!(custom.dual.stop_key.key_code, 164);
+
+        let changes = classify_config_change(&cfg, &custom);
+        assert!(changes.applied.contains(&"dialogue"));
+        assert!(changes.applied.contains(&"realtime"));
+        assert!(changes.needs_restart.contains(&"dual.stop_key"));
     }
 }

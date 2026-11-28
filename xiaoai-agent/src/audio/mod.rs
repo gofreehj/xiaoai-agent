@@ -1,5 +1,7 @@
 //! Audio capture, VAD, playback, and device volume contracts.
 
+pub mod output_format;
+pub mod stream_player;
 pub mod text_prep;
 
 use std::sync::Arc;
@@ -55,6 +57,7 @@ pub struct AudioCoordinator {
     pub airplay: AirPlayService,
     pub telemetry: RuntimeTelemetry,
     pub tts_health: Arc<TtsHealth>,
+    pub stream_player: Arc<stream_player::AplayStreamPlayer>,
 }
 
 #[allow(dead_code)]
@@ -79,6 +82,9 @@ impl AudioCoordinator {
             airplay,
             telemetry,
             tts_health,
+            stream_player: Arc::new(stream_player::AplayStreamPlayer::new(
+                stream_player::StreamAudioSpec::default(),
+            )),
         }
     }
 
@@ -122,9 +128,10 @@ impl AudioCoordinator {
         }
     }
 
-    /// 唤醒打断：立即推进播放令牌、打断音乐/AirPlay，并按是否保留暂停音乐选择精准掐断方式。
+    /// 唤醒打断：立即推进播放令牌、打断流式播放、音乐/AirPlay，并按是否保留暂停音乐选择精准掐断方式。
     pub async fn interrupt_for_wake(&self) {
         self.playback.begin();
+        self.stream_player.interrupt().await;
         let music_interrupted = self.music.interrupt_for_wake().await;
         let airplay_interrupted = self.airplay.interrupt_for_wake().await;
         if !music_interrupted && !airplay_interrupted {
@@ -134,9 +141,10 @@ impl AudioCoordinator {
         }
     }
 
-    /// 彻底停止全部音频输出（TTS + 音乐），并回到 `Idle`。
+    /// 彻底停止全部音频输出（流式播放 + TTS + 音乐），并回到 `Idle`。
     pub async fn stop_all_output(&self) {
         self.playback.begin();
+        self.stream_player.interrupt().await;
         let _ = self.music.stop().await;
         self.device.abort_current_output().await;
         self.set_phase(AgentPhase::Idle).await;
@@ -240,6 +248,7 @@ impl AudioCoordinator {
     /// 4. 按需清理 Agent 自己的外部 TTS (`xiaoai-tts-*`) / 提示音 (`qplayer`)，绝不发 `mphelper pause`。
     pub async fn yield_to_native_dialog(&self, cleanup_tts: bool) {
         self.playback.begin();
+        self.stream_player.interrupt().await;
         self.telemetry.set_phase(AgentPhase::Idle);
         let had_music = self.music.yield_to_native().await;
         if cleanup_tts || had_music {
